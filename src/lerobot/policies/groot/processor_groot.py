@@ -57,10 +57,26 @@ from lerobot.utils.constants import (
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
 
-from .configuration_groot import GrootConfig
+from .configuration_groot import GROOT_N1_7, GROOT_N1_7_BACKBONE_MODEL, GrootConfig
 
 # Defaults for Eagle processor locations
 DEFAULT_TOKENIZER_ASSETS_REPO = "lerobot/eagle2hg-processor-groot-n1p5"
+
+N1_7_EMBODIMENT_MAPPING = {
+    "oxe_droid_relative_eef_relative_joint": 24,
+    "xdof_relative_eef_relative_joint": 27,
+    "xdof_relative_eef_relative_joint_subtask": 27,
+    "real_g1_relative_eef_relative_joints": 25,
+    "real_r1_pro_sharpa_relative_eef": 26,
+    "real_r1_pro_sharpa_relative_eef_human": 26,
+    "real_r1_pro_sharpa_relative_eef_maxinsights": 26,
+    "real_r1_pro_sharpa_relative_eef_mecka": 26,
+    "unitree_g1_full_body_with_waist_height_nav_cmd": 25,
+    "simpler_env_google": 0,
+    "simpler_env_widowx": 1,
+    "libero_sim": 2,
+    "new_embodiment": 10,
+}
 
 
 def make_groot_pre_post_processors(
@@ -93,6 +109,52 @@ def make_groot_pre_post_processors(
     Returns:
         Tuple of (preprocessor, postprocessor) pipelines
     """
+
+    if config.model_version == GROOT_N1_7:
+        action_horizon = min(config.chunk_size, 40)
+        padded_stats = dataset_stats or {}
+        try:
+            env_action_dim = int(config.output_features[ACTION].shape[0])
+        except Exception:
+            env_action_dim = 0
+
+        input_steps: list[ProcessorStep] = [
+            RenameObservationsProcessorStep(rename_map={}),
+            AddBatchDimensionProcessorStep(),
+            GrootN17PackInputsStep(
+                state_horizon=1,
+                action_horizon=action_horizon,
+                max_state_dim=config.max_state_dim,
+                max_action_dim=config.max_action_dim,
+                language_key="task",
+                formalize_language=True,
+                embodiment_tag=config.embodiment_tag,
+                normalize_min_max=True,
+                stats=padded_stats,
+            ),
+            GrootN17VLMEncodeStep(model_name=config.n1_7_backbone_model),
+            DeviceProcessorStep(device=config.device),
+        ]
+        output_steps: list[ProcessorStep] = [
+            GrootActionUnpackUnnormalizeStep(
+                env_action_dim=env_action_dim,
+                stats=padded_stats,
+                normalize_min_max=True,
+            ),
+            DeviceProcessorStep(device="cpu"),
+        ]
+        return (
+            PolicyProcessorPipeline[dict[str, Any], dict[str, Any]](
+                steps=input_steps,
+                name=POLICY_PREPROCESSOR_DEFAULT_NAME,
+            ),
+            PolicyProcessorPipeline[PolicyAction, PolicyAction](
+                steps=output_steps,
+                name=POLICY_POSTPROCESSOR_DEFAULT_NAME,
+                to_transition=policy_action_to_transition,
+                to_output=transition_to_policy_action,
+            ),
+        )
 
     # Get horizon/dimension parameters from config
     # These should match the config used for the pretrained model
@@ -192,6 +254,52 @@ def _to_uint8_np_bhwc(img_t: torch.Tensor) -> np.ndarray:
     return rearrange(img_t.cpu().numpy(), "b c h w -> b h w c")
 
 
+def _infer_n1_7_batch_size_and_device(
+    obs: dict[str, Any], action: torch.Tensor | None
+) -> tuple[int, torch.device]:
+    for value in list(obs.values()) + [action]:
+        if isinstance(value, torch.Tensor):
+            return value.shape[0], value.device
+    video = obs.get("video")
+    if isinstance(video, np.ndarray):
+        return video.shape[0], torch.device("cpu")
+    return 1, torch.device("cpu")
+
+
+def _prepare_n1_7_language_batch(
+    language: Any,
+    batch_size: int,
+    *,
+    formalize_language: bool,
+) -> list[str]:
+    default_language = "Perform the task."
+    if language is None or (isinstance(language, str) and language == ""):
+        languages = [default_language] * batch_size
+    elif isinstance(language, str):
+        languages = [language] * batch_size
+    elif isinstance(language, (list, tuple)):
+        languages = list(language)
+        if len(languages) == 0:
+            languages = [default_language] * batch_size
+        elif len(languages) == 1 and batch_size > 1:
+            languages = languages * batch_size
+        elif len(languages) != batch_size:
+            raise ValueError(
+                f"language batch has {len(languages)} entries, but GR00T N1.7 input batch has {batch_size}."
+            )
+    else:
+        languages = [str(language)] * batch_size
+
+    formatted = []
+    for item in languages:
+        text = str(item) if item else default_language
+        if formalize_language:
+            text = text.lower()
+            text = "".join(ch for ch in text if ch.isalnum() or ch.isspace())
+        formatted.append(text)
+    return formatted
+
+
 def _build_eagle_processor(tokenizer_assets_repo: str = DEFAULT_TOKENIZER_ASSETS_REPO) -> ProcessorMixin:
     # Validate that the cache directory is ready. If not, instruct the user.
     cache_dir = HF_LEROBOT_HOME / tokenizer_assets_repo
@@ -207,6 +315,20 @@ def _build_eagle_processor(tokenizer_assets_repo: str = DEFAULT_TOKENIZER_ASSETS
             "or call ensure_eagle_cache_ready() before building processors."
         )
     proc = AutoProcessor.from_pretrained(str(cache_dir), trust_remote_code=True, use_fast=True)
+    proc.tokenizer.padding_side = "left"
+    return proc
+
+
+def _build_n1_7_processor(model_name: str = GROOT_N1_7_BACKBONE_MODEL) -> ProcessorMixin:
+    try:
+        from transformers import Qwen3VLProcessor
+    except ImportError as exc:
+        raise ImportError(
+            "GR00T N1.7 preprocessing requires a transformers version with Qwen3VLProcessor. "
+            "Install the GR00T optional dependencies with `pip install 'lerobot[groot]'`."
+        ) from exc
+
+    proc = Qwen3VLProcessor.from_pretrained(model_name, trust_remote_code=True)
     proc.tokenizer.padding_side = "left"
     return proc
 
@@ -431,6 +553,237 @@ class GrootPackInputsStep(ProcessorStep):
 
         if reconstructed:
             self.stats = reconstructed
+
+
+@dataclass
+@ProcessorStepRegistry.register(name="groot_n1_7_pack_inputs_v1")
+class GrootN17PackInputsStep(ProcessorStep):
+    state_horizon: int = 1
+    action_horizon: int = 40
+    max_state_dim: int = 132
+    max_action_dim: int = 132
+    language_key: str = "task"
+    formalize_language: bool = True
+    embodiment_tag: str = "new_embodiment"
+    embodiment_mapping: dict[str, int] = field(default_factory=lambda: dict(N1_7_EMBODIMENT_MAPPING))
+    normalize_min_max: bool = True
+    stats: dict[str, dict[str, Any]] | None = None
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        obs = transition.get(TransitionKey.OBSERVATION, {}) or {}
+        comp = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}) or {}
+
+        def _align_vec(vec: Any, target_dim: int, *, default: float) -> torch.Tensor:
+            t = torch.as_tensor(vec)
+            t = t.flatten().to(
+                dtype=torch.float32,
+                device=next(
+                    (v.device for v in obs.values() if isinstance(v, torch.Tensor)), torch.device("cpu")
+                ),
+            )
+            d = int(t.shape[-1]) if t.numel() > 0 else 0
+            if d == target_dim:
+                return t
+            if d < target_dim:
+                pad = torch.full((target_dim - d,), default, dtype=t.dtype, device=t.device)
+                return torch.cat([t, pad], dim=0)
+            return t[:target_dim]
+
+        def _min_max_norm(x: torch.Tensor, key: str) -> torch.Tensor:
+            if not self.normalize_min_max or self.stats is None or key not in self.stats:
+                return x
+            stats_k = self.stats[key]
+            last_dim = x.shape[-1]
+            min_v = _align_vec(stats_k.get("min", torch.zeros(last_dim)), last_dim, default=0.0)
+            max_v = _align_vec(stats_k.get("max", torch.ones(last_dim)), last_dim, default=1.0)
+            denom = max_v - min_v
+            mask = denom != 0
+            safe_denom = torch.where(mask, denom, torch.ones_like(denom))
+            mapped = 2 * (x - min_v) / safe_denom - 1
+            return torch.where(mask, mapped, torch.zeros_like(mapped))
+
+        img_keys = sorted([k for k in obs if k.startswith(OBS_IMAGES)])
+        if not img_keys and OBS_IMAGE in obs:
+            img_keys = [OBS_IMAGE]
+        if img_keys:
+            cams = [_to_uint8_np_bhwc(obs[k]) for k in img_keys]
+            video = np.stack(cams, axis=1)  # (B, V, H, W, C)
+            obs["video"] = np.expand_dims(video, axis=1)  # (B, 1, V, H, W, C)
+            for k in img_keys:
+                obs.pop(k, None)
+
+        bsz, _device = _infer_n1_7_batch_size_and_device(obs, transition.get(TransitionKey.ACTION))
+        comp["language"] = _prepare_n1_7_language_batch(
+            comp.get(self.language_key),
+            bsz,
+            formalize_language=self.formalize_language,
+        )
+
+        if OBS_STATE in obs:
+            state = obs[OBS_STATE]
+            if state.dim() != 2:
+                raise ValueError(f"state must be (B, D), got {tuple(state.shape)}")
+            bsz, dim = state.shape
+            if self.normalize_min_max:
+                state = _min_max_norm(state, OBS_STATE)
+            state = state.unsqueeze(1)
+            if dim > self.max_state_dim:
+                state = state[:, :, : self.max_state_dim]
+            elif dim < self.max_state_dim:
+                pad = torch.zeros(
+                    bsz, 1, self.max_state_dim - dim, dtype=state.dtype, device=state.device
+                )
+                state = torch.cat([state, pad], dim=2)
+            obs["state"] = state
+
+        action = transition.get(TransitionKey.ACTION)
+        if isinstance(action, torch.Tensor):
+            if self.normalize_min_max:
+                if action.dim() == 2:
+                    action = _min_max_norm(action, ACTION)
+                elif action.dim() == 3:
+                    bsz, horizon, dim = action.shape
+                    flat = _min_max_norm(action.reshape(bsz * horizon, dim), ACTION)
+                    action = flat.view(bsz, horizon, dim)
+            if action.dim() == 2:
+                action = action.unsqueeze(1).repeat(1, self.action_horizon, 1)
+            elif action.dim() == 3:
+                bsz, horizon, _dim = action.shape
+                if horizon < self.action_horizon:
+                    action = torch.cat(
+                        [action, action[:, -1:, :].repeat(1, self.action_horizon - horizon, 1)],
+                        dim=1,
+                    )
+                elif horizon > self.action_horizon:
+                    action = action[:, : self.action_horizon, :]
+            else:
+                raise ValueError(f"action must be (B, D) or (B, T, D), got {tuple(action.shape)}")
+
+            bsz, horizon, dim = action.shape
+            valid_dim = min(dim, self.max_action_dim)
+            if dim > self.max_action_dim:
+                action = action[:, :, : self.max_action_dim]
+            elif dim < self.max_action_dim:
+                pad = torch.zeros(
+                    bsz, horizon, self.max_action_dim - dim, dtype=action.dtype, device=action.device
+                )
+                action = torch.cat([action, pad], dim=2)
+            action_mask = torch.zeros(bsz, horizon, self.max_action_dim, dtype=torch.float32, device=action.device)
+            action_mask[:, :, :valid_dim] = 1.0
+            transition[TransitionKey.ACTION] = action
+            comp["action_mask"] = action_mask
+
+        emb_id = self.embodiment_mapping.get(self.embodiment_tag, 0)
+        bsz, device = _infer_n1_7_batch_size_and_device(obs, transition.get(TransitionKey.ACTION))
+        comp["embodiment_id"] = torch.full((bsz,), emb_id, dtype=torch.long, device=device)
+
+        transition[TransitionKey.OBSERVATION] = obs
+        transition[TransitionKey.COMPLEMENTARY_DATA] = comp
+        return transition
+
+    def transform_features(self, features):
+        return features
+
+    def get_config(self) -> dict[str, Any]:
+        return {
+            "state_horizon": self.state_horizon,
+            "action_horizon": self.action_horizon,
+            "max_state_dim": self.max_state_dim,
+            "max_action_dim": self.max_action_dim,
+            "language_key": self.language_key,
+            "formalize_language": self.formalize_language,
+            "embodiment_tag": self.embodiment_tag,
+            "embodiment_mapping": self.embodiment_mapping,
+            "normalize_min_max": self.normalize_min_max,
+        }
+
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        if not self.stats:
+            return {}
+
+        flat: dict[str, torch.Tensor] = {}
+        for key, sub in self.stats.items():
+            for stat_name, value in sub.items():
+                flat[f"{key}.{stat_name}"] = torch.as_tensor(value).cpu()
+        return flat
+
+    def load_state_dict(self, state: dict[str, torch.Tensor]) -> None:
+        if not state:
+            return
+        reconstructed: dict[str, dict[str, Any]] = {}
+        for flat_key, tensor in state.items():
+            if "." in flat_key:
+                key, stat_name = flat_key.rsplit(".", 1)
+                reconstructed.setdefault(key, {})[stat_name] = tensor
+        if reconstructed:
+            self.stats = reconstructed
+
+
+@dataclass
+@ProcessorStepRegistry.register(name="groot_n1_7_vlm_encode_v1")
+class GrootN17VLMEncodeStep(ProcessorStep):
+    model_name: str = GROOT_N1_7_BACKBONE_MODEL
+    _proc: ProcessorMixin | None = field(default=None, init=False, repr=False)
+
+    @property
+    def proc(self) -> ProcessorMixin:
+        if self._proc is None:
+            self._proc = _build_n1_7_processor(self.model_name)
+        return self._proc
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        obs = transition.get(TransitionKey.OBSERVATION, {}) or {}
+        comp = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}) or {}
+        video = obs.get("video")
+        if video is None:
+            return transition
+
+        languages = _prepare_n1_7_language_batch(
+            comp.get("language"),
+            video.shape[0],
+            formalize_language=False,
+        )
+
+        texts: list[str] = []
+        images: list[Image.Image] = []
+        for batch_idx in range(video.shape[0]):
+            sample = video[batch_idx]  # (T, V, H, W, C)
+            sample_images = [
+                Image.fromarray(sample[timestep, view_idx])
+                for timestep in range(sample.shape[0])
+                for view_idx in range(sample.shape[1])
+            ]
+            conversation = [
+                {
+                    "role": "user",
+                    "content": [
+                        *[{"type": "image", "image": image} for image in sample_images],
+                        {"type": "text", "text": languages[batch_idx]},
+                    ],
+                }
+            ]
+            texts.append(
+                self.proc.apply_chat_template(
+                    conversation,
+                    tokenize=False,
+                    add_generation_prompt=False,
+                )
+            )
+            images.extend(sample_images)
+
+        encoded = self.proc(text=texts, images=images, return_tensors="pt", padding=True)
+        for key, value in encoded.items():
+            comp[key] = value
+        obs.pop("video", None)
+        transition[TransitionKey.OBSERVATION] = obs
+        transition[TransitionKey.COMPLEMENTARY_DATA] = comp
+        return transition
+
+    def transform_features(self, features):
+        return features
+
+    def get_config(self) -> dict[str, Any]:
+        return {"model_name": self.model_name}
 
 
 @dataclass

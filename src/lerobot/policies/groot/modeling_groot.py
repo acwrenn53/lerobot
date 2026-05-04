@@ -46,7 +46,13 @@ from lerobot.utils.constants import ACTION, OBS_IMAGES
 from lerobot.utils.import_utils import require_package
 
 from ..pretrained import PreTrainedPolicy
-from .configuration_groot import GrootConfig
+from .configuration_groot import (
+    GROOT_N1_5,
+    GROOT_N1_7,
+    GrootConfig,
+    infer_groot_model_version,
+    normalize_groot_model_version,
+)
 from .groot_n1 import GR00TN15
 
 T = TypeVar("T", bound="GrootPolicy")
@@ -82,13 +88,23 @@ class GrootPolicy(PreTrainedPolicy):
         # Handle Flash Attention compatibility issues
         self._handle_flash_attention_compatibility()
 
-        model = GR00TN15.from_pretrained(
-            pretrained_model_name_or_path=self.config.base_model_path,
-            tune_llm=self.config.tune_llm,
-            tune_visual=self.config.tune_visual,
-            tune_projector=self.config.tune_projector,
-            tune_diffusion_model=self.config.tune_diffusion_model,
-        )
+        model_kwargs = {
+            "pretrained_model_name_or_path": self.config.base_model_path,
+            "tune_llm": self.config.tune_llm,
+            "tune_visual": self.config.tune_visual,
+            "tune_projector": self.config.tune_projector,
+            "tune_diffusion_model": self.config.tune_diffusion_model,
+        }
+        if self.config.model_version == GROOT_N1_7:
+            from .groot_n1_7 import GR00TN17
+
+            model = GR00TN17.from_pretrained(
+                **model_kwargs,
+                tune_vlln=True,
+                transformers_loading_kwargs={"trust_remote_code": True},
+            )
+        else:
+            model = GR00TN15.from_pretrained(**model_kwargs)
 
         model.compute_dtype = "bfloat16" if self.config.use_bf16 else model.compute_dtype
         model.config.compute_dtype = model.compute_dtype
@@ -141,8 +157,13 @@ class GrootPolicy(PreTrainedPolicy):
         from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
         from huggingface_hub.errors import HfHubHTTPError
 
+        requested_version = (
+            normalize_groot_model_version(config.model_version)
+            if config is not None
+            else infer_groot_model_version(str(pretrained_name_or_path)) or GROOT_N1_5
+        )
         print(
-            "The Groot policy is a wrapper around Nvidia's GR00T N1.5 model.\n"
+            f"The Groot policy is a wrapper around Nvidia's GR00T {requested_version} model.\n"
             f"Loading pretrained model from: {pretrained_name_or_path}"
         )
 
@@ -193,8 +214,12 @@ class GrootPolicy(PreTrainedPolicy):
         print("Detected base GR00T model, loading from HuggingFace...")
 
         if config is None:
+            model_version = infer_groot_model_version(str(pretrained_name_or_path)) or GROOT_N1_5
             # Create default config with the pretrained path
-            config = GrootConfig(base_model_path=str(pretrained_name_or_path))
+            config = GrootConfig(
+                model_version=model_version,
+                base_model_path=str(pretrained_name_or_path),
+            )
 
             # Add minimal visual feature required for validation
             # validate_features() will automatically add state and action features
@@ -215,6 +240,25 @@ class GrootPolicy(PreTrainedPolicy):
             if hasattr(config, key):
                 setattr(config, key, value)
 
+        config.model_version = normalize_groot_model_version(config.model_version)
+        inferred_version = infer_groot_model_version(config.base_model_path)
+        if inferred_version is not None and inferred_version != config.model_version:
+            raise ValueError(
+                f"GR00T model_version '{config.model_version}' does not match base_model_path "
+                f"'{config.base_model_path}', which looks like '{inferred_version}'."
+            )
+        if config.model_version == GROOT_N1_7:
+            if config.max_state_dim == 64:
+                config.max_state_dim = 132
+            if config.max_action_dim == 32:
+                config.max_action_dim = 132
+            if config.chunk_size == 50:
+                config.chunk_size = 40
+            if config.n_action_steps == 50:
+                config.n_action_steps = 40
+            if tuple(config.image_size) == (224, 224):
+                config.image_size = (256, 256)
+
         # Create a fresh policy instance - this will automatically load the GR00T model
         # in __init__ via _create_groot_model()
         policy = cls(config)
@@ -225,18 +269,28 @@ class GrootPolicy(PreTrainedPolicy):
     def get_optim_params(self) -> dict:
         return self.parameters()
 
+    def _filter_groot_inputs(self, batch: dict[str, Tensor], *, include_action: bool) -> dict[str, Tensor]:
+        allowed_base = {"state", "state_mask", "embodiment_id"}
+        if include_action:
+            allowed_base.update({"action", "action_mask"})
+
+        if self.config.model_version == GROOT_N1_7:
+            allowed_base.update({"input_ids", "attention_mask", "pixel_values", "image_grid_thw"})
+        else:
+            allowed_base.update({"action_mask"} if include_action else set())
+
+        return {
+            k: v
+            for k, v in batch.items()
+            if (k in allowed_base or k.startswith("eagle_")) and not (k.startswith("next.") or k == "info")
+        }
+
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Training forward pass.
 
         Delegates to Isaac-GR00T model.forward when inputs are compatible.
         """
-        # Build a clean input dict for GR00T: keep only tensors GR00T consumes
-        allowed_base = {"state", "state_mask", "action", "action_mask", "embodiment_id"}
-        groot_inputs = {
-            k: v
-            for k, v in batch.items()
-            if (k in allowed_base or k.startswith("eagle_")) and not (k.startswith("next.") or k == "info")
-        }
+        groot_inputs = self._filter_groot_inputs(batch, include_action=True)
 
         # Get device from model parameters
         device = next(self.parameters()).device
@@ -261,15 +315,9 @@ class GrootPolicy(PreTrainedPolicy):
         """
         self.eval()
 
-        # Build a clean input dict for GR00T: keep only tensors GR00T consumes
-        # Preprocessing is handled by the processor pipeline, so we just filter the batch
-        # NOTE: During inference, we should NOT pass action/action_mask (that's what we're predicting)
-        allowed_base = {"state", "state_mask", "embodiment_id"}
-        groot_inputs = {
-            k: v
-            for k, v in batch.items()
-            if (k in allowed_base or k.startswith("eagle_")) and not (k.startswith("next.") or k == "info")
-        }
+        # Preprocessing is handled by the processor pipeline, so we just filter the batch.
+        # During inference, we do not pass action/action_mask because those are predicted.
+        groot_inputs = self._filter_groot_inputs(batch, include_action=False)
 
         # Get device from model parameters
         device = next(self.parameters()).device

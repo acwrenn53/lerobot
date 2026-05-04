@@ -20,6 +20,43 @@ from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTr
 from lerobot.optim import AdamWConfig, CosineDecayWithWarmupSchedulerConfig
 from lerobot.utils.constants import ACTION, OBS_STATE
 
+GROOT_N1_5 = "n1.5"
+GROOT_N1_7 = "n1.7"
+GROOT_N1_5_BASE_MODEL = "nvidia/GR00T-N1.5-3B"
+GROOT_N1_7_BASE_MODEL = "nvidia/GR00T-N1.7-3B"
+GROOT_N1_7_BACKBONE_MODEL = "nvidia/Cosmos-Reason2-2B"
+
+_GROOT_MODEL_VERSION_ALIASES = {
+    "n1.5": GROOT_N1_5,
+    "n1_5": GROOT_N1_5,
+    "n15": GROOT_N1_5,
+    "1.5": GROOT_N1_5,
+    "n1.7": GROOT_N1_7,
+    "n1_7": GROOT_N1_7,
+    "n1d7": GROOT_N1_7,
+    "n17": GROOT_N1_7,
+    "1.7": GROOT_N1_7,
+}
+
+
+def normalize_groot_model_version(model_version: str) -> str:
+    normalized = _GROOT_MODEL_VERSION_ALIASES.get(model_version.lower())
+    if normalized is None:
+        supported = ", ".join(sorted({GROOT_N1_5, GROOT_N1_7}))
+        raise ValueError(f"Unsupported GR00T model_version '{model_version}'. Supported versions: {supported}.")
+    return normalized
+
+
+def infer_groot_model_version(model_path: str | None) -> str | None:
+    if not model_path:
+        return None
+    model_path_lower = model_path.lower()
+    if "gr00t-n1.7" in model_path_lower or "gr00t_n1.7" in model_path_lower:
+        return GROOT_N1_7
+    if "gr00t-n1.5" in model_path_lower or "gr00t_n1.5" in model_path_lower:
+        return GROOT_N1_5
+    return None
+
 
 @PreTrainedConfig.register_subclass("groot")
 @dataclass
@@ -52,11 +89,17 @@ class GrootConfig(PreTrainedConfig):
 
     # Groot-specific model parameters (from groot_finetune_script.py)
 
+    # Explicit GR00T model family selection. Defaults to N1.5 to preserve existing behavior.
+    model_version: str = GROOT_N1_5
+
     # Path or HuggingFace model ID for the base Groot model
-    base_model_path: str = "nvidia/GR00T-N1.5-3B"
+    base_model_path: str | None = None
 
     # HF repo ID (or local path) that hosts vocab.json and merges.txt for Eagle tokenizer.
     tokenizer_assets_repo: str = "lerobot/eagle2hg-processor-groot-n1p5"
+
+    # HF repo ID (or local path) for the GR00T N1.7 Cosmos/Qwen3-VL backbone processor.
+    n1_7_backbone_model: str = GROOT_N1_7_BACKBONE_MODEL
 
     # Embodiment tag to use for training (e.g. 'new_embodiment', 'gr1')
     embodiment_tag: str = "new_embodiment"
@@ -117,6 +160,31 @@ class GrootConfig(PreTrainedConfig):
     resume: bool = False
 
     def __post_init__(self):
+        self.model_version = normalize_groot_model_version(self.model_version)
+        if self.base_model_path is None:
+            self.base_model_path = (
+                GROOT_N1_7_BASE_MODEL if self.model_version == GROOT_N1_7 else GROOT_N1_5_BASE_MODEL
+            )
+
+        if self.model_version == GROOT_N1_7:
+            if self.max_state_dim == 64:
+                self.max_state_dim = 132
+            if self.max_action_dim == 32:
+                self.max_action_dim = 132
+            if self.chunk_size == 50:
+                self.chunk_size = 40
+            if self.n_action_steps == 50:
+                self.n_action_steps = 40
+            if tuple(self.image_size) == (224, 224):
+                self.image_size = (256, 256)
+
+        inferred_version = infer_groot_model_version(self.base_model_path)
+        if inferred_version is not None and inferred_version != self.model_version:
+            raise ValueError(
+                f"GR00T model_version '{self.model_version}' does not match base_model_path "
+                f"'{self.base_model_path}', which looks like '{inferred_version}'."
+            )
+
         super().__post_init__()
 
         if self.n_action_steps > self.chunk_size:
@@ -192,7 +260,8 @@ class GrootConfig(PreTrainedConfig):
     @property
     def action_delta_indices(self) -> list[int]:
         """Return indices for delta actions."""
-        return list(range(min(self.chunk_size, 16)))
+        model_action_horizon = 40 if self.model_version == GROOT_N1_7 else 16
+        return list(range(min(self.chunk_size, model_action_horizon)))
 
     @property
     def reward_delta_indices(self) -> None:
