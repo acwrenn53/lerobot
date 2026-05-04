@@ -49,8 +49,9 @@ except ImportError:
     tree = None
 
 try:
-    from transformers import Qwen3VLForConditionalGeneration
+    from transformers import Qwen3VLConfig, Qwen3VLForConditionalGeneration
 except ImportError:
+    Qwen3VLConfig = None
     Qwen3VLForConditionalGeneration = None
 
 logger = logging.getLogger(__name__)
@@ -258,6 +259,7 @@ class Qwen3Backbone(nn.Module):
         tune_top_llm_layers: int = 0,
         trainable_params_fp32: bool = False,
         transformers_loading_kwargs: dict[str, Any] | None = None,
+        load_pretrained_weights: bool = True,
     ):
         if Qwen3VLForConditionalGeneration is None:
             raise ImportError(
@@ -281,11 +283,18 @@ class Qwen3Backbone(nn.Module):
         if load_bf16:
             extra_kwargs["torch_dtype"] = torch.bfloat16
 
-        self.model = Qwen3VLForConditionalGeneration.from_pretrained(
-            model_name,
-            **extra_kwargs,
-            **transformers_loading_kwargs,
-        ).eval()
+        if load_pretrained_weights:
+            self.model = Qwen3VLForConditionalGeneration.from_pretrained(
+                model_name,
+                **extra_kwargs,
+                **transformers_loading_kwargs,
+            ).eval()
+        else:
+            self.model = self._from_backbone_config(
+                model_name=model_name,
+                model_kwargs=extra_kwargs,
+                config_kwargs=transformers_loading_kwargs,
+            ).eval()
 
         while len(self.language_model.layers) > select_layer:
             self.language_model.layers.pop(-1)
@@ -327,6 +336,24 @@ class Qwen3Backbone(nn.Module):
     @property
     def visual(self) -> nn.Module:
         return getattr(self.model, "model", self.model).visual
+
+    def _from_backbone_config(
+        self,
+        *,
+        model_name: str,
+        model_kwargs: dict[str, Any],
+        config_kwargs: dict[str, Any],
+    ) -> nn.Module:
+        if _is_cosmos_reason2_backbone(model_name):
+            backbone_config = _cosmos_reason2_qwen3_vl_config()
+        else:
+            if AutoConfig is None:
+                raise ImportError(
+                    "AutoConfig is required to initialize a GR00T N1.7 backbone from config. "
+                    "Install the GR00T optional dependencies with `pip install 'lerobot[groot]'`."
+                )
+            backbone_config = AutoConfig.from_pretrained(model_name, **config_kwargs)
+        return Qwen3VLForConditionalGeneration._from_config(backbone_config, **model_kwargs)
 
     def prepare_input(self, batch: dict[str, Any]) -> BatchFeature:
         return BatchFeature(data=batch)
@@ -627,8 +654,74 @@ class GR00TN17ActionHead(nn.Module):
         return BatchFeature(data=batch)
 
 
+def _is_cosmos_reason2_backbone(model_name: str) -> bool:
+    return str(model_name).rstrip("/") == "nvidia/Cosmos-Reason2-2B"
+
+
+def _cosmos_reason2_qwen3_vl_config() -> PretrainedConfig:
+    if Qwen3VLConfig is None:
+        raise ImportError(
+            "Qwen3VLConfig is required for GR00T N1.7. "
+            "Install the GR00T optional dependencies with `pip install 'lerobot[groot]'`."
+        )
+    return Qwen3VLConfig(
+        image_token_id=151655,
+        video_token_id=151656,
+        vision_start_token_id=151652,
+        vision_end_token_id=151653,
+        tie_word_embeddings=True,
+        text_config={
+            "attention_bias": False,
+            "attention_dropout": 0.0,
+            "bos_token_id": 151643,
+            "dtype": "bfloat16",
+            "eos_token_id": 151645,
+            "head_dim": 128,
+            "hidden_act": "silu",
+            "hidden_size": 2048,
+            "initializer_range": 0.02,
+            "intermediate_size": 6144,
+            "max_position_embeddings": 262144,
+            "model_type": "qwen3_vl_text",
+            "num_attention_heads": 16,
+            "num_hidden_layers": 28,
+            "num_key_value_heads": 8,
+            "rms_norm_eps": 1e-6,
+            "rope_scaling": {
+                "mrope_interleaved": True,
+                "mrope_section": [24, 20, 20],
+                "rope_type": "default",
+            },
+            "rope_theta": 5000000,
+            "tie_word_embeddings": True,
+            "use_cache": True,
+            "vocab_size": 151936,
+        },
+        vision_config={
+            "deepstack_visual_indexes": [5, 11, 17],
+            "depth": 24,
+            "hidden_act": "gelu_pytorch_tanh",
+            "hidden_size": 1024,
+            "in_channels": 3,
+            "initializer_range": 0.02,
+            "intermediate_size": 4096,
+            "model_type": "qwen3_vl",
+            "num_heads": 16,
+            "num_position_embeddings": 2304,
+            "out_hidden_size": 2048,
+            "patch_size": 16,
+            "spatial_merge_size": 2,
+            "temporal_patch_size": 2,
+        },
+    )
+
+
 def get_backbone_cls(config: GR00TN17Config):
-    if "nvidia/Cosmos-Reason2" in config.model_name or "Qwen/Qwen3-VL" in config.model_name:
+    if (
+        config.backbone_model_type == "qwen"
+        or "nvidia/Cosmos-Reason2" in config.model_name
+        or "Qwen/Qwen3-VL" in config.model_name
+    ):
         return Qwen3Backbone
     raise ValueError(f"Unsupported GR00T N1.7 backbone model: {config.model_name}")
 
@@ -643,6 +736,7 @@ class GR00TN17(PreTrainedModel):
         self,
         config: GR00TN17Config,
         transformers_loading_kwargs: dict[str, Any] | None = None,
+        load_backbone_weights: bool = True,
     ):
         super().__init__(config)
         transformers_loading_kwargs = transformers_loading_kwargs or {"trust_remote_code": True}
@@ -659,6 +753,7 @@ class GR00TN17(PreTrainedModel):
             tune_top_llm_layers=config.tune_top_llm_layers,
             trainable_params_fp32=config.backbone_trainable_params_fp32,
             transformers_loading_kwargs=transformers_loading_kwargs,
+            load_pretrained_weights=load_backbone_weights,
         )
         self.action_head = GR00TN17ActionHead(config)
         self.post_init()
@@ -708,16 +803,30 @@ class GR00TN17(PreTrainedModel):
         tune_projector = kwargs.pop("tune_projector", True)
         tune_diffusion_model = kwargs.pop("tune_diffusion_model", True)
         tune_vlln = kwargs.pop("tune_vlln", True)
-        transformers_loading_kwargs = kwargs.pop("transformers_loading_kwargs", {"trust_remote_code": True})
+        transformers_loading_kwargs = kwargs.pop("transformers_loading_kwargs", None) or {
+            "trust_remote_code": True
+        }
+        load_backbone_weights = kwargs.pop("load_backbone_weights", False)
+        for key in ("revision", "cache_dir", "local_files_only", "token"):
+            if key in kwargs:
+                transformers_loading_kwargs.setdefault(key, kwargs[key])
 
         try:
-            local_model_path = snapshot_download(pretrained_model_name_or_path, repo_type="model")
+            local_model_path = snapshot_download(
+                pretrained_model_name_or_path,
+                repo_type="model",
+                revision=kwargs.get("revision"),
+                cache_dir=kwargs.get("cache_dir"),
+                local_files_only=kwargs.get("local_files_only", False),
+                token=kwargs.get("token"),
+            )
         except (HFValidationError, RepositoryNotFoundError):
             local_model_path = pretrained_model_name_or_path
 
         pretrained_model = super().from_pretrained(
             local_model_path,
             transformers_loading_kwargs=transformers_loading_kwargs,
+            load_backbone_weights=load_backbone_weights,
             **kwargs,
         )
         pretrained_model.backbone.set_trainable_parameters(

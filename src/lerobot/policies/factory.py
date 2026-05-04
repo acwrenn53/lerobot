@@ -48,7 +48,7 @@ from .act.configuration_act import ACTConfig
 from .diffusion.configuration_diffusion import DiffusionConfig
 from .eo1.configuration_eo1 import EO1Config
 from .gaussian_actor.configuration_gaussian_actor import GaussianActorConfig
-from .groot.configuration_groot import GrootConfig
+from .groot.configuration_groot import GROOT_N1_7, GrootConfig
 from .multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig
 from .pi0.configuration_pi0 import PI0Config
 from .pi05.configuration_pi05 import PI05Config
@@ -266,11 +266,16 @@ def make_pre_post_processors(
     if pretrained_path:
         # TODO(Steven): Temporary patch, implement correctly the processors for Gr00t
         if isinstance(policy_cfg, GrootConfig):
-            # GROOT handles normalization in groot_pack_inputs_v3 step
+            # GROOT handles normalization in its pack-inputs step
             # Need to override both stats AND normalize_min_max since saved config might be empty
             preprocessor_overrides = {}
             postprocessor_overrides = {}
-            preprocessor_overrides["groot_pack_inputs_v3"] = {
+            pack_inputs_key = (
+                "groot_n1_7_pack_inputs_v1"
+                if policy_cfg.model_version == GROOT_N1_7
+                else "groot_pack_inputs_v3"
+            )
+            preprocessor_overrides[pack_inputs_key] = {
                 "stats": kwargs.get("dataset_stats"),
                 "normalize_min_max": True,
             }

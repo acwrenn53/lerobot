@@ -15,8 +15,15 @@
 # limitations under the License.
 
 from .configuration_groot import GrootConfig
-from .groot_n1_7 import GR00TN17, GR00TN17Config
 from .modeling_groot import GrootPolicy
 from .processor_groot import make_groot_pre_post_processors
 
 __all__ = ["GR00TN17", "GR00TN17Config", "GrootConfig", "GrootPolicy", "make_groot_pre_post_processors"]
+
+
+def __getattr__(name: str):
+    if name in {"GR00TN17", "GR00TN17Config"}:
+        from .groot_n1_7 import GR00TN17, GR00TN17Config
+
+        return {"GR00TN17": GR00TN17, "GR00TN17Config": GR00TN17Config}[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

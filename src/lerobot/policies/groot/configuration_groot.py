@@ -14,7 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTrainedConfig
 from lerobot.optim import AdamWConfig, CosineDecayWithWarmupSchedulerConfig
@@ -55,6 +57,49 @@ def infer_groot_model_version(model_path: str | None) -> str | None:
         return GROOT_N1_7
     if "gr00t-n1.5" in model_path_lower or "gr00t_n1.5" in model_path_lower:
         return GROOT_N1_5
+    config_version = _infer_groot_model_version_from_local_config(model_path)
+    if config_version is not None:
+        return config_version
+    return None
+
+
+def _infer_groot_model_version_from_local_config(model_path: str) -> str | None:
+    path = Path(model_path).expanduser()
+    if path.is_dir():
+        config_path = path / "config.json"
+    elif path.name == "config.json":
+        config_path = path
+    else:
+        return None
+
+    if not config_path.exists():
+        return None
+
+    try:
+        with config_path.open() as f:
+            config = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    model_version = config.get("model_version")
+    if isinstance(model_version, str):
+        try:
+            return normalize_groot_model_version(model_version)
+        except ValueError:
+            return None
+
+    candidates = [config.get("model_type"), *(config.get("architectures") or [])]
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            continue
+        normalized = candidate.lower().replace("-", "_")
+        if normalized in {"gr00tn1d7", "gr00t_n1d7", "gr00t_n1_7"}:
+            return GROOT_N1_7
+        if normalized in {"gr00t_n1_5", "gr00tn15", "gr00t_n1d5"}:
+            return GROOT_N1_5
+
+    if config.get("model_name") == GROOT_N1_7_BACKBONE_MODEL:
+        return GROOT_N1_7
     return None
 
 

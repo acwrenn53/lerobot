@@ -24,7 +24,7 @@ import torch
 from torch import nn
 
 from lerobot.configs import FeatureType, PolicyFeature
-from lerobot.policies.factory import make_policy_config
+from lerobot.policies.factory import make_policy_config, make_pre_post_processors
 from lerobot.policies.groot.configuration_groot import (
     GROOT_N1_5,
     GROOT_N1_5_BASE_MODEL,
@@ -152,6 +152,31 @@ def test_groot_from_pretrained_keeps_matching_caller_config(tmp_path, monkeypatc
     assert policy.config.base_model_path == str(model_path)
 
 
+def test_groot_from_pretrained_infers_n1_7_from_ambiguous_local_config(tmp_path, monkeypatch):
+    from lerobot.policies.groot.groot_n1_7 import GR00TN17
+
+    model_path = tmp_path / "local-checkpoint"
+    model_path.mkdir()
+    (model_path / "config.json").write_text('{"model_type": "Gr00tN1d7"}')
+
+    monkeypatch.setattr(GR00TN17, "from_pretrained", classmethod(lambda cls, **kwargs: _DummyGrootModel()))
+
+    policy = GrootPolicy.from_pretrained(model_path)
+
+    assert policy.config.model_version == GROOT_N1_7
+    assert policy.config.base_model_path == str(model_path)
+
+
+def test_groot_from_pretrained_rejects_caller_config_mismatch_from_local_config(tmp_path):
+    model_path = tmp_path / "local-checkpoint"
+    model_path.mkdir()
+    (model_path / "config.json").write_text('{"model_type": "Gr00tN1d7"}')
+    config = _groot_config(GROOT_N1_5)
+
+    with pytest.raises(ValueError, match="does not match base_model_path"):
+        GrootPolicy.from_pretrained(model_path, config=config)
+
+
 def test_groot_n1_7_processors_are_registered_lazily_without_external_gr00t():
     sys.modules.pop("gr00t", None)
     config = _groot_config(GROOT_N1_7)
@@ -252,6 +277,38 @@ def test_groot_n1_7_vlm_encode_config_round_trips_model_name():
     restored = GrootN17VLMEncodeStep(**step.get_config())
 
     assert restored.model_name == "local-cosmos"
+
+
+def test_groot_n1_7_saved_processors_reload_through_factory(tmp_path):
+    config = _groot_config(GROOT_N1_7)
+    dataset_stats = {
+        OBS_STATE: {
+            "min": torch.zeros(8),
+            "max": torch.ones(8),
+        },
+        ACTION: {
+            "min": torch.zeros(7),
+            "max": torch.ones(7),
+        },
+    }
+    preprocessor, postprocessor = make_groot_pre_post_processors(config, dataset_stats=dataset_stats)
+    preprocessor.save_pretrained(tmp_path)
+    postprocessor.save_pretrained(tmp_path)
+
+    loaded_preprocessor, loaded_postprocessor = make_pre_post_processors(
+        config,
+        pretrained_path=str(tmp_path),
+        dataset_stats=dataset_stats,
+    )
+
+    pack_step = next(step for step in loaded_preprocessor.steps if isinstance(step, GrootN17PackInputsStep))
+    unpack_step = loaded_postprocessor.steps[0]
+    assert pack_step.normalize_min_max
+    torch.testing.assert_close(pack_step.stats[OBS_STATE]["min"], dataset_stats[OBS_STATE]["min"])
+    torch.testing.assert_close(pack_step.stats[ACTION]["max"], dataset_stats[ACTION]["max"])
+    torch.testing.assert_close(unpack_step.stats[OBS_STATE]["min"], dataset_stats[OBS_STATE]["min"])
+    torch.testing.assert_close(unpack_step.stats[ACTION]["max"], dataset_stats[ACTION]["max"])
+    assert unpack_step.env_action_dim == 7
 
 
 def test_groot_policy_selects_n1_7_model_class(monkeypatch):
@@ -390,6 +447,98 @@ def test_qwen3_backbone_uses_nested_transformers_model_contract(monkeypatch):
         output["backbone_attention_mask"],
         torch.tensor([[True, True, False], [True, True, True]]),
     )
+
+
+def test_qwen3_backbone_can_initialize_from_config_without_downloading_weights(monkeypatch):
+    pytest.importorskip("transformers")
+
+    import lerobot.policies.groot.groot_n1_7 as groot_n1_7
+
+    class FakeLanguageModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([nn.Linear(1, 1) for _ in range(3)])
+
+    class FakeVisual(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(1, 1)
+
+    class FakeInnerModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.language_model = FakeLanguageModel()
+            self.visual = FakeVisual()
+
+    class FakeQwenForConditionalGeneration(nn.Module):
+        config = SimpleNamespace(image_token_id=42)
+        from_pretrained_called = False
+        from_config_called = False
+
+        def __init__(self):
+            super().__init__()
+            self.model = FakeInnerModel()
+
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            cls.from_pretrained_called = True
+            raise AssertionError("Qwen backbone weights should not be loaded separately")
+
+        @classmethod
+        def _from_config(cls, config, **kwargs):
+            cls.from_config_called = True
+            return cls()
+
+        def eval(self):
+            super().eval()
+            return self
+
+    monkeypatch.setattr(groot_n1_7, "Qwen3VLForConditionalGeneration", FakeQwenForConditionalGeneration)
+
+    backbone = groot_n1_7.Qwen3Backbone(
+        model_name="nvidia/Cosmos-Reason2-2B",
+        select_layer=2,
+        load_pretrained_weights=False,
+    )
+
+    assert isinstance(backbone.model, FakeQwenForConditionalGeneration)
+    assert FakeQwenForConditionalGeneration.from_config_called
+    assert not FakeQwenForConditionalGeneration.from_pretrained_called
+
+
+def test_gr00t_n1_7_from_pretrained_defers_backbone_weight_loading(monkeypatch, tmp_path):
+    from huggingface_hub.errors import HFValidationError
+
+    import lerobot.policies.groot.groot_n1_7 as groot_n1_7
+
+    called = {}
+
+    class FakeLoadedModel:
+        def __init__(self):
+            self.config = SimpleNamespace(tune_top_llm_layers=0)
+            self.backbone = SimpleNamespace(set_trainable_parameters=lambda **kwargs: None)
+            self.action_head = SimpleNamespace(set_trainable_parameters=lambda **kwargs: None)
+
+    def fake_snapshot_download(*args, **kwargs):
+        raise HFValidationError("local path")
+
+    def fake_super_from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        called["pretrained_model_name_or_path"] = pretrained_model_name_or_path
+        called.update(kwargs)
+        return FakeLoadedModel()
+
+    monkeypatch.setattr(groot_n1_7, "snapshot_download", fake_snapshot_download)
+    monkeypatch.setattr(
+        groot_n1_7.PreTrainedModel,
+        "from_pretrained",
+        classmethod(fake_super_from_pretrained),
+    )
+
+    loaded = groot_n1_7.GR00TN17.from_pretrained(str(tmp_path))
+
+    assert isinstance(loaded, FakeLoadedModel)
+    assert called["pretrained_model_name_or_path"] == str(tmp_path)
+    assert called["load_backbone_weights"] is False
 
 
 def test_gr00t_n1_7_model_forward_with_mocked_backbone():
