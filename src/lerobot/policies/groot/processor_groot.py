@@ -91,6 +91,13 @@ class _GrootN17CheckpointProcessorAssets:
     stats: dict[str, dict[str, Any]]
     embodiment_mapping: dict[str, int]
     formalize_language: bool
+    valid_action_horizon: int | None
+    max_action_horizon: int | None
+    clip_outliers: bool
+    image_crop_size: list[int] | None
+    image_target_size: list[int] | None
+    shortest_image_edge: int | None
+    crop_fraction: float | None
 
 
 def _load_n1_7_checkpoint_processor_assets(config: GrootConfig) -> _GrootN17CheckpointProcessorAssets | None:
@@ -108,11 +115,26 @@ def _load_n1_7_checkpoint_processor_assets(config: GrootConfig) -> _GrootN17Chec
     formalize_language = processor_kwargs.get("formalize_language", True)
     if not isinstance(formalize_language, bool):
         formalize_language = True
+    clip_outliers = processor_kwargs.get("clip_outliers", True)
+    if not isinstance(clip_outliers, bool):
+        clip_outliers = True
+
+    valid_action_horizon = _load_n1_7_checkpoint_action_horizon(processor_kwargs, config.embodiment_tag)
+    max_action_horizon = processor_kwargs.get("max_action_horizon")
+    if not isinstance(max_action_horizon, int):
+        max_action_horizon = None
 
     return _GrootN17CheckpointProcessorAssets(
         stats=stats,
         embodiment_mapping=embodiment_mapping,
         formalize_language=formalize_language,
+        valid_action_horizon=valid_action_horizon,
+        max_action_horizon=max_action_horizon,
+        clip_outliers=clip_outliers,
+        image_crop_size=_as_int_pair(processor_kwargs.get("image_crop_size")),
+        image_target_size=_as_int_pair(processor_kwargs.get("image_target_size")),
+        shortest_image_edge=_as_optional_int(processor_kwargs.get("shortest_image_edge")),
+        crop_fraction=_as_optional_float(processor_kwargs.get("crop_fraction")),
     )
 
 
@@ -170,6 +192,52 @@ def _load_n1_7_checkpoint_stats(
             use_percentiles=bool(use_percentiles),
         ),
     }
+
+
+def _load_n1_7_checkpoint_action_horizon(
+    processor_kwargs: dict[str, Any],
+    embodiment_tag: str,
+) -> int | None:
+    modality_configs = processor_kwargs.get("modality_configs", {})
+    if not isinstance(modality_configs, dict):
+        return None
+    embodiment_config = modality_configs.get(embodiment_tag, {})
+    if not isinstance(embodiment_config, dict):
+        return None
+    action_config = embodiment_config.get("action", {})
+    if not isinstance(action_config, dict):
+        return None
+    delta_indices = action_config.get("delta_indices", [])
+    if not isinstance(delta_indices, list):
+        return None
+    return len(delta_indices) or None
+
+
+def _as_int_pair(value: Any) -> list[int] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return None
+    try:
+        return [int(value[0]), int(value[1])]
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _flatten_n1_7_modality_stats(
@@ -253,7 +321,16 @@ def make_groot_pre_post_processors(
 
     if config.model_version == GROOT_N1_7:
         checkpoint_assets = _load_n1_7_checkpoint_processor_assets(config)
-        action_horizon = min(config.chunk_size, 40)
+        action_horizon = (
+            checkpoint_assets.max_action_horizon
+            if checkpoint_assets is not None and checkpoint_assets.max_action_horizon is not None
+            else min(config.chunk_size, 40)
+        )
+        valid_action_horizon = (
+            checkpoint_assets.valid_action_horizon
+            if checkpoint_assets is not None and checkpoint_assets.valid_action_horizon is not None
+            else action_horizon
+        )
         padded_stats = dataset_stats or (checkpoint_assets.stats if checkpoint_assets is not None else {})
         embodiment_mapping = (
             checkpoint_assets.embodiment_mapping
@@ -261,6 +338,7 @@ def make_groot_pre_post_processors(
             else dict(N1_7_EMBODIMENT_MAPPING)
         )
         formalize_language = checkpoint_assets.formalize_language if checkpoint_assets is not None else True
+        clip_outliers = checkpoint_assets.clip_outliers if checkpoint_assets is not None else True
         try:
             env_action_dim = int(config.output_features[ACTION].shape[0])
         except Exception:
@@ -272,6 +350,7 @@ def make_groot_pre_post_processors(
             GrootN17PackInputsStep(
                 state_horizon=1,
                 action_horizon=action_horizon,
+                valid_action_horizon=valid_action_horizon,
                 max_state_dim=config.max_state_dim,
                 max_action_dim=config.max_action_dim,
                 language_key="task",
@@ -280,8 +359,15 @@ def make_groot_pre_post_processors(
                 embodiment_mapping=embodiment_mapping,
                 normalize_min_max=True,
                 stats=padded_stats,
+                clip_outliers=clip_outliers,
             ),
-            GrootN17VLMEncodeStep(model_name=config.n1_7_backbone_model),
+            GrootN17VLMEncodeStep(
+                model_name=config.n1_7_backbone_model,
+                image_crop_size=checkpoint_assets.image_crop_size if checkpoint_assets is not None else None,
+                image_target_size=checkpoint_assets.image_target_size if checkpoint_assets is not None else None,
+                shortest_image_edge=checkpoint_assets.shortest_image_edge if checkpoint_assets is not None else None,
+                crop_fraction=checkpoint_assets.crop_fraction if checkpoint_assets is not None else None,
+            ),
             DeviceProcessorStep(device=config.device),
         ]
         output_steps: list[ProcessorStep] = [
@@ -289,6 +375,10 @@ def make_groot_pre_post_processors(
                 env_action_dim=env_action_dim,
                 stats=padded_stats,
                 normalize_min_max=True,
+                clip_normalized_action=True,
+                libero_gripper_action=checkpoint_assets is not None
+                and config.embodiment_tag == "libero_sim"
+                and env_action_dim == 7,
             ),
             DeviceProcessorStep(device="cpu"),
         ]
@@ -493,6 +583,46 @@ def _build_n1_7_processor(model_name: str = GROOT_N1_7_BACKBONE_MODEL) -> Proces
     )
     proc.tokenizer.padding_side = "left"
     return proc
+
+
+def _transform_n1_7_image_for_vlm(
+    image: Image.Image,
+    *,
+    image_crop_size: list[int] | None,
+    image_target_size: list[int] | None,
+    shortest_image_edge: int | None,
+    crop_fraction: float | None,
+) -> Image.Image:
+    if image_target_size is None:
+        return image
+
+    target_h, target_w = image_target_size
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+
+    square_edge = max(image.width, image.height)
+    if image.width != image.height:
+        padded = Image.new("RGB", (square_edge, square_edge))
+        left = (square_edge - image.width) // 2
+        top = (square_edge - image.height) // 2
+        padded.paste(image, (left, top))
+        image = padded
+
+    resize_edge = shortest_image_edge or target_h
+    image = image.resize((resize_edge, resize_edge), Image.Resampling.BICUBIC)
+
+    if crop_fraction is None and image_crop_size is not None:
+        crop_fraction = image_crop_size[0] / float(target_h)
+    if crop_fraction is not None and 0.0 < crop_fraction < 1.0:
+        crop_w = max(1, int(round(image.width * crop_fraction)))
+        crop_h = max(1, int(round(image.height * crop_fraction)))
+        left = max(0, (image.width - crop_w) // 2)
+        top = max(0, (image.height - crop_h) // 2)
+        image = image.crop((left, top, left + crop_w, top + crop_h))
+
+    if image.size != (target_w, target_h):
+        image = image.resize((target_w, target_h), Image.Resampling.BICUBIC)
+    return image
 
 
 @dataclass
@@ -722,6 +852,7 @@ class GrootPackInputsStep(ProcessorStep):
 class GrootN17PackInputsStep(ProcessorStep):
     state_horizon: int = 1
     action_horizon: int = 40
+    valid_action_horizon: int = 40
     max_state_dim: int = 132
     max_action_dim: int = 132
     language_key: str = "task"
@@ -730,6 +861,7 @@ class GrootN17PackInputsStep(ProcessorStep):
     embodiment_mapping: dict[str, int] = field(default_factory=lambda: dict(N1_7_EMBODIMENT_MAPPING))
     normalize_min_max: bool = True
     stats: dict[str, dict[str, Any]] | None = None
+    clip_outliers: bool = True
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         obs = transition.get(TransitionKey.OBSERVATION, {}) or {}
@@ -762,7 +894,10 @@ class GrootN17PackInputsStep(ProcessorStep):
             mask = denom != 0
             safe_denom = torch.where(mask, denom, torch.ones_like(denom))
             mapped = 2 * (x - min_v) / safe_denom - 1
-            return torch.where(mask, mapped, torch.zeros_like(mapped))
+            normalized = torch.where(mask, mapped, torch.zeros_like(mapped))
+            if self.clip_outliers:
+                normalized = normalized.clamp(-1.0, 1.0)
+            return normalized
 
         img_keys = sorted([k for k in obs if k.startswith(OBS_IMAGES)])
         if not img_keys and OBS_IMAGE in obs:
@@ -808,21 +943,18 @@ class GrootN17PackInputsStep(ProcessorStep):
                     flat = _min_max_norm(action.reshape(bsz * horizon, dim), ACTION)
                     action = flat.view(bsz, horizon, dim)
             if action.dim() == 2:
-                action = action.unsqueeze(1).repeat(1, self.action_horizon, 1)
+                action = action.unsqueeze(1)
             elif action.dim() == 3:
-                bsz, horizon, _dim = action.shape
-                if horizon < self.action_horizon:
-                    action = torch.cat(
-                        [action, action[:, -1:, :].repeat(1, self.action_horizon - horizon, 1)],
-                        dim=1,
-                    )
-                elif horizon > self.action_horizon:
-                    action = action[:, : self.action_horizon, :]
+                pass
             else:
                 raise ValueError(f"action must be (B, D) or (B, T, D), got {tuple(action.shape)}")
 
             bsz, horizon, dim = action.shape
             valid_dim = min(dim, self.max_action_dim)
+            valid_horizon = min(horizon, self.valid_action_horizon, self.action_horizon)
+            if horizon > self.action_horizon:
+                action = action[:, : self.action_horizon, :]
+                horizon = self.action_horizon
             if dim > self.max_action_dim:
                 action = action[:, :, : self.max_action_dim]
             elif dim < self.max_action_dim:
@@ -830,13 +962,31 @@ class GrootN17PackInputsStep(ProcessorStep):
                     bsz, horizon, self.max_action_dim - dim, dtype=action.dtype, device=action.device
                 )
                 action = torch.cat([action, pad], dim=2)
+            if horizon < self.action_horizon:
+                pad = torch.zeros(
+                    bsz,
+                    self.action_horizon - horizon,
+                    self.max_action_dim,
+                    dtype=action.dtype,
+                    device=action.device,
+                )
+                action = torch.cat([action, pad], dim=1)
+                horizon = self.action_horizon
+            if valid_horizon < horizon:
+                action = action.clone()
+                action[:, valid_horizon:, :] = 0
             action_mask = torch.zeros(bsz, horizon, self.max_action_dim, dtype=torch.float32, device=action.device)
-            action_mask[:, :, :valid_dim] = 1.0
+            action_mask[:, :valid_horizon, :valid_dim] = 1.0
             transition[TransitionKey.ACTION] = action
             comp["action_mask"] = action_mask
 
         emb_id = self.embodiment_mapping.get(self.embodiment_tag, 0)
         bsz, device = _infer_n1_7_batch_size_and_device(obs, transition.get(TransitionKey.ACTION))
+        if "action_mask" not in comp:
+            action_mask = torch.zeros(bsz, self.action_horizon, dtype=torch.float32, device=device)
+            valid_horizon = min(self.valid_action_horizon, self.action_horizon)
+            action_mask[:, :valid_horizon] = 1.0
+            comp["action_mask"] = action_mask
         comp["embodiment_id"] = torch.full((bsz,), emb_id, dtype=torch.long, device=device)
 
         transition[TransitionKey.OBSERVATION] = obs
@@ -850,6 +1000,7 @@ class GrootN17PackInputsStep(ProcessorStep):
         return {
             "state_horizon": self.state_horizon,
             "action_horizon": self.action_horizon,
+            "valid_action_horizon": self.valid_action_horizon,
             "max_state_dim": self.max_state_dim,
             "max_action_dim": self.max_action_dim,
             "language_key": self.language_key,
@@ -857,6 +1008,7 @@ class GrootN17PackInputsStep(ProcessorStep):
             "embodiment_tag": self.embodiment_tag,
             "embodiment_mapping": self.embodiment_mapping,
             "normalize_min_max": self.normalize_min_max,
+            "clip_outliers": self.clip_outliers,
         }
 
     def state_dict(self) -> dict[str, torch.Tensor]:
@@ -885,6 +1037,10 @@ class GrootN17PackInputsStep(ProcessorStep):
 @ProcessorStepRegistry.register(name="groot_n1_7_vlm_encode_v1")
 class GrootN17VLMEncodeStep(ProcessorStep):
     model_name: str = GROOT_N1_7_BACKBONE_MODEL
+    image_crop_size: list[int] | None = None
+    image_target_size: list[int] | None = None
+    shortest_image_edge: int | None = None
+    crop_fraction: float | None = None
     _proc: ProcessorMixin | None = field(default=None, init=False, repr=False)
 
     @property
@@ -911,7 +1067,13 @@ class GrootN17VLMEncodeStep(ProcessorStep):
         for batch_idx in range(video.shape[0]):
             sample = video[batch_idx]  # (T, V, H, W, C)
             sample_images = [
-                Image.fromarray(sample[timestep, view_idx])
+                _transform_n1_7_image_for_vlm(
+                    Image.fromarray(sample[timestep, view_idx]),
+                    image_crop_size=self.image_crop_size,
+                    image_target_size=self.image_target_size,
+                    shortest_image_edge=self.shortest_image_edge,
+                    crop_fraction=self.crop_fraction,
+                )
                 for timestep in range(sample.shape[0])
                 for view_idx in range(sample.shape[1])
             ]
@@ -945,7 +1107,13 @@ class GrootN17VLMEncodeStep(ProcessorStep):
         return features
 
     def get_config(self) -> dict[str, Any]:
-        return {"model_name": self.model_name}
+        return {
+            "model_name": self.model_name,
+            "image_crop_size": self.image_crop_size,
+            "image_target_size": self.image_target_size,
+            "shortest_image_edge": self.shortest_image_edge,
+            "crop_fraction": self.crop_fraction,
+        }
 
 
 @dataclass
@@ -1090,6 +1258,9 @@ class GrootActionUnpackUnnormalizeStep(ProcessorStep):
     # Apply inverse of min-max normalization if it was used in preprocessor
     normalize_min_max: bool = True
     stats: dict[str, dict[str, Any]] | None = None
+    clip_normalized_action: bool = False
+    libero_gripper_action: bool = False
+    libero_gripper_binarize: bool = True
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         # Expect model outputs to be in TransitionKey.ACTION as (B, T, D_model)
@@ -1108,6 +1279,8 @@ class GrootActionUnpackUnnormalizeStep(ProcessorStep):
         # forward: y = 2 * (x - min) / denom - 1, with y=0 when denom==0
         # inverse: x = (y+1)/2 * denom + min, and when denom==0 -> x = min
         if self.normalize_min_max and self.stats is not None:
+            if self.clip_normalized_action:
+                action = action.clamp(-1.0, 1.0)
             stats_k = self.stats.get(ACTION, {})
             d = action.shape[-1]
             min_v = torch.as_tensor(
@@ -1128,6 +1301,15 @@ class GrootActionUnpackUnnormalizeStep(ProcessorStep):
             inv = (action + 1.0) * 0.5 * safe_denom + min_v
             action = torch.where(mask, inv, min_v)
 
+        if self.libero_gripper_action and action.shape[-1] >= 7:
+            gripper = action[..., -1]
+            if self.libero_gripper_binarize:
+                gripper = -torch.sign(2.0 * gripper - 1.0)
+            else:
+                gripper = -(2.0 * gripper - 1.0)
+            action = action.clone()
+            action[..., -1] = gripper
+
         transition[TransitionKey.ACTION] = action
         return transition
 
@@ -1143,6 +1325,9 @@ class GrootActionUnpackUnnormalizeStep(ProcessorStep):
         return {
             "env_action_dim": self.env_action_dim,
             "normalize_min_max": self.normalize_min_max,
+            "clip_normalized_action": self.clip_normalized_action,
+            "libero_gripper_action": self.libero_gripper_action,
+            "libero_gripper_binarize": self.libero_gripper_binarize,
         }
 
     def state_dict(self) -> dict[str, torch.Tensor]:

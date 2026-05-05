@@ -51,6 +51,8 @@ from .configuration_groot import (
     GROOT_N1_7,
     GrootConfig,
     infer_groot_model_version,
+    infer_groot_n1_7_action_execution_horizon,
+    infer_groot_n1_7_action_horizon,
     normalize_groot_model_version,
 )
 from .groot_n1 import GR00TN15
@@ -73,6 +75,7 @@ class GrootPolicy(PreTrainedPolicy):
 
         # Initialize GR00T model using ported components
         self._groot_model = self._create_groot_model()
+        self._action_queue_steps = self._resolve_action_queue_steps()
 
         self.reset()
 
@@ -113,7 +116,7 @@ class GrootPolicy(PreTrainedPolicy):
 
     def reset(self):
         """Reset policy state when environment resets."""
-        self._action_queue = deque([], maxlen=self.config.n_action_steps)
+        self._action_queue = deque([], maxlen=self._action_queue_steps)
 
     @classmethod
     def from_pretrained(
@@ -269,6 +272,26 @@ class GrootPolicy(PreTrainedPolicy):
     def get_optim_params(self) -> dict:
         return self.parameters()
 
+    def _resolve_action_queue_steps(self) -> int:
+        n_action_steps = int(self.config.n_action_steps)
+        if self.config.model_version != GROOT_N1_7:
+            return n_action_steps
+
+        checkpoint_action_horizon = infer_groot_n1_7_action_horizon(
+            self.config.base_model_path,
+            self.config.embodiment_tag,
+        )
+        execution_horizon = infer_groot_n1_7_action_execution_horizon(
+            self.config.base_model_path,
+            self.config.embodiment_tag,
+        )
+        horizons = [n_action_steps]
+        if checkpoint_action_horizon is not None:
+            horizons.append(checkpoint_action_horizon)
+        if execution_horizon is not None:
+            horizons.append(execution_horizon)
+        return min(horizons)
+
     def _filter_groot_inputs(self, batch: dict[str, Tensor], *, include_action: bool) -> dict[str, Tensor]:
         allowed_base = {"state", "state_mask", "embodiment_id"}
         if include_action:
@@ -276,6 +299,7 @@ class GrootPolicy(PreTrainedPolicy):
 
         if self.config.model_version == GROOT_N1_7:
             allowed_base.update({"input_ids", "attention_mask", "pixel_values", "image_grid_thw"})
+            allowed_base.add("action_mask")
         else:
             allowed_base.update({"action_mask"} if include_action else set())
 
@@ -316,7 +340,8 @@ class GrootPolicy(PreTrainedPolicy):
         self.eval()
 
         # Preprocessing is handled by the processor pipeline, so we just filter the batch.
-        # During inference, we do not pass action/action_mask because those are predicted.
+        # During inference, we do not pass action because it is predicted.
+        # N1.7 still carries a 2-D action horizon mask from its checkpoint processor.
         groot_inputs = self._filter_groot_inputs(batch, include_action=False)
 
         # Get device from model parameters
@@ -340,7 +365,7 @@ class GrootPolicy(PreTrainedPolicy):
 
         if len(self._action_queue) == 0:
             actions = self.predict_action_chunk(batch)
-            self._action_queue.extend(actions.transpose(0, 1))
+            self._action_queue.extend(actions[:, : self._action_queue_steps].transpose(0, 1))
         return self._action_queue.popleft()
 
     # -------------------------

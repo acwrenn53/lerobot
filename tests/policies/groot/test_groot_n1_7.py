@@ -86,7 +86,13 @@ def _write_raw_n1_7_libero_checkpoint(path):
             {
                 "processor_class": "Gr00tN1d7Processor",
                 "processor_kwargs": {
+                    "clip_outliers": True,
                     "formalize_language": False,
+                    "image_crop_size": [230, 230],
+                    "image_target_size": [256, 256],
+                    "shortest_image_edge": 256,
+                    "crop_fraction": 0.95,
+                    "max_action_horizon": 40,
                     "use_percentiles": True,
                     "modality_configs": {
                         "libero_sim": {
@@ -280,6 +286,7 @@ def test_pretrained_config_loads_raw_n1_7_libero_checkpoint(tmp_path, monkeypatc
     assert config.model_version == GROOT_N1_7
     assert config.base_model_path == str(model_path)
     assert config.embodiment_tag == "libero_sim"
+    assert config.n_action_steps == 8
     assert config.n1_7_backbone_model == str(cosmos_snapshot)
 
 
@@ -299,6 +306,9 @@ def test_raw_n1_7_libero_checkpoint_processors_use_checkpoint_assets(tmp_path):
     assert pack_inputs.embodiment_tag == "libero_sim"
     assert pack_inputs.embodiment_mapping["libero_sim"] == 42
     assert pack_inputs.formalize_language is False
+    assert pack_inputs.valid_action_horizon == 16
+    assert pack_inputs.action_horizon == 40
+    assert pack_inputs.clip_outliers is True
     assert pack_inputs.stats[OBS_STATE]["min"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
     assert unpack_actions.stats[ACTION]["max"] == [
         109.0,
@@ -309,6 +319,114 @@ def test_raw_n1_7_libero_checkpoint_processors_use_checkpoint_assets(tmp_path):
         114.0,
         115.0,
     ]
+    assert unpack_actions.clip_normalized_action is True
+    assert unpack_actions.libero_gripper_action is True
+
+
+def test_groot_n1_7_pack_inputs_clips_and_masks_only_valid_action_horizon():
+    step = GrootN17PackInputsStep(
+        action_horizon=40,
+        valid_action_horizon=16,
+        max_state_dim=4,
+        max_action_dim=4,
+        normalize_min_max=True,
+        clip_outliers=True,
+        stats={
+            OBS_STATE: {"min": [0.0, 0.0], "max": [1.0, 1.0]},
+            ACTION: {"min": [0.0, 0.0], "max": [1.0, 1.0]},
+        },
+    )
+    transition = {
+        TransitionKey.OBSERVATION: {
+            OBS_STATE: torch.tensor([[2.0, -1.0]]),
+        },
+        TransitionKey.ACTION: torch.full((1, 16, 2), 1.0),
+        TransitionKey.COMPLEMENTARY_DATA: {"task": ["Move"]},
+    }
+
+    output = step(transition)
+
+    torch.testing.assert_close(
+        output[TransitionKey.OBSERVATION]["state"][0, 0, :2],
+        torch.tensor([1.0, -1.0]),
+    )
+    assert output[TransitionKey.ACTION].shape == (1, 40, 4)
+    torch.testing.assert_close(output[TransitionKey.ACTION][0, 16:], torch.zeros(24, 4))
+    action_mask = output[TransitionKey.COMPLEMENTARY_DATA]["action_mask"]
+    assert action_mask.shape == (1, 40, 4)
+    assert action_mask[0, :16, :2].sum().item() == 32
+    assert action_mask[0, 16:].sum().item() == 0
+    assert action_mask[0, :, 2:].sum().item() == 0
+
+
+def test_groot_n1_7_pack_inputs_adds_inference_action_horizon_mask():
+    step = GrootN17PackInputsStep(
+        action_horizon=40,
+        valid_action_horizon=16,
+        max_state_dim=8,
+        max_action_dim=7,
+        normalize_min_max=False,
+    )
+    transition = {
+        TransitionKey.OBSERVATION: {
+            OBS_STATE: torch.zeros(2, 8),
+        },
+        TransitionKey.COMPLEMENTARY_DATA: {"task": ["Move", "Place"]},
+    }
+
+    output = step(transition)
+
+    action_mask = output[TransitionKey.COMPLEMENTARY_DATA]["action_mask"]
+    assert action_mask.shape == (2, 40)
+    assert action_mask[:, :16].sum().item() == 32
+    assert action_mask[:, 16:].sum().item() == 0
+
+
+def test_groot_n1_7_postprocessor_clips_normalized_action_before_unnormalizing():
+    step = GrootActionUnpackUnnormalizeStep(
+        env_action_dim=3,
+        normalize_min_max=True,
+        clip_normalized_action=True,
+        stats={
+            ACTION: {
+                "min": [0.0, 0.0, 0.0],
+                "max": [10.0, 10.0, 10.0],
+            }
+        },
+    )
+    transition = {
+        TransitionKey.ACTION: torch.tensor([[-2.0, 0.0, 2.0]]),
+    }
+
+    output = step(transition)
+
+    torch.testing.assert_close(output[TransitionKey.ACTION], torch.tensor([[0.0, 5.0, 10.0]]))
+
+
+def test_groot_n1_7_postprocessor_converts_libero_gripper_convention():
+    step = GrootActionUnpackUnnormalizeStep(
+        env_action_dim=7,
+        normalize_min_max=True,
+        stats={
+            ACTION: {
+                "min": [0.0] * 7,
+                "max": [1.0] * 7,
+            }
+        },
+        libero_gripper_action=True,
+    )
+    transition = {
+        TransitionKey.ACTION: torch.tensor(
+            [
+                [-1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0],
+                [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+            ]
+        )
+    }
+
+    output = step(transition)
+
+    torch.testing.assert_close(output[TransitionKey.ACTION][:, -1], torch.tensor([1.0, -1.0]))
 
 
 def test_groot_from_pretrained_rejects_caller_config_mismatch_from_local_config(tmp_path):
@@ -416,11 +534,21 @@ def test_groot_n1_7_vlm_encode_uses_per_sample_language():
 
 
 def test_groot_n1_7_vlm_encode_config_round_trips_model_name():
-    step = GrootN17VLMEncodeStep(model_name="local-cosmos")
+    step = GrootN17VLMEncodeStep(
+        model_name="local-cosmos",
+        image_crop_size=[230, 230],
+        image_target_size=[256, 256],
+        shortest_image_edge=256,
+        crop_fraction=0.95,
+    )
 
     restored = GrootN17VLMEncodeStep(**step.get_config())
 
     assert restored.model_name == "local-cosmos"
+    assert restored.image_crop_size == [230, 230]
+    assert restored.image_target_size == [256, 256]
+    assert restored.shortest_image_edge == 256
+    assert restored.crop_fraction == 0.95
 
 
 def test_groot_n1_7_processor_uses_qwen_component_assets(monkeypatch):
@@ -568,6 +696,58 @@ def test_groot_policy_forwards_n1_7_qwen_inputs(monkeypatch):
         "pixel_values",
         "image_grid_thw",
     }
+
+
+def test_groot_n1_7_select_action_uses_checkpoint_valid_horizon(tmp_path, monkeypatch):
+    from lerobot.policies.groot.groot_n1_7 import GR00TN17
+
+    model_path = tmp_path / "libero_spatial"
+    _write_raw_n1_7_libero_checkpoint(model_path)
+
+    class HorizonModel(_DummyGrootModel):
+        def get_action(self, inputs):
+            assert inputs["action_mask"].shape == (1, 40)
+            assert inputs["action_mask"][0, :16].sum().item() == 16
+            assert inputs["action_mask"][0, 16:].sum().item() == 0
+            batch_size = inputs["state"].shape[0]
+            steps = torch.arange(40, dtype=torch.float32).view(1, 40, 1).expand(batch_size, 40, 132)
+            return {"action_pred": steps}
+
+    monkeypatch.setattr(GR00TN17, "from_pretrained", classmethod(lambda cls, **kwargs: HorizonModel()))
+    input_features, output_features = _groot_features(state_dim=8, action_dim=7)
+    config = GrootConfig(
+        model_version=GROOT_N1_7,
+        base_model_path=str(model_path),
+        embodiment_tag="libero_sim",
+        input_features=input_features,
+        output_features=output_features,
+        device="cpu",
+        use_bf16=False,
+        n_action_steps=40,
+    )
+    policy = GrootPolicy(config)
+    batch = {
+        "state": torch.zeros(1, 1, 132),
+        "embodiment_id": torch.zeros(1, dtype=torch.long),
+        "input_ids": torch.ones(1, 2, dtype=torch.long),
+        "attention_mask": torch.ones(1, 2, dtype=torch.long),
+        "pixel_values": torch.zeros(1, 3, 2, 2),
+        "image_grid_thw": torch.ones(1, 3, dtype=torch.long),
+        "action_mask": torch.cat((torch.ones(1, 16), torch.zeros(1, 24)), dim=1),
+    }
+
+    first_action = policy.select_action(batch)
+
+    assert policy._action_queue_steps == 8
+    assert len(policy._action_queue) == 7
+    torch.testing.assert_close(first_action[0, 0], torch.tensor(0.0))
+
+    for expected_step in range(1, 8):
+        action = policy.select_action(batch)
+        torch.testing.assert_close(action[0, 0], torch.tensor(float(expected_step)))
+
+    refreshed_action = policy.select_action(batch)
+    torch.testing.assert_close(refreshed_action[0, 0], torch.tensor(0.0))
 
 
 def test_qwen3_backbone_uses_nested_transformers_model_contract(monkeypatch):

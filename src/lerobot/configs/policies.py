@@ -250,6 +250,8 @@ def _maybe_load_groot_n1_7_policy_config(
         GROOT_N1_7_BACKBONE_MODEL,
         GrootConfig,
         infer_groot_model_version,
+        infer_groot_n1_7_action_execution_horizon,
+        infer_groot_n1_7_action_horizon,
         infer_groot_n1_7_embodiment_tag,
         is_raw_groot_n1_7_checkpoint,
         resolve_groot_n1_7_backbone_model,
@@ -289,6 +291,14 @@ def _maybe_load_groot_n1_7_policy_config(
     embodiment_tag = infer_groot_n1_7_embodiment_tag(checkpoint_path)
     if embodiment_tag is not None:
         groot_config["embodiment_tag"] = embodiment_tag
+        action_horizon = infer_groot_n1_7_action_horizon(checkpoint_path, embodiment_tag)
+        if action_horizon is not None:
+            groot_config["n_action_steps"] = min(groot_config.get("n_action_steps", action_horizon), action_horizon)
+        execution_horizon = infer_groot_n1_7_action_execution_horizon(checkpoint_path, embodiment_tag)
+        if execution_horizon is not None:
+            groot_config["n_action_steps"] = min(
+                groot_config.get("n_action_steps", execution_horizon), execution_horizon
+            )
 
     with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as f:
         json.dump(groot_config, f)

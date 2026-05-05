@@ -106,6 +106,57 @@ def infer_groot_n1_7_embodiment_tag(model_path: str | Path | None) -> str | None
     return None
 
 
+def infer_groot_n1_7_action_horizon(model_path: str | Path | None, embodiment_tag: str | None = None) -> int | None:
+    if model_path is None:
+        return None
+
+    processor_config_path = Path(model_path).expanduser() / "processor_config.json"
+    try:
+        with processor_config_path.open() as f:
+            processor_config = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    processor_kwargs = processor_config.get("processor_kwargs", {})
+    if not isinstance(processor_kwargs, dict):
+        return None
+    modality_configs = processor_kwargs.get("modality_configs", {})
+    if not isinstance(modality_configs, dict):
+        return None
+
+    if embodiment_tag is None:
+        embodiment_tag = infer_groot_n1_7_embodiment_tag(model_path)
+    if embodiment_tag is None:
+        return None
+
+    embodiment_config = modality_configs.get(embodiment_tag, {})
+    if not isinstance(embodiment_config, dict):
+        return None
+    action_config = embodiment_config.get("action", {})
+    if not isinstance(action_config, dict):
+        return None
+    delta_indices = action_config.get("delta_indices", [])
+    if not isinstance(delta_indices, list):
+        return None
+    return len(delta_indices) or None
+
+
+def infer_groot_n1_7_action_execution_horizon(
+    model_path: str | Path | None, embodiment_tag: str | None = None
+) -> int | None:
+    action_horizon = infer_groot_n1_7_action_horizon(model_path, embodiment_tag)
+    if action_horizon is None:
+        return None
+
+    if embodiment_tag is None:
+        embodiment_tag = infer_groot_n1_7_embodiment_tag(model_path)
+    if embodiment_tag == "libero_sim":
+        # NVIDIA's N1.7 LIBERO rollout wrapper replans after 8 of the 16 decoded
+        # actions. Keeping that execution cadence avoids stale open-loop chunks.
+        return min(action_horizon, 8)
+    return action_horizon
+
+
 def resolve_groot_n1_7_backbone_model(model_name: str, cache_dir: str | Path | None = None) -> str:
     model_path = Path(model_name).expanduser()
     if model_path.exists():
