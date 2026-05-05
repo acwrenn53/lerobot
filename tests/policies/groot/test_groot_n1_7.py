@@ -541,6 +541,51 @@ def test_gr00t_n1_7_from_pretrained_defers_backbone_weight_loading(monkeypatch, 
     assert called["load_backbone_weights"] is False
 
 
+def test_gr00t_n1_7_action_head_meta_init_defers_beta_distribution():
+    pytest.importorskip("diffusers")
+
+    from lerobot.policies.groot.groot_n1_7 import GR00TN17ActionHead, GR00TN17Config
+
+    config = GR00TN17Config(
+        backbone_embedding_dim=32,
+        hidden_size=32,
+        input_embedding_dim=32,
+        max_state_dim=7,
+        max_action_dim=5,
+        action_horizon=4,
+        state_history_length=1,
+        max_num_embodiments=4,
+        use_alternate_vl_dit=False,
+        use_vlln=False,
+        add_pos_embed=False,
+        vl_self_attention_cfg={"num_layers": 0},
+        diffusion_model_cfg={
+            "positional_embeddings": None,
+            "num_layers": 1,
+            "num_attention_heads": 2,
+            "attention_head_dim": 16,
+            "norm_type": "ada_norm",
+            "dropout": 0.0,
+            "final_dropout": False,
+            "output_dim": 32,
+            "interleave_self_attention": False,
+        },
+    )
+
+    with torch.device("meta"):
+        meta_action_head = GR00TN17ActionHead(config)
+
+    assert meta_action_head._beta_dist is None
+    assert any(parameter.is_meta for parameter in meta_action_head.parameters())
+
+    action_head = GR00TN17ActionHead(config)
+    sample = action_head.sample_time(batch_size=3, device=torch.device("cpu"), dtype=torch.float32)
+
+    assert action_head._beta_dist is not None
+    assert sample.shape == (3,)
+    assert torch.isfinite(sample).all()
+
+
 def test_gr00t_n1_7_model_forward_with_mocked_backbone():
     pytest.importorskip("diffusers")
     pytest.importorskip("transformers")

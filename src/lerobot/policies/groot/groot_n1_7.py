@@ -427,7 +427,9 @@ class GR00TN17ActionHead(nn.Module):
             self.position_embedding = nn.Embedding(config.max_seq_len, self.input_embedding_dim)
             nn.init.normal_(self.position_embedding.weight, mean=0.0, std=0.02)
         self.state_dropout_prob = config.state_dropout_prob
-        self.beta_dist = Beta(config.noise_beta_alpha, config.noise_beta_beta)
+        self._noise_beta_alpha = config.noise_beta_alpha
+        self._noise_beta_beta = config.noise_beta_beta
+        self._beta_dist = None
         self.num_timestep_buckets = config.num_timestep_buckets
         self.set_trainable_parameters(config.tune_projector, config.tune_diffusion_model, config.tune_vlln)
 
@@ -466,7 +468,11 @@ class GR00TN17ActionHead(nn.Module):
                 self.vl_self_attention.eval()
 
     def sample_time(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        sample = self.beta_dist.sample([batch_size]).to(device, dtype=dtype)
+        if self._beta_dist is None:
+            beta_alpha = torch.tensor(self._noise_beta_alpha, device="cpu", dtype=torch.float32)
+            beta_beta = torch.tensor(self._noise_beta_beta, device="cpu", dtype=torch.float32)
+            self._beta_dist = Beta(beta_alpha, beta_beta, validate_args=False)
+        sample = self._beta_dist.sample([batch_size]).to(device, dtype=dtype)
         return (1 - sample) * self.config.noise_s
 
     def process_backbone_output(self, backbone_output: BatchFeature) -> BatchFeature:
