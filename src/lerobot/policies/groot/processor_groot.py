@@ -321,14 +321,27 @@ def _build_eagle_processor(tokenizer_assets_repo: str = DEFAULT_TOKENIZER_ASSETS
 
 def _build_n1_7_processor(model_name: str = GROOT_N1_7_BACKBONE_MODEL) -> ProcessorMixin:
     try:
-        from transformers import Qwen3VLProcessor
+        from transformers import (
+            AutoTokenizer,
+            Qwen2VLImageProcessorFast,
+            Qwen3VLProcessor,
+            Qwen3VLVideoProcessor,
+        )
     except ImportError as exc:
         raise ImportError(
-            "GR00T N1.7 preprocessing requires a transformers version with Qwen3VLProcessor. "
+            "GR00T N1.7 preprocessing requires a transformers version with Qwen3-VL processor support. "
             "Install the GR00T optional dependencies with `pip install 'lerobot[groot]'`."
         ) from exc
 
-    proc = Qwen3VLProcessor.from_pretrained(model_name, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    image_processor = Qwen2VLImageProcessorFast.from_pretrained(model_name, trust_remote_code=True)
+    video_processor = Qwen3VLVideoProcessor.from_pretrained(model_name, trust_remote_code=True)
+    proc = Qwen3VLProcessor(
+        image_processor=image_processor,
+        tokenizer=tokenizer,
+        video_processor=video_processor,
+        chat_template=tokenizer.chat_template,
+    )
     proc.tokenizer.padding_side = "left"
     return proc
 

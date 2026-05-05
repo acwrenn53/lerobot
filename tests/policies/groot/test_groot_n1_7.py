@@ -279,6 +279,68 @@ def test_groot_n1_7_vlm_encode_config_round_trips_model_name():
     assert restored.model_name == "local-cosmos"
 
 
+def test_groot_n1_7_processor_uses_qwen_component_assets(monkeypatch):
+    pytest.importorskip("transformers")
+
+    import transformers
+
+    from lerobot.policies.groot import processor_groot
+
+    calls = []
+
+    class FakeTokenizer:
+        chat_template = "fake-chat-template"
+        padding_side = "right"
+
+        @classmethod
+        def from_pretrained(cls, model_name, **kwargs):
+            calls.append(("tokenizer", model_name, kwargs))
+            return cls()
+
+    class FakeImageProcessor:
+        @classmethod
+        def from_pretrained(cls, model_name, **kwargs):
+            calls.append(("image_processor", model_name, kwargs))
+            return cls()
+
+    class FakeVideoProcessor:
+        @classmethod
+        def from_pretrained(cls, model_name, **kwargs):
+            calls.append(("video_processor", model_name, kwargs))
+            return cls()
+
+    class FakeProcessor:
+        from_pretrained_called = False
+
+        def __init__(self, *, image_processor, tokenizer, video_processor, chat_template):
+            self.image_processor = image_processor
+            self.tokenizer = tokenizer
+            self.video_processor = video_processor
+            self.chat_template = chat_template
+
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            cls.from_pretrained_called = True
+            raise AssertionError("Cosmos does not publish processor_config.json")
+
+    monkeypatch.setattr(transformers, "AutoTokenizer", FakeTokenizer)
+    monkeypatch.setattr(transformers, "Qwen2VLImageProcessorFast", FakeImageProcessor)
+    monkeypatch.setattr(transformers, "Qwen3VLVideoProcessor", FakeVideoProcessor)
+    monkeypatch.setattr(transformers, "Qwen3VLProcessor", FakeProcessor)
+
+    processor = processor_groot._build_n1_7_processor("nvidia/Cosmos-Reason2-2B")
+
+    assert [call[:2] for call in calls] == [
+        ("tokenizer", "nvidia/Cosmos-Reason2-2B"),
+        ("image_processor", "nvidia/Cosmos-Reason2-2B"),
+        ("video_processor", "nvidia/Cosmos-Reason2-2B"),
+    ]
+    assert all(call[2] == {"trust_remote_code": True} for call in calls)
+    assert processor.tokenizer.padding_side == "left"
+    assert processor.chat_template == "fake-chat-template"
+    assert not FakeProcessor.from_pretrained_called
+
+
 def test_groot_n1_7_saved_processors_reload_through_factory(tmp_path):
     config = _groot_config(GROOT_N1_7)
     dataset_stats = {
