@@ -312,6 +312,7 @@ def test_raw_n1_7_libero_checkpoint_processors_use_checkpoint_assets(tmp_path):
     assert pack_inputs.valid_action_horizon == 16
     assert pack_inputs.action_horizon == 40
     assert pack_inputs.clip_outliers is True
+    assert pack_inputs.video_modality_keys == ["image", "wrist_image"]
     assert pack_inputs.stats[OBS_STATE]["min"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
     assert vlm_encode.image_crop_size == [230, 230]
     assert vlm_encode.image_target_size == [256, 256]
@@ -389,6 +390,30 @@ def test_groot_n1_7_pack_inputs_adds_inference_action_horizon_mask():
     assert action_mask[:, :16].sum().item() == 32
     assert action_mask[:, 16:].sum().item() == 0
     assert output[TransitionKey.COMPLEMENTARY_DATA]["embodiment_id"].dtype == torch.int32
+
+
+def test_groot_n1_7_pack_inputs_orders_video_by_checkpoint_modality_keys():
+    step = GrootN17PackInputsStep(
+        normalize_min_max=False,
+        video_modality_keys=["image", "wrist_image"],
+    )
+    transition = {
+        TransitionKey.OBSERVATION: {
+            f"{OBS_IMAGES}.extra": torch.full((1, 3, 2, 2), 0.5),
+            f"{OBS_IMAGES}.image2": torch.ones(1, 3, 2, 2),
+            f"{OBS_IMAGES}.image": torch.zeros(1, 3, 2, 2),
+            OBS_STATE: torch.zeros(1, 8),
+        },
+        TransitionKey.COMPLEMENTARY_DATA: {"task": ["Move"]},
+    }
+
+    output = step(transition)
+
+    video = output[TransitionKey.OBSERVATION]["video"]
+    assert video.shape == (1, 1, 2, 2, 2, 3)
+    assert video[0, 0, 0].max() == 0
+    assert video[0, 0, 1].min() == 255
+    assert f"{OBS_IMAGES}.extra" not in output[TransitionKey.OBSERVATION]
 
 
 def test_groot_n1_7_postprocessor_clips_normalized_action_before_unnormalizing():

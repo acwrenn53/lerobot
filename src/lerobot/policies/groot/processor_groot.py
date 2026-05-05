@@ -94,6 +94,7 @@ class _GrootN17CheckpointProcessorAssets:
     valid_action_horizon: int | None
     max_action_horizon: int | None
     clip_outliers: bool
+    video_modality_keys: list[str] | None
     image_crop_size: list[int] | None
     image_target_size: list[int] | None
     shortest_image_edge: int | None
@@ -124,6 +125,9 @@ def _load_n1_7_checkpoint_processor_assets(config: GrootConfig) -> _GrootN17Chec
         use_albumentations = False
 
     valid_action_horizon = _load_n1_7_checkpoint_action_horizon(processor_kwargs, config.embodiment_tag)
+    video_modality_keys = _load_n1_7_checkpoint_video_modality_keys(
+        processor_kwargs, config.embodiment_tag
+    )
     max_action_horizon = processor_kwargs.get("max_action_horizon")
     if not isinstance(max_action_horizon, int):
         max_action_horizon = None
@@ -135,6 +139,7 @@ def _load_n1_7_checkpoint_processor_assets(config: GrootConfig) -> _GrootN17Chec
         valid_action_horizon=valid_action_horizon,
         max_action_horizon=max_action_horizon,
         clip_outliers=clip_outliers,
+        video_modality_keys=video_modality_keys,
         image_crop_size=_as_int_pair(processor_kwargs.get("image_crop_size")),
         image_target_size=_as_int_pair(processor_kwargs.get("image_target_size")),
         shortest_image_edge=_as_optional_int(processor_kwargs.get("shortest_image_edge")),
@@ -216,6 +221,26 @@ def _load_n1_7_checkpoint_action_horizon(
     if not isinstance(delta_indices, list):
         return None
     return len(delta_indices) or None
+
+
+def _load_n1_7_checkpoint_video_modality_keys(
+    processor_kwargs: dict[str, Any],
+    embodiment_tag: str,
+) -> list[str] | None:
+    modality_configs = processor_kwargs.get("modality_configs", {})
+    if not isinstance(modality_configs, dict):
+        return None
+    embodiment_config = modality_configs.get(embodiment_tag, {})
+    if not isinstance(embodiment_config, dict):
+        return None
+    video_config = embodiment_config.get("video", {})
+    if not isinstance(video_config, dict):
+        return None
+    modality_keys = video_config.get("modality_keys", [])
+    if not isinstance(modality_keys, list):
+        return None
+    keys = [key for key in modality_keys if isinstance(key, str)]
+    return keys or None
 
 
 def _as_int_pair(value: Any) -> list[int] | None:
@@ -344,6 +369,7 @@ def make_groot_pre_post_processors(
         )
         formalize_language = checkpoint_assets.formalize_language if checkpoint_assets is not None else True
         clip_outliers = checkpoint_assets.clip_outliers if checkpoint_assets is not None else True
+        video_modality_keys = checkpoint_assets.video_modality_keys if checkpoint_assets is not None else None
         try:
             env_action_dim = int(config.output_features[ACTION].shape[0])
         except Exception:
@@ -365,6 +391,7 @@ def make_groot_pre_post_processors(
                 normalize_min_max=True,
                 stats=padded_stats,
                 clip_outliers=clip_outliers,
+                video_modality_keys=video_modality_keys,
             ),
             GrootN17VLMEncodeStep(
                 model_name=config.n1_7_backbone_model,
@@ -917,6 +944,30 @@ class GrootN17PackInputsStep(ProcessorStep):
     normalize_min_max: bool = True
     stats: dict[str, dict[str, Any]] | None = None
     clip_outliers: bool = True
+    video_modality_keys: list[str] | None = None
+
+    def _ordered_image_keys(self, obs: dict[str, Any]) -> list[str]:
+        available = {key for key in obs if key.startswith(OBS_IMAGES)}
+        if not available and OBS_IMAGE in obs:
+            return [OBS_IMAGE]
+        if not self.video_modality_keys:
+            return sorted(available)
+
+        ordered: list[str] = []
+        for modality_key in self.video_modality_keys:
+            candidates = [f"{OBS_IMAGES}.{modality_key}"]
+            if modality_key == "wrist_image":
+                candidates.append(f"{OBS_IMAGES}.image2")
+            elif modality_key == "image":
+                candidates.append(f"{OBS_IMAGES}.image")
+
+            match = next((candidate for candidate in candidates if candidate in available), None)
+            if match is not None:
+                ordered.append(match)
+
+        if not ordered:
+            return sorted(available)
+        return ordered
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         obs = transition.get(TransitionKey.OBSERVATION, {}) or {}
@@ -954,14 +1005,15 @@ class GrootN17PackInputsStep(ProcessorStep):
                 normalized = normalized.clamp(-1.0, 1.0)
             return normalized
 
-        img_keys = sorted([k for k in obs if k.startswith(OBS_IMAGES)])
-        if not img_keys and OBS_IMAGE in obs:
-            img_keys = [OBS_IMAGE]
+        img_keys = self._ordered_image_keys(obs)
         if img_keys:
             cams = [_to_uint8_np_bhwc(obs[k]) for k in img_keys]
             video = np.stack(cams, axis=1)  # (B, V, H, W, C)
             obs["video"] = np.expand_dims(video, axis=1)  # (B, 1, V, H, W, C)
-            for k in img_keys:
+            image_keys_to_remove = [key for key in obs if key.startswith(OBS_IMAGES)]
+            if OBS_IMAGE in obs:
+                image_keys_to_remove.append(OBS_IMAGE)
+            for k in image_keys_to_remove:
                 obs.pop(k, None)
 
         bsz, _device = _infer_n1_7_batch_size_and_device(obs, transition.get(TransitionKey.ACTION))
@@ -1064,6 +1116,7 @@ class GrootN17PackInputsStep(ProcessorStep):
             "embodiment_mapping": self.embodiment_mapping,
             "normalize_min_max": self.normalize_min_max,
             "clip_outliers": self.clip_outliers,
+            "video_modality_keys": self.video_modality_keys,
         }
 
     def state_dict(self) -> dict[str, torch.Tensor]:
