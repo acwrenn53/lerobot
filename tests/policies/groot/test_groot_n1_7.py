@@ -32,6 +32,8 @@ from lerobot.policies.groot.configuration_groot import (
     GROOT_N1_7,
     GROOT_N1_7_BASE_MODEL,
     GrootConfig,
+    infer_groot_n1_7_action_execution_horizon,
+    infer_groot_n1_7_action_horizon,
 )
 from lerobot.policies.groot.modeling_groot import GrootPolicy
 from lerobot.policies.groot.processor_groot import (
@@ -88,25 +90,33 @@ def _write_raw_n1_7_libero_checkpoint(path):
                 "processor_class": "Gr00tN1d7Processor",
                 "processor_kwargs": {
                     "clip_outliers": True,
-                    "formalize_language": False,
+                    "formalize_language": True,
                     "image_crop_size": [230, 230],
                     "image_target_size": [256, 256],
                     "shortest_image_edge": 256,
                     "crop_fraction": 0.95,
                     "use_albumentations": True,
                     "max_action_horizon": 40,
+                    "max_state_dim": 132,
+                    "max_action_dim": 132,
                     "use_percentiles": True,
+                    "use_relative_action": True,
                     "modality_configs": {
                         "libero_sim": {
+                            "video": {
+                                "delta_indices": [0],
+                                "modality_keys": ["image", "wrist_image"],
+                            },
                             "state": {
+                                "delta_indices": [0],
                                 "modality_keys": ["x", "y", "z", "roll", "pitch", "yaw", "gripper"]
                             },
                             "action": {
                                 "delta_indices": list(range(16)),
                                 "modality_keys": ["x", "y", "z", "roll", "pitch", "yaw", "gripper"],
                             },
-                            "video": {"modality_keys": ["image", "wrist_image"]},
                             "language": {
+                                "delta_indices": [0],
                                 "modality_keys": ["annotation.human.action.task_description"]
                             },
                         }
@@ -171,6 +181,31 @@ def _write_cached_cosmos_snapshot(hub_cache):
     ):
         (snapshot / filename).write_text("{}")
     return snapshot
+
+
+def _expected_albumentations_eval_image(image_np, cv2, *, target_size, shortest_edge, crop_fraction):
+    height, width = image_np.shape[:2]
+    if height != width:
+        square_edge = max(height, width)
+        pad_h = square_edge - height
+        pad_w = square_edge - width
+        image_np = cv2.copyMakeBorder(
+            image_np,
+            pad_h // 2,
+            pad_h - pad_h // 2,
+            pad_w // 2,
+            pad_w - pad_w // 2,
+            cv2.BORDER_CONSTANT,
+            value=(0, 0, 0),
+        )
+
+    image_np = cv2.resize(image_np, (shortest_edge, shortest_edge), interpolation=cv2.INTER_AREA)
+    crop_h = max(1, int(shortest_edge * crop_fraction))
+    crop_w = max(1, int(shortest_edge * crop_fraction))
+    top = (shortest_edge - crop_h) // 2
+    left = (shortest_edge - crop_w) // 2
+    image_np = image_np[top : top + crop_h, left : left + crop_w]
+    return cv2.resize(image_np, (target_size[1], target_size[0]), interpolation=cv2.INTER_AREA)
 
 
 class _DummyGrootModel(nn.Module):
@@ -308,12 +343,25 @@ def test_raw_n1_7_libero_checkpoint_processors_use_checkpoint_assets(tmp_path):
 
     assert pack_inputs.embodiment_tag == "libero_sim"
     assert pack_inputs.embodiment_mapping["libero_sim"] == 42
-    assert pack_inputs.formalize_language is False
+    assert pack_inputs.formalize_language is True
     assert pack_inputs.valid_action_horizon == 16
     assert pack_inputs.action_horizon == 40
+    assert pack_inputs.max_state_dim == 132
+    assert pack_inputs.max_action_dim == 132
     assert pack_inputs.clip_outliers is True
     assert pack_inputs.video_modality_keys == ["image", "wrist_image"]
     assert pack_inputs.stats[OBS_STATE]["min"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+    assert pack_inputs.stats[OBS_STATE]["max"] == [
+        99.0,
+        100.0,
+        101.0,
+        102.0,
+        103.0,
+        104.0,
+        105.0,
+        106.0,
+    ]
+    assert pack_inputs.stats[ACTION]["min"] == [11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0]
     assert vlm_encode.image_crop_size == [230, 230]
     assert vlm_encode.image_target_size == [256, 256]
     assert vlm_encode.shortest_image_edge == 256
@@ -328,6 +376,7 @@ def test_raw_n1_7_libero_checkpoint_processors_use_checkpoint_assets(tmp_path):
         114.0,
         115.0,
     ]
+    assert unpack_actions.env_action_dim == 7
     assert unpack_actions.clip_normalized_action is True
     assert unpack_actions.libero_gripper_action is True
 
@@ -368,6 +417,33 @@ def test_groot_n1_7_pack_inputs_clips_and_masks_only_valid_action_horizon():
     assert action_mask[0, :, 2:].sum().item() == 0
 
 
+def test_groot_n1_7_pack_inputs_normalizes_state_with_q01_q99_clips_and_pads():
+    step = GrootN17PackInputsStep(
+        action_horizon=4,
+        max_state_dim=6,
+        max_action_dim=7,
+        normalize_min_max=True,
+        clip_outliers=True,
+        stats={
+            OBS_STATE: {
+                "min": [0.0, 10.0, -2.0, 4.0],
+                "max": [10.0, 10.0, 2.0, 8.0],
+            }
+        },
+    )
+    transition = {
+        TransitionKey.OBSERVATION: {
+            OBS_STATE: torch.tensor([[5.0, 42.0, -6.0, 10.0]]),
+        },
+        TransitionKey.COMPLEMENTARY_DATA: {"task": ["Move"]},
+    }
+
+    output = step(transition)
+
+    expected = torch.tensor([[[0.0, 0.0, -1.0, 1.0, 0.0, 0.0]]])
+    torch.testing.assert_close(output[TransitionKey.OBSERVATION]["state"], expected)
+
+
 def test_groot_n1_7_pack_inputs_adds_inference_action_horizon_mask():
     step = GrootN17PackInputsStep(
         action_horizon=40,
@@ -399,9 +475,9 @@ def test_groot_n1_7_pack_inputs_orders_video_by_checkpoint_modality_keys():
     )
     transition = {
         TransitionKey.OBSERVATION: {
-            f"{OBS_IMAGES}.extra": torch.full((1, 3, 2, 2), 0.5),
-            f"{OBS_IMAGES}.image2": torch.ones(1, 3, 2, 2),
-            f"{OBS_IMAGES}.image": torch.zeros(1, 3, 2, 2),
+            f"{OBS_IMAGES}.zz_extra": torch.full((1, 3, 2, 2), 33, dtype=torch.uint8),
+            f"{OBS_IMAGES}.image2": torch.full((1, 3, 2, 2), 22, dtype=torch.uint8),
+            f"{OBS_IMAGES}.image": torch.full((1, 3, 2, 2), 11, dtype=torch.uint8),
             OBS_STATE: torch.zeros(1, 8),
         },
         TransitionKey.COMPLEMENTARY_DATA: {"task": ["Move"]},
@@ -411,9 +487,11 @@ def test_groot_n1_7_pack_inputs_orders_video_by_checkpoint_modality_keys():
 
     video = output[TransitionKey.OBSERVATION]["video"]
     assert video.shape == (1, 1, 2, 2, 2, 3)
-    assert video[0, 0, 0].max() == 0
-    assert video[0, 0, 1].min() == 255
-    assert f"{OBS_IMAGES}.extra" not in output[TransitionKey.OBSERVATION]
+    assert np.unique(video[0, 0, 0]).tolist() == [11]
+    assert np.unique(video[0, 0, 1]).tolist() == [22]
+    assert f"{OBS_IMAGES}.zz_extra" not in output[TransitionKey.OBSERVATION]
+    assert f"{OBS_IMAGES}.image" not in output[TransitionKey.OBSERVATION]
+    assert f"{OBS_IMAGES}.image2" not in output[TransitionKey.OBSERVATION]
 
 
 def test_groot_n1_7_postprocessor_clips_normalized_action_before_unnormalizing():
@@ -461,6 +539,34 @@ def test_groot_n1_7_postprocessor_converts_libero_gripper_convention():
     output = step(transition)
 
     torch.testing.assert_close(output[TransitionKey.ACTION][:, -1], torch.tensor([1.0, -1.0]))
+
+
+def test_groot_n1_7_postprocessor_decodes_selected_action_and_gripper_thresholds():
+    step = GrootActionUnpackUnnormalizeStep(
+        env_action_dim=7,
+        normalize_min_max=True,
+        clip_normalized_action=True,
+        stats={
+            ACTION: {
+                "min": [0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 0.0],
+                "max": [2.0, 12.0, 22.0, 32.0, 42.0, 52.0, 1.0],
+            }
+        },
+        libero_gripper_action=True,
+    )
+    selected_actions = torch.tensor(
+        [
+            [-1.0, -0.5, 0.0, 0.5, 1.0, 2.0, -0.5],
+            [-1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 0.0],
+            [-1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 0.5],
+        ]
+    )
+
+    output = step({TransitionKey.ACTION: selected_actions})
+
+    expected_prefix = torch.tensor([0.0, 10.5, 21.0, 31.5, 42.0, 52.0])
+    torch.testing.assert_close(output[TransitionKey.ACTION][:, :6], expected_prefix.expand(3, 6))
+    torch.testing.assert_close(output[TransitionKey.ACTION][:, -1], torch.tensor([1.0, -0.0, -1.0]))
 
 
 def test_groot_from_pretrained_rejects_caller_config_mismatch_from_local_config(tmp_path):
@@ -526,6 +632,34 @@ def test_groot_n1_7_pack_inputs_preserves_per_sample_language():
     )
 
 
+def test_groot_n1_7_language_formalization_preserves_core_task_identifier_and_batch():
+    step = GrootN17PackInputsStep(
+        action_horizon=2,
+        max_state_dim=8,
+        max_action_dim=7,
+        formalize_language=True,
+        normalize_min_max=False,
+    )
+    transition = {
+        TransitionKey.OBSERVATION: {
+            OBS_STATE: torch.zeros(2, 8),
+        },
+        TransitionKey.COMPLEMENTARY_DATA: {
+            "task": [
+                "Pick_Up_The_Black_Bowl_Next_To_The_Ramekin_And_Place_It_On_The_Plate!!!",
+                "MOVE, the YELLOW mug -- to Zone_2.",
+            ],
+        },
+    }
+
+    output = step(transition)
+
+    assert output[TransitionKey.COMPLEMENTARY_DATA]["language"] == [
+        "pick_up_the_black_bowl_next_to_the_ramekin_and_place_it_on_the_plate",
+        "move the yellow mug  to zone_2",
+    ]
+
+
 def test_groot_n1_7_vlm_encode_uses_per_sample_language():
     class FakeProcessor:
         def __init__(self):
@@ -567,8 +701,71 @@ def test_groot_n1_7_vlm_encode_uses_per_sample_language():
     )
 
 
+def test_groot_n1_7_vlm_encode_packs_images_time_major_then_camera_order():
+    class FakeProcessor:
+        def __init__(self):
+            self.add_generation_prompts = []
+            self.conversation_image_values = []
+            self.conversation_texts = []
+            self.encoded_texts = None
+            self.encoded_image_values = None
+
+        def apply_chat_template(self, conversation, tokenize, add_generation_prompt):
+            assert tokenize is False
+            self.add_generation_prompts.append(add_generation_prompt)
+            content = conversation[0]["content"]
+            self.conversation_image_values.append(
+                [int(np.asarray(item["image"])[0, 0, 0]) for item in content if item["type"] == "image"]
+            )
+            text = content[-1]["text"]
+            self.conversation_texts.append(text)
+            return f"rendered:{text}"
+
+        def __call__(self, text, images, return_tensors, padding):
+            assert return_tensors == "pt"
+            assert padding is True
+            self.encoded_texts = text
+            self.encoded_image_values = [int(np.asarray(image)[0, 0, 0]) for image in images]
+            return {
+                "input_ids": torch.arange(len(text)).view(len(text), 1),
+                "attention_mask": torch.ones(len(text), 1, dtype=torch.long),
+                "pixel_values": torch.arange(len(images)).view(len(images), 1),
+                "image_grid_thw": torch.ones(len(images), 3, dtype=torch.long),
+            }
+
+    fake_proc = FakeProcessor()
+    step = GrootN17VLMEncodeStep()
+    step._proc = fake_proc
+    video = np.zeros((2, 2, 2, 2, 2, 3), dtype=np.uint8)
+    image_id = 1
+    for batch_idx in range(2):
+        for timestep in range(2):
+            for view_idx in range(2):
+                video[batch_idx, timestep, view_idx, :, :, :] = image_id
+                image_id += 1
+    transition = {
+        TransitionKey.OBSERVATION: {"video": video},
+        TransitionKey.COMPLEMENTARY_DATA: {"language": ["task a", "task b"]},
+    }
+
+    output = step(transition)
+
+    assert fake_proc.conversation_image_values == [[1, 2, 3, 4], [5, 6, 7, 8]]
+    assert fake_proc.encoded_image_values == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert fake_proc.conversation_texts == ["task a", "task b"]
+    assert fake_proc.encoded_texts == ["rendered:task a", "rendered:task b"]
+    assert fake_proc.add_generation_prompts == [False, False]
+    assert "video" not in output[TransitionKey.OBSERVATION]
+    assert set(output[TransitionKey.COMPLEMENTARY_DATA]) >= {
+        "input_ids",
+        "attention_mask",
+        "pixel_values",
+        "image_grid_thw",
+    }
+
+
 def test_groot_n1_7_vlm_image_transform_matches_albumentations_eval_path():
-    cv2 = pytest.importorskip("cv2")
+    cv2 = pytest.importorskip("cv2", exc_type=ImportError)
     from PIL import Image
 
     image_np = (np.arange(360 * 360 * 3, dtype=np.uint32) % 251).astype(np.uint8).reshape(360, 360, 3)
@@ -590,6 +787,66 @@ def test_groot_n1_7_vlm_image_transform_matches_albumentations_eval_path():
 
     assert transformed.size == (256, 256)
     np.testing.assert_array_equal(np.asarray(transformed), expected)
+
+
+def test_groot_n1_7_vlm_encode_transforms_non_square_two_camera_sample_like_core_albumentations():
+    cv2 = pytest.importorskip("cv2", exc_type=ImportError)
+
+    class FakeProcessor:
+        def __init__(self):
+            self.images = None
+
+        def apply_chat_template(self, conversation, tokenize, add_generation_prompt):
+            return conversation[0]["content"][-1]["text"]
+
+        def __call__(self, text, images, return_tensors, padding):
+            self.images = images
+            return {
+                "input_ids": torch.ones(len(text), 1, dtype=torch.long),
+                "attention_mask": torch.ones(len(text), 1, dtype=torch.long),
+            }
+
+    camera_a = np.arange(3 * 5 * 3, dtype=np.uint8).reshape(3, 5, 3)
+    camera_b = (np.arange(3 * 5 * 3, dtype=np.uint16).reshape(3, 5, 3) * 3 % 251).astype(np.uint8)
+    video = np.stack([camera_a, camera_b], axis=0).reshape(1, 1, 2, 3, 5, 3)
+    fake_proc = FakeProcessor()
+    step = GrootN17VLMEncodeStep(
+        image_target_size=[8, 8],
+        shortest_image_edge=10,
+        crop_fraction=0.6,
+        use_albumentations=True,
+    )
+    step._proc = fake_proc
+
+    step(
+        {
+            TransitionKey.OBSERVATION: {"video": video},
+            TransitionKey.COMPLEMENTARY_DATA: {"language": ["move"]},
+        }
+    )
+
+    assert fake_proc.images is not None
+    assert len(fake_proc.images) == 2
+    np.testing.assert_array_equal(
+        np.asarray(fake_proc.images[0]),
+        _expected_albumentations_eval_image(
+            camera_a,
+            cv2,
+            target_size=[8, 8],
+            shortest_edge=10,
+            crop_fraction=0.6,
+        ),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(fake_proc.images[1]),
+        _expected_albumentations_eval_image(
+            camera_b,
+            cv2,
+            target_size=[8, 8],
+            shortest_edge=10,
+            crop_fraction=0.6,
+        ),
+    )
 
 
 def test_groot_n1_7_vlm_encode_config_round_trips_model_name():
@@ -757,6 +1014,14 @@ def test_groot_policy_forwards_n1_7_qwen_inputs(monkeypatch):
         "pixel_values",
         "image_grid_thw",
     }
+
+
+def test_groot_n1_7_libero_execution_horizon_uses_core_eight_action_cadence(tmp_path):
+    model_path = tmp_path / "libero_spatial"
+    _write_raw_n1_7_libero_checkpoint(model_path)
+
+    assert infer_groot_n1_7_action_horizon(model_path, "libero_sim") == 16
+    assert infer_groot_n1_7_action_execution_horizon(model_path, "libero_sim") == 8
 
 
 def test_groot_n1_7_select_action_uses_checkpoint_valid_horizon(tmp_path, monkeypatch):

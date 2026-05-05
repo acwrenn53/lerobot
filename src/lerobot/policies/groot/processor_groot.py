@@ -573,7 +573,7 @@ def _prepare_n1_7_language_batch(
         text = str(item) if item else default_language
         if formalize_language:
             text = text.lower()
-            text = "".join(ch for ch in text if ch.isalnum() or ch.isspace())
+            text = "".join(ch for ch in text if ch.isalnum() or ch.isspace() or ch == "_")
         formatted.append(text)
     return formatted
 
