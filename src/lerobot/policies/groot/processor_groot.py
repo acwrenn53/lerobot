@@ -98,6 +98,7 @@ class _GrootN17CheckpointProcessorAssets:
     image_target_size: list[int] | None
     shortest_image_edge: int | None
     crop_fraction: float | None
+    use_albumentations: bool
 
 
 def _load_n1_7_checkpoint_processor_assets(config: GrootConfig) -> _GrootN17CheckpointProcessorAssets | None:
@@ -118,6 +119,9 @@ def _load_n1_7_checkpoint_processor_assets(config: GrootConfig) -> _GrootN17Chec
     clip_outliers = processor_kwargs.get("clip_outliers", True)
     if not isinstance(clip_outliers, bool):
         clip_outliers = True
+    use_albumentations = processor_kwargs.get("use_albumentations", False)
+    if not isinstance(use_albumentations, bool):
+        use_albumentations = False
 
     valid_action_horizon = _load_n1_7_checkpoint_action_horizon(processor_kwargs, config.embodiment_tag)
     max_action_horizon = processor_kwargs.get("max_action_horizon")
@@ -135,6 +139,7 @@ def _load_n1_7_checkpoint_processor_assets(config: GrootConfig) -> _GrootN17Chec
         image_target_size=_as_int_pair(processor_kwargs.get("image_target_size")),
         shortest_image_edge=_as_optional_int(processor_kwargs.get("shortest_image_edge")),
         crop_fraction=_as_optional_float(processor_kwargs.get("crop_fraction")),
+        use_albumentations=use_albumentations,
     )
 
 
@@ -364,9 +369,16 @@ def make_groot_pre_post_processors(
             GrootN17VLMEncodeStep(
                 model_name=config.n1_7_backbone_model,
                 image_crop_size=checkpoint_assets.image_crop_size if checkpoint_assets is not None else None,
-                image_target_size=checkpoint_assets.image_target_size if checkpoint_assets is not None else None,
-                shortest_image_edge=checkpoint_assets.shortest_image_edge if checkpoint_assets is not None else None,
+                image_target_size=checkpoint_assets.image_target_size
+                if checkpoint_assets is not None
+                else None,
+                shortest_image_edge=checkpoint_assets.shortest_image_edge
+                if checkpoint_assets is not None
+                else None,
                 crop_fraction=checkpoint_assets.crop_fraction if checkpoint_assets is not None else None,
+                use_albumentations=checkpoint_assets.use_albumentations
+                if checkpoint_assets is not None
+                else False,
             ),
             DeviceProcessorStep(device=config.device),
         ]
@@ -592,6 +604,7 @@ def _transform_n1_7_image_for_vlm(
     image_target_size: list[int] | None,
     shortest_image_edge: int | None,
     crop_fraction: float | None,
+    use_albumentations: bool = False,
 ) -> Image.Image:
     if image_target_size is None:
         return image
@@ -599,6 +612,48 @@ def _transform_n1_7_image_for_vlm(
     target_h, target_w = image_target_size
     if image.mode != "RGB":
         image = image.convert("RGB")
+
+    if use_albumentations:
+        try:
+            import cv2
+        except ImportError as exc:
+            raise ImportError(
+                "GR00T N1.7 checkpoints with use_albumentations=True require opencv-python-headless."
+            ) from exc
+
+        image_np = np.asarray(image)
+        height, width = image_np.shape[:2]
+        if height != width:
+            square_edge = max(height, width)
+            pad_h = square_edge - height
+            pad_w = square_edge - width
+            image_np = cv2.copyMakeBorder(
+                image_np,
+                pad_h // 2,
+                pad_h - pad_h // 2,
+                pad_w // 2,
+                pad_w - pad_w // 2,
+                cv2.BORDER_CONSTANT,
+                value=(0, 0, 0),
+            )
+
+        resize_edge = shortest_image_edge or target_h
+        if image_np.shape[:2] != (resize_edge, resize_edge):
+            image_np = cv2.resize(image_np, (resize_edge, resize_edge), interpolation=cv2.INTER_AREA)
+
+        if crop_fraction is None and image_crop_size is not None:
+            crop_fraction = image_crop_size[0] / float(target_h)
+        if crop_fraction is not None and 0.0 < crop_fraction < 1.0:
+            height, width = image_np.shape[:2]
+            crop_h = max(1, int(height * crop_fraction))
+            crop_w = max(1, int(width * crop_fraction))
+            top = max(0, (height - crop_h) // 2)
+            left = max(0, (width - crop_w) // 2)
+            image_np = image_np[top : top + crop_h, left : left + crop_w]
+
+        if image_np.shape[:2] != (target_h, target_w):
+            image_np = cv2.resize(image_np, (target_w, target_h), interpolation=cv2.INTER_AREA)
+        return Image.fromarray(image_np)
 
     square_edge = max(image.width, image.height)
     if image.width != image.height:
@@ -987,7 +1042,7 @@ class GrootN17PackInputsStep(ProcessorStep):
             valid_horizon = min(self.valid_action_horizon, self.action_horizon)
             action_mask[:, :valid_horizon] = 1.0
             comp["action_mask"] = action_mask
-        comp["embodiment_id"] = torch.full((bsz,), emb_id, dtype=torch.long, device=device)
+        comp["embodiment_id"] = torch.full((bsz,), emb_id, dtype=torch.int32, device=device)
 
         transition[TransitionKey.OBSERVATION] = obs
         transition[TransitionKey.COMPLEMENTARY_DATA] = comp
@@ -1041,6 +1096,7 @@ class GrootN17VLMEncodeStep(ProcessorStep):
     image_target_size: list[int] | None = None
     shortest_image_edge: int | None = None
     crop_fraction: float | None = None
+    use_albumentations: bool = False
     _proc: ProcessorMixin | None = field(default=None, init=False, repr=False)
 
     @property
@@ -1073,6 +1129,7 @@ class GrootN17VLMEncodeStep(ProcessorStep):
                     image_target_size=self.image_target_size,
                     shortest_image_edge=self.shortest_image_edge,
                     crop_fraction=self.crop_fraction,
+                    use_albumentations=self.use_albumentations,
                 )
                 for timestep in range(sample.shape[0])
                 for view_idx in range(sample.shape[1])
@@ -1113,6 +1170,7 @@ class GrootN17VLMEncodeStep(ProcessorStep):
             "image_target_size": self.image_target_size,
             "shortest_image_edge": self.shortest_image_edge,
             "crop_fraction": self.crop_fraction,
+            "use_albumentations": self.use_albumentations,
         }
 
 

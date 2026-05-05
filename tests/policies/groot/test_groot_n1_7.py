@@ -39,6 +39,7 @@ from lerobot.policies.groot.processor_groot import (
     GrootEagleEncodeStep,
     GrootN17PackInputsStep,
     GrootN17VLMEncodeStep,
+    _transform_n1_7_image_for_vlm,
     make_groot_pre_post_processors,
 )
 from lerobot.types import TransitionKey
@@ -92,6 +93,7 @@ def _write_raw_n1_7_libero_checkpoint(path):
                     "image_target_size": [256, 256],
                     "shortest_image_edge": 256,
                     "crop_fraction": 0.95,
+                    "use_albumentations": True,
                     "max_action_horizon": 40,
                     "use_percentiles": True,
                     "modality_configs": {
@@ -299,6 +301,7 @@ def test_raw_n1_7_libero_checkpoint_processors_use_checkpoint_assets(tmp_path):
     preprocessor, postprocessor = make_pre_post_processors(config, pretrained_path=str(model_path))
 
     pack_inputs = next(step for step in preprocessor.steps if isinstance(step, GrootN17PackInputsStep))
+    vlm_encode = next(step for step in preprocessor.steps if isinstance(step, GrootN17VLMEncodeStep))
     unpack_actions = next(
         step for step in postprocessor.steps if isinstance(step, GrootActionUnpackUnnormalizeStep)
     )
@@ -310,6 +313,11 @@ def test_raw_n1_7_libero_checkpoint_processors_use_checkpoint_assets(tmp_path):
     assert pack_inputs.action_horizon == 40
     assert pack_inputs.clip_outliers is True
     assert pack_inputs.stats[OBS_STATE]["min"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+    assert vlm_encode.image_crop_size == [230, 230]
+    assert vlm_encode.image_target_size == [256, 256]
+    assert vlm_encode.shortest_image_edge == 256
+    assert vlm_encode.crop_fraction == 0.95
+    assert vlm_encode.use_albumentations is True
     assert unpack_actions.stats[ACTION]["max"] == [
         109.0,
         110.0,
@@ -380,6 +388,7 @@ def test_groot_n1_7_pack_inputs_adds_inference_action_horizon_mask():
     assert action_mask.shape == (2, 40)
     assert action_mask[:, :16].sum().item() == 32
     assert action_mask[:, 16:].sum().item() == 0
+    assert output[TransitionKey.COMPLEMENTARY_DATA]["embodiment_id"].dtype == torch.int32
 
 
 def test_groot_n1_7_postprocessor_clips_normalized_action_before_unnormalizing():
@@ -533,6 +542,31 @@ def test_groot_n1_7_vlm_encode_uses_per_sample_language():
     )
 
 
+def test_groot_n1_7_vlm_image_transform_matches_albumentations_eval_path():
+    cv2 = pytest.importorskip("cv2")
+    from PIL import Image
+
+    image_np = (np.arange(360 * 360 * 3, dtype=np.uint32) % 251).astype(np.uint8).reshape(360, 360, 3)
+
+    transformed = _transform_n1_7_image_for_vlm(
+        Image.fromarray(image_np),
+        image_crop_size=[230, 230],
+        image_target_size=[256, 256],
+        shortest_image_edge=256,
+        crop_fraction=0.95,
+        use_albumentations=True,
+    )
+
+    expected = cv2.resize(image_np, (256, 256), interpolation=cv2.INTER_AREA)
+    crop_edge = int(256 * 0.95)
+    crop_start = (256 - crop_edge) // 2
+    expected = expected[crop_start : crop_start + crop_edge, crop_start : crop_start + crop_edge]
+    expected = cv2.resize(expected, (256, 256), interpolation=cv2.INTER_AREA)
+
+    assert transformed.size == (256, 256)
+    np.testing.assert_array_equal(np.asarray(transformed), expected)
+
+
 def test_groot_n1_7_vlm_encode_config_round_trips_model_name():
     step = GrootN17VLMEncodeStep(
         model_name="local-cosmos",
@@ -540,6 +574,7 @@ def test_groot_n1_7_vlm_encode_config_round_trips_model_name():
         image_target_size=[256, 256],
         shortest_image_edge=256,
         crop_fraction=0.95,
+        use_albumentations=True,
     )
 
     restored = GrootN17VLMEncodeStep(**step.get_config())
@@ -549,6 +584,7 @@ def test_groot_n1_7_vlm_encode_config_round_trips_model_name():
     assert restored.image_target_size == [256, 256]
     assert restored.shortest_image_edge == 256
     assert restored.crop_fraction == 0.95
+    assert restored.use_albumentations is True
 
 
 def test_groot_n1_7_processor_uses_qwen_component_assets(monkeypatch):
