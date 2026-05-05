@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -63,6 +64,125 @@ def infer_groot_model_version(model_path: str | None) -> str | None:
     return None
 
 
+def is_raw_groot_n1_7_checkpoint(model_path: str | Path | None) -> bool:
+    if model_path is None:
+        return False
+
+    path = Path(model_path).expanduser()
+    if path.is_dir():
+        config_path = path / "config.json"
+    elif path.name == "config.json":
+        config_path = path
+    else:
+        return False
+
+    try:
+        with config_path.open() as f:
+            config = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+
+    return "type" not in config and _infer_groot_model_version_from_config(config) == GROOT_N1_7
+
+
+def infer_groot_n1_7_embodiment_tag(model_path: str | Path | None) -> str | None:
+    if model_path is None:
+        return None
+
+    processor_config_path = Path(model_path).expanduser() / "processor_config.json"
+    try:
+        with processor_config_path.open() as f:
+            processor_config = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    modality_configs = processor_config.get("processor_kwargs", {}).get("modality_configs", {})
+    if not isinstance(modality_configs, dict):
+        return None
+    if "libero_sim" in modality_configs:
+        return "libero_sim"
+    if len(modality_configs) == 1:
+        return next(iter(modality_configs))
+    return None
+
+
+def resolve_groot_n1_7_backbone_model(model_name: str, cache_dir: str | Path | None = None) -> str:
+    model_path = Path(model_name).expanduser()
+    if model_path.exists():
+        return str(model_path)
+
+    cached_snapshot = _find_cached_hf_snapshot(model_name, cache_dir=cache_dir)
+    return str(cached_snapshot) if cached_snapshot is not None else model_name
+
+
+def _find_cached_hf_snapshot(repo_id: str, cache_dir: str | Path | None = None) -> Path | None:
+    repo_cache_name = f"models--{repo_id.replace('/', '--')}"
+    required_files = (
+        "config.json",
+        "tokenizer_config.json",
+        "preprocessor_config.json",
+        "video_preprocessor_config.json",
+    )
+
+    for hub_cache in _candidate_hf_hub_caches(cache_dir):
+        repo_cache = hub_cache / repo_cache_name
+        snapshots_dir = repo_cache / "snapshots"
+        if not snapshots_dir.is_dir():
+            continue
+
+        candidates: list[Path] = []
+        ref_path = repo_cache / "refs" / "main"
+        try:
+            ref = ref_path.read_text().strip()
+        except OSError:
+            ref = ""
+        if ref:
+            candidates.append(snapshots_dir / ref)
+        candidates.extend(
+            sorted(
+                (path for path in snapshots_dir.iterdir() if path.is_dir()),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+        )
+
+        seen: set[Path] = set()
+        for snapshot in candidates:
+            if snapshot in seen:
+                continue
+            seen.add(snapshot)
+            if all((snapshot / filename).exists() for filename in required_files):
+                return snapshot
+    return None
+
+
+def _candidate_hf_hub_caches(cache_dir: str | Path | None) -> list[Path]:
+    candidates: list[Path] = []
+    if cache_dir is not None:
+        cache_path = Path(cache_dir).expanduser()
+        candidates.append(cache_path)
+        candidates.append(cache_path / "hub")
+
+    hub_cache = os.environ.get("HUGGINGFACE_HUB_CACHE")
+    if hub_cache:
+        candidates.append(Path(hub_cache).expanduser())
+
+    hf_home = os.environ.get("HF_HOME")
+    if hf_home:
+        candidates.append(Path(hf_home).expanduser() / "hub")
+
+    candidates.append(Path.home() / ".cache" / "huggingface" / "hub")
+
+    deduped: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve() if candidate.exists() else candidate
+        if resolved not in seen:
+            seen.add(resolved)
+            deduped.append(candidate)
+    return deduped
+
+
 def _infer_groot_model_version_from_local_config(model_path: str) -> str | None:
     path = Path(model_path).expanduser()
     if path.is_dir():
@@ -81,6 +201,10 @@ def _infer_groot_model_version_from_local_config(model_path: str) -> str | None:
     except (OSError, json.JSONDecodeError):
         return None
 
+    return _infer_groot_model_version_from_config(config)
+
+
+def _infer_groot_model_version_from_config(config: dict) -> str | None:
     model_version = config.get("model_version")
     if isinstance(model_version, str):
         try:

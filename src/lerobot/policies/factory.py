@@ -264,6 +264,18 @@ def make_pre_post_processors(
             policy configuration type.
     """
     if pretrained_path:
+        if isinstance(policy_cfg, GrootConfig):
+            from .groot.configuration_groot import is_raw_groot_n1_7_checkpoint
+
+            groot_checkpoint_path = policy_cfg.base_model_path or pretrained_path
+            if is_raw_groot_n1_7_checkpoint(groot_checkpoint_path):
+                from .groot.processor_groot import make_groot_pre_post_processors
+
+                return make_groot_pre_post_processors(
+                    config=policy_cfg,
+                    dataset_stats=kwargs.get("dataset_stats"),
+                )
+
         # TODO(Steven): Temporary patch, implement correctly the processors for Gr00t
         if isinstance(policy_cfg, GrootConfig):
             # GROOT handles normalization in its pack-inputs step

@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import sys
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -23,7 +24,7 @@ import pytest
 import torch
 from torch import nn
 
-from lerobot.configs import FeatureType, PolicyFeature
+from lerobot.configs import FeatureType, PolicyFeature, PreTrainedConfig
 from lerobot.policies.factory import make_policy_config, make_pre_post_processors
 from lerobot.policies.groot.configuration_groot import (
     GROOT_N1_5,
@@ -34,6 +35,7 @@ from lerobot.policies.groot.configuration_groot import (
 )
 from lerobot.policies.groot.modeling_groot import GrootPolicy
 from lerobot.policies.groot.processor_groot import (
+    GrootActionUnpackUnnormalizeStep,
     GrootEagleEncodeStep,
     GrootN17PackInputsStep,
     GrootN17VLMEncodeStep,
@@ -62,6 +64,105 @@ def _groot_config(model_version: str) -> GrootConfig:
         device="cpu",
         use_bf16=False,
     )
+
+
+def _write_raw_n1_7_libero_checkpoint(path):
+    path.mkdir()
+    (path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "Gr00tN1d7",
+                "architectures": ["Gr00tN1d7"],
+                "model_name": "nvidia/Cosmos-Reason2-2B",
+                "action_horizon": 40,
+                "max_state_dim": 132,
+                "max_action_dim": 132,
+                "image_target_size": [256, 256],
+            }
+        )
+    )
+    (path / "processor_config.json").write_text(
+        json.dumps(
+            {
+                "processor_class": "Gr00tN1d7Processor",
+                "processor_kwargs": {
+                    "formalize_language": False,
+                    "use_percentiles": True,
+                    "modality_configs": {
+                        "libero_sim": {
+                            "state": {
+                                "modality_keys": ["x", "y", "z", "roll", "pitch", "yaw", "gripper"]
+                            },
+                            "action": {
+                                "delta_indices": list(range(16)),
+                                "modality_keys": ["x", "y", "z", "roll", "pitch", "yaw", "gripper"],
+                            },
+                            "video": {"modality_keys": ["image", "wrist_image"]},
+                            "language": {
+                                "modality_keys": ["annotation.human.action.task_description"]
+                            },
+                        }
+                    },
+                },
+            }
+        )
+    )
+    (path / "embodiment_id.json").write_text(json.dumps({"libero_sim": 42}))
+    (path / "statistics.json").write_text(
+        json.dumps(
+            {
+                "libero_sim": {
+                    "state": {
+                        "x": _stats([0.0]),
+                        "y": _stats([1.0]),
+                        "z": _stats([2.0]),
+                        "roll": _stats([3.0]),
+                        "pitch": _stats([4.0]),
+                        "yaw": _stats([5.0]),
+                        "gripper": _stats([6.0, 7.0]),
+                    },
+                    "action": {
+                        "x": _stats([10.0]),
+                        "y": _stats([11.0]),
+                        "z": _stats([12.0]),
+                        "roll": _stats([13.0]),
+                        "pitch": _stats([14.0]),
+                        "yaw": _stats([15.0]),
+                        "gripper": _stats([16.0]),
+                    },
+                    "relative_action": {},
+                }
+            }
+        )
+    )
+
+
+def _stats(values):
+    return {
+        "min": values,
+        "max": [value + 100.0 for value in values],
+        "mean": [value + 50.0 for value in values],
+        "std": [1.0 for _ in values],
+        "q01": [value + 1.0 for value in values],
+        "q99": [value + 99.0 for value in values],
+    }
+
+
+def _write_cached_cosmos_snapshot(hub_cache):
+    commit = "1234567890abcdef"
+    repo_cache = hub_cache / "models--nvidia--Cosmos-Reason2-2B"
+    snapshot = repo_cache / "snapshots" / commit
+    snapshot.mkdir(parents=True)
+    (repo_cache / "refs").mkdir()
+    (repo_cache / "refs" / "main").write_text(commit)
+    for filename in (
+        "config.json",
+        "tokenizer_config.json",
+        "preprocessor_config.json",
+        "video_preprocessor_config.json",
+    ):
+        (snapshot / filename).write_text("{}")
+    return snapshot
 
 
 class _DummyGrootModel(nn.Module):
@@ -165,6 +266,49 @@ def test_groot_from_pretrained_infers_n1_7_from_ambiguous_local_config(tmp_path,
 
     assert policy.config.model_version == GROOT_N1_7
     assert policy.config.base_model_path == str(model_path)
+
+
+def test_pretrained_config_loads_raw_n1_7_libero_checkpoint(tmp_path, monkeypatch):
+    model_path = tmp_path / "libero_spatial"
+    _write_raw_n1_7_libero_checkpoint(model_path)
+    cosmos_snapshot = _write_cached_cosmos_snapshot(tmp_path / "hub")
+    monkeypatch.setenv("HUGGINGFACE_HUB_CACHE", str(tmp_path / "hub"))
+
+    config = PreTrainedConfig.from_pretrained(model_path, cli_overrides=["--device=cpu"])
+
+    assert isinstance(config, GrootConfig)
+    assert config.model_version == GROOT_N1_7
+    assert config.base_model_path == str(model_path)
+    assert config.embodiment_tag == "libero_sim"
+    assert config.n1_7_backbone_model == str(cosmos_snapshot)
+
+
+def test_raw_n1_7_libero_checkpoint_processors_use_checkpoint_assets(tmp_path):
+    model_path = tmp_path / "libero_spatial"
+    _write_raw_n1_7_libero_checkpoint(model_path)
+    config = PreTrainedConfig.from_pretrained(model_path, cli_overrides=["--device=cpu"])
+    config.input_features, config.output_features = _groot_features(state_dim=8, action_dim=7)
+
+    preprocessor, postprocessor = make_pre_post_processors(config, pretrained_path=str(model_path))
+
+    pack_inputs = next(step for step in preprocessor.steps if isinstance(step, GrootN17PackInputsStep))
+    unpack_actions = next(
+        step for step in postprocessor.steps if isinstance(step, GrootActionUnpackUnnormalizeStep)
+    )
+
+    assert pack_inputs.embodiment_tag == "libero_sim"
+    assert pack_inputs.embodiment_mapping["libero_sim"] == 42
+    assert pack_inputs.formalize_language is False
+    assert pack_inputs.stats[OBS_STATE]["min"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+    assert unpack_actions.stats[ACTION]["max"] == [
+        109.0,
+        110.0,
+        111.0,
+        112.0,
+        113.0,
+        114.0,
+        115.0,
+    ]
 
 
 def test_groot_from_pretrained_rejects_caller_config_mismatch_from_local_config(tmp_path):

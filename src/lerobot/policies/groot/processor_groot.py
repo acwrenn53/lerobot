@@ -14,7 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -57,7 +59,12 @@ from lerobot.utils.constants import (
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
 
-from .configuration_groot import GROOT_N1_7, GROOT_N1_7_BACKBONE_MODEL, GrootConfig
+from .configuration_groot import (
+    GROOT_N1_7,
+    GROOT_N1_7_BACKBONE_MODEL,
+    GrootConfig,
+    is_raw_groot_n1_7_checkpoint,
+)
 
 # Defaults for Eagle processor locations
 DEFAULT_TOKENIZER_ASSETS_REPO = "lerobot/eagle2hg-processor-groot-n1p5"
@@ -77,6 +84,140 @@ N1_7_EMBODIMENT_MAPPING = {
     "libero_sim": 2,
     "new_embodiment": 10,
 }
+
+
+@dataclass
+class _GrootN17CheckpointProcessorAssets:
+    stats: dict[str, dict[str, Any]]
+    embodiment_mapping: dict[str, int]
+    formalize_language: bool
+
+
+def _load_n1_7_checkpoint_processor_assets(config: GrootConfig) -> _GrootN17CheckpointProcessorAssets | None:
+    if not is_raw_groot_n1_7_checkpoint(config.base_model_path):
+        return None
+
+    checkpoint_path = Path(config.base_model_path).expanduser()
+    processor_config = _read_json(checkpoint_path / "processor_config.json")
+    processor_kwargs = processor_config.get("processor_kwargs", {})
+    if not isinstance(processor_kwargs, dict):
+        processor_kwargs = {}
+
+    stats = _load_n1_7_checkpoint_stats(checkpoint_path, processor_kwargs, config.embodiment_tag)
+    embodiment_mapping = _load_n1_7_embodiment_mapping(checkpoint_path) or dict(N1_7_EMBODIMENT_MAPPING)
+    formalize_language = processor_kwargs.get("formalize_language", True)
+    if not isinstance(formalize_language, bool):
+        formalize_language = True
+
+    return _GrootN17CheckpointProcessorAssets(
+        stats=stats,
+        embodiment_mapping=embodiment_mapping,
+        formalize_language=formalize_language,
+    )
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    try:
+        with path.open() as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _load_n1_7_embodiment_mapping(checkpoint_path: Path) -> dict[str, int] | None:
+    mapping = _read_json(checkpoint_path / "embodiment_id.json")
+    if not mapping:
+        return None
+    parsed: dict[str, int] = {}
+    for key, value in mapping.items():
+        if not isinstance(key, str):
+            continue
+        try:
+            parsed[key] = int(value)
+        except (TypeError, ValueError):
+            continue
+    return parsed or None
+
+
+def _load_n1_7_checkpoint_stats(
+    checkpoint_path: Path, processor_kwargs: dict[str, Any], embodiment_tag: str
+) -> dict[str, dict[str, Any]]:
+    all_stats = _read_json(checkpoint_path / "statistics.json")
+    embodiment_stats = all_stats.get(embodiment_tag)
+    if not isinstance(embodiment_stats, dict):
+        return {}
+
+    modality_configs = processor_kwargs.get("modality_configs", {})
+    if not isinstance(modality_configs, dict):
+        return {}
+    embodiment_config = modality_configs.get(embodiment_tag)
+    if not isinstance(embodiment_config, dict):
+        return {}
+
+    use_percentiles = processor_kwargs.get("use_percentiles", False)
+    return {
+        OBS_STATE: _flatten_n1_7_modality_stats(
+            embodiment_stats=embodiment_stats,
+            embodiment_config=embodiment_config,
+            modality="state",
+            use_percentiles=bool(use_percentiles),
+        ),
+        ACTION: _flatten_n1_7_modality_stats(
+            embodiment_stats=embodiment_stats,
+            embodiment_config=embodiment_config,
+            modality="action",
+            use_percentiles=bool(use_percentiles),
+        ),
+    }
+
+
+def _flatten_n1_7_modality_stats(
+    *,
+    embodiment_stats: dict[str, Any],
+    embodiment_config: dict[str, Any],
+    modality: str,
+    use_percentiles: bool,
+) -> dict[str, list[float]]:
+    source_stats = embodiment_stats.get(modality, {})
+    modality_config = embodiment_config.get(modality, {})
+    if not isinstance(source_stats, dict) or not isinstance(modality_config, dict):
+        return {}
+    modality_keys = modality_config.get("modality_keys", [])
+    if not isinstance(modality_keys, list):
+        return {}
+
+    flattened: dict[str, list[float]] = {}
+    for stat_name in ("min", "max", "mean", "std"):
+        values: list[float] = []
+        source_stat_name = stat_name
+        if use_percentiles and stat_name == "min":
+            source_stat_name = "q01"
+        elif use_percentiles and stat_name == "max":
+            source_stat_name = "q99"
+
+        for modality_key in modality_keys:
+            if not isinstance(modality_key, str):
+                continue
+            key_stats = source_stats.get(modality_key, {})
+            if not isinstance(key_stats, dict):
+                continue
+            raw_values = key_stats.get(source_stat_name)
+            if raw_values is None and source_stat_name != stat_name:
+                raw_values = key_stats.get(stat_name)
+            values.extend(_as_float_list(raw_values))
+        if values:
+            flattened[stat_name] = values
+
+    return flattened
+
+
+def _as_float_list(values: Any) -> list[float]:
+    if isinstance(values, list):
+        return [float(value) for value in values]
+    if values is None:
+        return []
+    return [float(values)]
 
 
 def make_groot_pre_post_processors(
@@ -111,8 +252,15 @@ def make_groot_pre_post_processors(
     """
 
     if config.model_version == GROOT_N1_7:
+        checkpoint_assets = _load_n1_7_checkpoint_processor_assets(config)
         action_horizon = min(config.chunk_size, 40)
-        padded_stats = dataset_stats or {}
+        padded_stats = dataset_stats or (checkpoint_assets.stats if checkpoint_assets is not None else {})
+        embodiment_mapping = (
+            checkpoint_assets.embodiment_mapping
+            if checkpoint_assets is not None
+            else dict(N1_7_EMBODIMENT_MAPPING)
+        )
+        formalize_language = checkpoint_assets.formalize_language if checkpoint_assets is not None else True
         try:
             env_action_dim = int(config.output_features[ACTION].shape[0])
         except Exception:
@@ -127,8 +275,9 @@ def make_groot_pre_post_processors(
                 max_state_dim=config.max_state_dim,
                 max_action_dim=config.max_action_dim,
                 language_key="task",
-                formalize_language=True,
+                formalize_language=formalize_language,
                 embodiment_tag=config.embodiment_tag,
+                embodiment_mapping=embodiment_mapping,
                 normalize_min_max=True,
                 stats=padded_stats,
             ),
