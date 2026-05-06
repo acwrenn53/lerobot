@@ -299,10 +299,12 @@ def _flatten_n1_7_modality_stats(
                 continue
             key_stats = source_stats.get(modality_key, {})
             if not isinstance(key_stats, dict):
-                continue
+                raise KeyError(f"Missing statistics for {modality}.{modality_key}")
             raw_values = key_stats.get(source_stat_name)
-            if raw_values is None and source_stat_name != stat_name:
-                raw_values = key_stats.get(stat_name)
+            if raw_values is None:
+                raise KeyError(
+                    f"Missing '{source_stat_name}' statistics for {modality}.{modality_key}"
+                )
             values.extend(_as_float_list(raw_values))
         if values:
             flattened[stat_name] = values
@@ -1028,12 +1030,14 @@ class GrootN17PackInputsStep(ProcessorStep):
             if state.dim() != 2:
                 raise ValueError(f"state must be (B, D), got {tuple(state.shape)}")
             bsz, dim = state.shape
+            if dim > self.max_state_dim:
+                raise ValueError(
+                    f"State dimension {dim} exceeds max_state_dim {self.max_state_dim}."
+                )
             if self.normalize_min_max:
                 state = _min_max_norm(state, OBS_STATE)
             state = state.unsqueeze(1)
-            if dim > self.max_state_dim:
-                state = state[:, :, : self.max_state_dim]
-            elif dim < self.max_state_dim:
+            if dim < self.max_state_dim:
                 pad = torch.zeros(
                     bsz, 1, self.max_state_dim - dim, dtype=state.dtype, device=state.device
                 )
@@ -1042,13 +1046,6 @@ class GrootN17PackInputsStep(ProcessorStep):
 
         action = transition.get(TransitionKey.ACTION)
         if isinstance(action, torch.Tensor):
-            if self.normalize_min_max:
-                if action.dim() == 2:
-                    action = _min_max_norm(action, ACTION)
-                elif action.dim() == 3:
-                    bsz, horizon, dim = action.shape
-                    flat = _min_max_norm(action.reshape(bsz * horizon, dim), ACTION)
-                    action = flat.view(bsz, horizon, dim)
             if action.dim() == 2:
                 action = action.unsqueeze(1)
             elif action.dim() == 3:
@@ -1057,14 +1054,20 @@ class GrootN17PackInputsStep(ProcessorStep):
                 raise ValueError(f"action must be (B, D) or (B, T, D), got {tuple(action.shape)}")
 
             bsz, horizon, dim = action.shape
+            if horizon > self.action_horizon:
+                raise ValueError(
+                    f"Action horizon {horizon} exceeds action_horizon {self.action_horizon}."
+                )
+            if dim > self.max_action_dim:
+                raise ValueError(
+                    f"Action dimension {dim} exceeds max_action_dim {self.max_action_dim}."
+                )
+            if self.normalize_min_max:
+                flat = _min_max_norm(action.reshape(bsz * horizon, dim), ACTION)
+                action = flat.view(bsz, horizon, dim)
             valid_dim = min(dim, self.max_action_dim)
             valid_horizon = min(horizon, self.valid_action_horizon, self.action_horizon)
-            if horizon > self.action_horizon:
-                action = action[:, : self.action_horizon, :]
-                horizon = self.action_horizon
-            if dim > self.max_action_dim:
-                action = action[:, :, : self.max_action_dim]
-            elif dim < self.max_action_dim:
+            if dim < self.max_action_dim:
                 pad = torch.zeros(
                     bsz, horizon, self.max_action_dim - dim, dtype=action.dtype, device=action.device
                 )

@@ -44,6 +44,7 @@ from lerobot.policies.groot.processor_groot import (
     _transform_n1_7_image_for_vlm,
     make_groot_pre_post_processors,
 )
+from lerobot.processor import PolicyProcessorPipeline
 from lerobot.types import TransitionKey
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
@@ -379,6 +380,104 @@ def test_raw_n1_7_libero_checkpoint_processors_use_checkpoint_assets(tmp_path):
     assert unpack_actions.env_action_dim == 7
     assert unpack_actions.clip_normalized_action is True
     assert unpack_actions.libero_gripper_action is True
+
+
+def test_raw_n1_7_checkpoint_requires_percentile_stats_when_config_uses_percentiles(tmp_path):
+    model_path = tmp_path / "libero_spatial"
+    _write_raw_n1_7_libero_checkpoint(model_path)
+    statistics = json.loads((model_path / "statistics.json").read_text())
+    del statistics["libero_sim"]["state"]["x"]["q01"]
+    (model_path / "statistics.json").write_text(json.dumps(statistics))
+    config = PreTrainedConfig.from_pretrained(model_path, cli_overrides=["--device=cpu"])
+    config.input_features, config.output_features = _groot_features(state_dim=8, action_dim=7)
+
+    with pytest.raises(KeyError, match="q01.*state.x"):
+        make_pre_post_processors(config, pretrained_path=str(model_path))
+
+
+def test_groot_n1_7_saved_processors_round_trip_checkpoint_specific_fields(tmp_path):
+    model_path = tmp_path / "libero_spatial"
+    _write_raw_n1_7_libero_checkpoint(model_path)
+    config = PreTrainedConfig.from_pretrained(model_path, cli_overrides=["--device=cpu"])
+    config.input_features, config.output_features = _groot_features(state_dim=8, action_dim=7)
+    preprocessor, postprocessor = make_pre_post_processors(config, pretrained_path=str(model_path))
+    save_dir = tmp_path / "saved_processors"
+
+    preprocessor.save_pretrained(save_dir)
+    postprocessor.save_pretrained(save_dir)
+
+    loaded_preprocessor = PolicyProcessorPipeline.from_pretrained(
+        save_dir,
+        config_filename="policy_preprocessor.json",
+    )
+    loaded_postprocessor = PolicyProcessorPipeline.from_pretrained(
+        save_dir,
+        config_filename="policy_postprocessor.json",
+    )
+    pack_inputs = next(
+        step for step in loaded_preprocessor.steps if isinstance(step, GrootN17PackInputsStep)
+    )
+    unpack_actions = next(
+        step
+        for step in loaded_postprocessor.steps
+        if isinstance(step, GrootActionUnpackUnnormalizeStep)
+    )
+
+    assert pack_inputs.valid_action_horizon == 16
+    assert pack_inputs.action_horizon == 40
+    assert pack_inputs.video_modality_keys == ["image", "wrist_image"]
+    assert pack_inputs.clip_outliers is True
+    torch.testing.assert_close(
+        pack_inputs.stats[OBS_STATE]["min"],
+        torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
+    )
+    assert unpack_actions.env_action_dim == 7
+    assert unpack_actions.libero_gripper_action is True
+    assert unpack_actions.clip_normalized_action is True
+    torch.testing.assert_close(
+        unpack_actions.stats[ACTION]["max"],
+        torch.tensor([109.0, 110.0, 111.0, 112.0, 113.0, 114.0, 115.0]),
+    )
+
+
+def test_groot_n1_7_pack_inputs_rejects_state_dim_above_core_max():
+    step = GrootN17PackInputsStep(
+        max_state_dim=2,
+        max_action_dim=4,
+        normalize_min_max=False,
+    )
+    transition = {
+        TransitionKey.OBSERVATION: {
+            OBS_STATE: torch.zeros(1, 3),
+        },
+        TransitionKey.COMPLEMENTARY_DATA: {"task": ["Move"]},
+    }
+
+    with pytest.raises(ValueError, match="State dimension 3 exceeds max_state_dim 2"):
+        step(transition)
+
+
+def test_groot_n1_7_pack_inputs_rejects_action_shape_above_core_limits():
+    step = GrootN17PackInputsStep(
+        action_horizon=2,
+        max_state_dim=2,
+        max_action_dim=2,
+        normalize_min_max=False,
+    )
+    transition = {
+        TransitionKey.OBSERVATION: {
+            OBS_STATE: torch.zeros(1, 2),
+        },
+        TransitionKey.ACTION: torch.zeros(1, 2, 3),
+        TransitionKey.COMPLEMENTARY_DATA: {"task": ["Move"]},
+    }
+
+    with pytest.raises(ValueError, match="Action dimension 3 exceeds max_action_dim 2"):
+        step(transition)
+
+    transition[TransitionKey.ACTION] = torch.zeros(1, 3, 2)
+    with pytest.raises(ValueError, match="Action horizon 3 exceeds action_horizon 2"):
+        step(transition)
 
 
 def test_groot_n1_7_pack_inputs_clips_and_masks_only_valid_action_horizon():
