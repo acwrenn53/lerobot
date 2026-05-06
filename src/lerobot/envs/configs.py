@@ -331,6 +331,7 @@ class LiberoEnv(EnvConfig):
     camera_name_mapping: dict[str, str] | None = None
     observation_height: int = 360
     observation_width: int = 360
+    num_steps_wait: int = 10
     is_libero_plus: bool = False
     features: dict[str, PolicyFeature] = field(
         default_factory=lambda: {
@@ -412,6 +413,7 @@ class LiberoEnv(EnvConfig):
             "render_mode": self.render_mode,
             "observation_height": self.observation_height,
             "observation_width": self.observation_width,
+            "num_steps_wait": self.num_steps_wait,
         }
         if self.task_ids is not None:
             kwargs["task_ids"] = self.task_ids

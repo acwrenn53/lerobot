@@ -551,6 +551,77 @@ def test_groot_n1_7_pack_inputs_normalizes_state_with_q01_q99_clips_and_pads():
     torch.testing.assert_close(output[TransitionKey.OBSERVATION]["state"], expected)
 
 
+def test_groot_n1_7_libero_open_gripper_state_normalizes_near_core_oracle():
+    step = GrootN17PackInputsStep(
+        action_horizon=40,
+        max_state_dim=132,
+        max_action_dim=7,
+        normalize_min_max=True,
+        clip_outliers=True,
+        stats={
+            OBS_STATE: {
+                "min": [
+                    -0.27276572585105896,
+                    -0.237214133143425,
+                    0.916006326675415,
+                    2.779496669769287,
+                    -1.3187512159347534,
+                    -0.4198998212814331,
+                    0.001503719249740243,
+                    -0.03989770635962486,
+                ],
+                "max": [
+                    0.1352936029434204,
+                    0.362916499376297,
+                    1.286232590675354,
+                    3.2829697132110596,
+                    0.9332759976387024,
+                    0.6325722336769104,
+                    0.03993396461009979,
+                    -0.0016719202976673841,
+                ],
+            }
+        },
+    )
+    transition = {
+        TransitionKey.OBSERVATION: {
+            OBS_STATE: torch.tensor(
+                [
+                    [
+                        -0.20846466720104218,
+                        0.0,
+                        1.1732795238494873,
+                        3.1403393745422363,
+                        0.0007735038525424898,
+                        -0.0892220064997673,
+                        0.020833000540733337,
+                        -0.020833000540733337,
+                    ]
+                ]
+            ),
+        },
+        TransitionKey.COMPLEMENTARY_DATA: {"task": ["Move"]},
+    }
+
+    output = step(transition)
+
+    normalized = output[TransitionKey.OBSERVATION]["state"][0, 0, :8]
+    expected = torch.tensor(
+        [
+            -0.6848445534706116,
+            -0.2094583511352539,
+            0.3898160457611084,
+            0.4334142208099365,
+            0.17185509204864502,
+            -0.3716168999671936,
+            0.005941033363342285,
+            -0.002521216869354248,
+        ]
+    )
+    torch.testing.assert_close(normalized, expected, atol=1e-6, rtol=1e-6)
+    assert normalized[6:].abs().max().item() < 0.01
+
+
 def test_groot_n1_7_pack_inputs_normalizes_action_chunk_per_dimension_before_padding():
     step = GrootN17PackInputsStep(
         action_horizon=5,
