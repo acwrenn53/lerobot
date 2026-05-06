@@ -83,16 +83,29 @@ def _raw_n1_7_libero_config(model_path) -> GrootConfig:
     )
 
 
-def test_n1_7_backbone_rejects_transformers_5(monkeypatch):
+def test_n1_7_backbone_accepts_transformers_5_layout_and_forwards_mm_token_type_ids(monkeypatch):
+    from transformers.feature_extraction_utils import BatchFeature
+
     import lerobot.policies.groot.groot_n1_7 as groot_n1_7
 
-    class FakeQwen3VLForConditionalGeneration(nn.Module):
+    class FakeLanguageModel(nn.Module):
         def __init__(self):
             super().__init__()
-            self.model = nn.Module()
-            self.model.language_model = nn.Module()
-            self.model.language_model.layers = nn.ModuleList()
-            self.model.visual = nn.Module()
+            self.layers = nn.ModuleList([nn.Linear(1, 1) for _ in range(2)])
+
+    class FakeInnerModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.language_model = FakeLanguageModel()
+            self.visual = nn.Linear(1, 1)
+
+    class FakeQwen3VLForConditionalGeneration(nn.Module):
+        config = SimpleNamespace(image_token_id=42)
+
+        def __init__(self):
+            super().__init__()
+            self.model = FakeInnerModel()
+            self.forward_kwargs = None
 
         @classmethod
         def from_pretrained(cls, *args, **kwargs):
@@ -101,6 +114,19 @@ def test_n1_7_backbone_rejects_transformers_5(monkeypatch):
         @classmethod
         def _from_config(cls, *args, **kwargs):
             return cls()
+
+        def eval(self):
+            super().eval()
+            return self
+
+        def forward(self, **kwargs):
+            self.forward_kwargs = kwargs
+            assert "mm_token_type_ids" in kwargs
+            batch_size, sequence_length = kwargs["input_ids"].shape
+            features = torch.arange(batch_size * sequence_length * 4, dtype=torch.float32).view(
+                batch_size, sequence_length, 4
+            )
+            return SimpleNamespace(hidden_states=[features])
 
     monkeypatch.setattr(
         groot_n1_7,
@@ -112,7 +138,41 @@ def test_n1_7_backbone_rejects_transformers_5(monkeypatch):
         groot_n1_7, "Qwen3VLForConditionalGeneration", FakeQwen3VLForConditionalGeneration
     )
 
-    with pytest.raises(ImportError, match=r"GR00T N1\.7.*transformers.*<5"):
+    backbone = groot_n1_7.Qwen3Backbone(
+        model_name="nvidia/Cosmos-Reason2-2B",
+        select_layer=1,
+        use_flash_attention=False,
+    )
+
+    assert len(backbone.language_model.layers) == 1
+    output = backbone.forward(
+        BatchFeature(
+            data={
+                "input_ids": torch.tensor([[1, 42, 2]]),
+                "attention_mask": torch.tensor([[1, 1, 0]]),
+                "mm_token_type_ids": torch.tensor([[0, 1, 0]]),
+                "pixel_values": torch.zeros(1, 3, 2, 2),
+                "image_grid_thw": torch.ones(1, 3, dtype=torch.long),
+            }
+        )
+    )
+
+    assert backbone.model.forward_kwargs["mm_token_type_ids"].tolist() == [[0, 1, 0]]
+    assert output["backbone_features"].shape == (1, 3, 4)
+
+
+def test_n1_7_backbone_preserves_missing_qwen_optional_dependency_error(monkeypatch):
+    import lerobot.policies.groot.groot_n1_7 as groot_n1_7
+
+    monkeypatch.setattr(
+        groot_n1_7,
+        "metadata",
+        SimpleNamespace(version=lambda package: "5.3.0" if package == "transformers" else "0"),
+        raising=False,
+    )
+    monkeypatch.setattr(groot_n1_7, "Qwen3VLForConditionalGeneration", None)
+
+    with pytest.raises(ImportError, match="Qwen3VLForConditionalGeneration is required"):
         groot_n1_7.Qwen3Backbone(
             model_name="nvidia/Cosmos-Reason2-2B",
             select_layer=0,
@@ -1463,12 +1523,6 @@ def test_qwen3_backbone_uses_nested_transformers_model_contract(monkeypatch):
         "Qwen3VLForConditionalGeneration",
         FakeQwenForConditionalGeneration,
     )
-    monkeypatch.setattr(
-        groot_n1_7,
-        "metadata",
-        SimpleNamespace(version=lambda package: "4.57.3" if package == "transformers" else "0"),
-    )
-
     backbone = groot_n1_7.Qwen3Backbone(
         model_name="fake-qwen",
         select_layer=2,
@@ -1549,11 +1603,6 @@ def test_qwen3_backbone_can_initialize_from_config_without_downloading_weights(m
             return self
 
     monkeypatch.setattr(groot_n1_7, "Qwen3VLForConditionalGeneration", FakeQwenForConditionalGeneration)
-    monkeypatch.setattr(
-        groot_n1_7,
-        "metadata",
-        SimpleNamespace(version=lambda package: "4.57.3" if package == "transformers" else "0"),
-    )
 
     backbone = groot_n1_7.Qwen3Backbone(
         model_name="nvidia/Cosmos-Reason2-2B",

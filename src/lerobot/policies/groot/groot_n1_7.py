@@ -20,14 +20,12 @@ import json
 import logging
 from contextlib import suppress
 from copy import deepcopy
-from importlib import metadata
 from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F  # noqa: N812
 from huggingface_hub import snapshot_download
 from huggingface_hub.errors import HFValidationError, RepositoryNotFoundError
-from packaging.version import InvalidVersion, Version
 from torch import nn
 from torch.distributions import Beta
 
@@ -57,22 +55,6 @@ except ImportError:
     Qwen3VLForConditionalGeneration = None
 
 logger = logging.getLogger(__name__)
-
-
-def _validate_n1_7_transformers_version() -> None:
-    try:
-        version = Version(metadata.version("transformers"))
-    except metadata.PackageNotFoundError:
-        return
-    except InvalidVersion as exc:
-        raise ImportError(f"Could not parse installed transformers version for GR00T N1.7: {exc}") from exc
-
-    if version < Version("4.57.0") or version >= Version("5"):
-        raise ImportError(
-            "GR00T N1.7 currently requires transformers>=4.57,<5 for Cosmos/Qwen3-VL parity. "
-            f"Detected transformers=={version}. Install transformers==4.57.3 in the GR00T optional "
-            "environment before loading N1.7 checkpoints."
-        )
 
 
 def _copy_default(value: Any) -> Any:
@@ -279,8 +261,6 @@ class Qwen3Backbone(nn.Module):
         transformers_loading_kwargs: dict[str, Any] | None = None,
         load_pretrained_weights: bool = True,
     ):
-        _validate_n1_7_transformers_version()
-
         if Qwen3VLForConditionalGeneration is None:
             raise ImportError(
                 "Qwen3VLForConditionalGeneration is required for GR00T N1.7. "
@@ -381,11 +361,13 @@ class Qwen3Backbone(nn.Module):
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
         keys_to_use = ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"]
-        vl_input = {key: vl_input[key] for key in keys_to_use}
-        outputs = self.model(**vl_input, output_hidden_states=True)
+        optional_keys = ["mm_token_type_ids", "pixel_values_videos", "video_grid_thw"]
+        model_input = {key: vl_input[key] for key in keys_to_use}
+        model_input.update({key: vl_input[key] for key in optional_keys if key in vl_input})
+        outputs = self.model(**model_input, output_hidden_states=True)
         features = outputs.hidden_states[-1]
-        image_mask = vl_input["input_ids"] == self.model.config.image_token_id
-        attention_mask = vl_input["attention_mask"] == 1
+        image_mask = model_input["input_ids"] == self.model.config.image_token_id
+        attention_mask = model_input["attention_mask"] == 1
         return BatchFeature(
             data={
                 "backbone_features": features,
