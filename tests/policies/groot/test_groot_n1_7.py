@@ -83,6 +83,43 @@ def _raw_n1_7_libero_config(model_path) -> GrootConfig:
     )
 
 
+def test_n1_7_backbone_rejects_transformers_5(monkeypatch):
+    import lerobot.policies.groot.groot_n1_7 as groot_n1_7
+
+    class FakeQwen3VLForConditionalGeneration(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Module()
+            self.model.language_model = nn.Module()
+            self.model.language_model.layers = nn.ModuleList()
+            self.model.visual = nn.Module()
+
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            return cls()
+
+        @classmethod
+        def _from_config(cls, *args, **kwargs):
+            return cls()
+
+    monkeypatch.setattr(
+        groot_n1_7,
+        "metadata",
+        SimpleNamespace(version=lambda package: "5.3.0" if package == "transformers" else "0"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        groot_n1_7, "Qwen3VLForConditionalGeneration", FakeQwen3VLForConditionalGeneration
+    )
+
+    with pytest.raises(ImportError, match=r"GR00T N1\.7.*transformers.*<5"):
+        groot_n1_7.Qwen3Backbone(
+            model_name="nvidia/Cosmos-Reason2-2B",
+            select_layer=0,
+            use_flash_attention=False,
+        )
+
+
 def _write_raw_n1_7_libero_checkpoint(path):
     path.mkdir()
     (path / "config.json").write_text(
@@ -1426,6 +1463,11 @@ def test_qwen3_backbone_uses_nested_transformers_model_contract(monkeypatch):
         "Qwen3VLForConditionalGeneration",
         FakeQwenForConditionalGeneration,
     )
+    monkeypatch.setattr(
+        groot_n1_7,
+        "metadata",
+        SimpleNamespace(version=lambda package: "4.57.3" if package == "transformers" else "0"),
+    )
 
     backbone = groot_n1_7.Qwen3Backbone(
         model_name="fake-qwen",
@@ -1507,6 +1549,11 @@ def test_qwen3_backbone_can_initialize_from_config_without_downloading_weights(m
             return self
 
     monkeypatch.setattr(groot_n1_7, "Qwen3VLForConditionalGeneration", FakeQwenForConditionalGeneration)
+    monkeypatch.setattr(
+        groot_n1_7,
+        "metadata",
+        SimpleNamespace(version=lambda package: "4.57.3" if package == "transformers" else "0"),
+    )
 
     backbone = groot_n1_7.Qwen3Backbone(
         model_name="nvidia/Cosmos-Reason2-2B",

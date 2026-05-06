@@ -20,12 +20,14 @@ import json
 import logging
 from contextlib import suppress
 from copy import deepcopy
+from importlib import metadata
 from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F  # noqa: N812
 from huggingface_hub import snapshot_download
 from huggingface_hub.errors import HFValidationError, RepositoryNotFoundError
+from packaging.version import InvalidVersion, Version
 from torch import nn
 from torch.distributions import Beta
 
@@ -55,6 +57,22 @@ except ImportError:
     Qwen3VLForConditionalGeneration = None
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_n1_7_transformers_version() -> None:
+    try:
+        version = Version(metadata.version("transformers"))
+    except metadata.PackageNotFoundError:
+        return
+    except InvalidVersion as exc:
+        raise ImportError(f"Could not parse installed transformers version for GR00T N1.7: {exc}") from exc
+
+    if version < Version("4.57.0") or version >= Version("5"):
+        raise ImportError(
+            "GR00T N1.7 currently requires transformers>=4.57,<5 for Cosmos/Qwen3-VL parity. "
+            f"Detected transformers=={version}. Install transformers==4.57.3 in the GR00T optional "
+            "environment before loading N1.7 checkpoints."
+        )
 
 
 def _copy_default(value: Any) -> Any:
@@ -261,6 +279,8 @@ class Qwen3Backbone(nn.Module):
         transformers_loading_kwargs: dict[str, Any] | None = None,
         load_pretrained_weights: bool = True,
     ):
+        _validate_n1_7_transformers_version()
+
         if Qwen3VLForConditionalGeneration is None:
             raise ImportError(
                 "Qwen3VLForConditionalGeneration is required for GR00T N1.7. "
