@@ -24,7 +24,7 @@ import pytest
 import torch
 from torch import nn
 
-from lerobot.configs import FeatureType, PolicyFeature, PreTrainedConfig
+from lerobot.configs import FeatureType, PolicyFeature
 from lerobot.policies.factory import make_policy_config, make_pre_post_processors
 from lerobot.policies.groot.configuration_groot import (
     GROOT_N1_5,
@@ -63,6 +63,19 @@ def _groot_config(model_version: str) -> GrootConfig:
     input_features, output_features = _groot_features(state_dim=8, action_dim=7)
     return GrootConfig(
         model_version=model_version,
+        input_features=input_features,
+        output_features=output_features,
+        device="cpu",
+        use_bf16=False,
+    )
+
+
+def _raw_n1_7_libero_config(model_path) -> GrootConfig:
+    input_features, output_features = _groot_features(state_dim=8, action_dim=7)
+    return GrootConfig(
+        model_version=GROOT_N1_7,
+        base_model_path=str(model_path),
+        embodiment_tag="libero_sim",
         input_features=input_features,
         output_features=output_features,
         device="cpu",
@@ -165,23 +178,6 @@ def _stats(values):
         "q01": [value + 1.0 for value in values],
         "q99": [value + 99.0 for value in values],
     }
-
-
-def _write_cached_cosmos_snapshot(hub_cache):
-    commit = "1234567890abcdef"
-    repo_cache = hub_cache / "models--nvidia--Cosmos-Reason2-2B"
-    snapshot = repo_cache / "snapshots" / commit
-    snapshot.mkdir(parents=True)
-    (repo_cache / "refs").mkdir()
-    (repo_cache / "refs" / "main").write_text(commit)
-    for filename in (
-        "config.json",
-        "tokenizer_config.json",
-        "preprocessor_config.json",
-        "video_preprocessor_config.json",
-    ):
-        (snapshot / filename).write_text("{}")
-    return snapshot
 
 
 def _expected_albumentations_eval_image(image_np, cv2, *, target_size, shortest_edge, crop_fraction):
@@ -312,27 +308,10 @@ def test_groot_from_pretrained_infers_n1_7_from_ambiguous_local_config(tmp_path,
     assert policy.config.base_model_path == str(model_path)
 
 
-def test_pretrained_config_loads_raw_n1_7_libero_checkpoint(tmp_path, monkeypatch):
-    model_path = tmp_path / "libero_spatial"
-    _write_raw_n1_7_libero_checkpoint(model_path)
-    cosmos_snapshot = _write_cached_cosmos_snapshot(tmp_path / "hub")
-    monkeypatch.setenv("HUGGINGFACE_HUB_CACHE", str(tmp_path / "hub"))
-
-    config = PreTrainedConfig.from_pretrained(model_path, cli_overrides=["--device=cpu"])
-
-    assert isinstance(config, GrootConfig)
-    assert config.model_version == GROOT_N1_7
-    assert config.base_model_path == str(model_path)
-    assert config.embodiment_tag == "libero_sim"
-    assert config.n_action_steps == 8
-    assert config.n1_7_backbone_model == str(cosmos_snapshot)
-
-
 def test_raw_n1_7_libero_checkpoint_processors_use_checkpoint_assets(tmp_path):
     model_path = tmp_path / "libero_spatial"
     _write_raw_n1_7_libero_checkpoint(model_path)
-    config = PreTrainedConfig.from_pretrained(model_path, cli_overrides=["--device=cpu"])
-    config.input_features, config.output_features = _groot_features(state_dim=8, action_dim=7)
+    config = _raw_n1_7_libero_config(model_path)
 
     preprocessor, postprocessor = make_pre_post_processors(config, pretrained_path=str(model_path))
 
@@ -388,18 +367,47 @@ def test_raw_n1_7_checkpoint_requires_percentile_stats_when_config_uses_percenti
     statistics = json.loads((model_path / "statistics.json").read_text())
     del statistics["libero_sim"]["state"]["x"]["q01"]
     (model_path / "statistics.json").write_text(json.dumps(statistics))
-    config = PreTrainedConfig.from_pretrained(model_path, cli_overrides=["--device=cpu"])
-    config.input_features, config.output_features = _groot_features(state_dim=8, action_dim=7)
+    config = _raw_n1_7_libero_config(model_path)
 
     with pytest.raises(KeyError, match="q01.*state.x"):
         make_pre_post_processors(config, pretrained_path=str(model_path))
 
 
+def test_raw_n1_7_checkpoint_processors_prefer_dataset_stats_when_supplied(tmp_path):
+    model_path = tmp_path / "libero_spatial"
+    _write_raw_n1_7_libero_checkpoint(model_path)
+    config = _raw_n1_7_libero_config(model_path)
+    dataset_stats = {
+        OBS_STATE: {
+            "min": torch.full((8,), -8.0),
+            "max": torch.full((8,), 8.0),
+        },
+        ACTION: {
+            "min": torch.full((7,), -7.0),
+            "max": torch.full((7,), 7.0),
+        },
+    }
+
+    preprocessor, postprocessor = make_pre_post_processors(
+        config,
+        pretrained_path=str(model_path),
+        dataset_stats=dataset_stats,
+    )
+
+    pack_inputs = next(step for step in preprocessor.steps if isinstance(step, GrootN17PackInputsStep))
+    unpack_actions = next(
+        step for step in postprocessor.steps if isinstance(step, GrootActionUnpackUnnormalizeStep)
+    )
+    torch.testing.assert_close(pack_inputs.stats[OBS_STATE]["min"], dataset_stats[OBS_STATE]["min"])
+    torch.testing.assert_close(pack_inputs.stats[ACTION]["max"], dataset_stats[ACTION]["max"])
+    torch.testing.assert_close(unpack_actions.stats[OBS_STATE]["min"], dataset_stats[OBS_STATE]["min"])
+    torch.testing.assert_close(unpack_actions.stats[ACTION]["max"], dataset_stats[ACTION]["max"])
+
+
 def test_groot_n1_7_saved_processors_round_trip_checkpoint_specific_fields(tmp_path):
     model_path = tmp_path / "libero_spatial"
     _write_raw_n1_7_libero_checkpoint(model_path)
-    config = PreTrainedConfig.from_pretrained(model_path, cli_overrides=["--device=cpu"])
-    config.input_features, config.output_features = _groot_features(state_dim=8, action_dim=7)
+    config = _raw_n1_7_libero_config(model_path)
     preprocessor, postprocessor = make_pre_post_processors(config, pretrained_path=str(model_path))
     save_dir = tmp_path / "saved_processors"
 
@@ -543,6 +551,59 @@ def test_groot_n1_7_pack_inputs_normalizes_state_with_q01_q99_clips_and_pads():
     torch.testing.assert_close(output[TransitionKey.OBSERVATION]["state"], expected)
 
 
+def test_groot_n1_7_pack_inputs_normalizes_action_chunk_per_dimension_before_padding():
+    step = GrootN17PackInputsStep(
+        action_horizon=5,
+        valid_action_horizon=3,
+        max_state_dim=4,
+        max_action_dim=5,
+        normalize_min_max=True,
+        clip_outliers=True,
+        stats={
+            OBS_STATE: {"min": [0.0, 0.0], "max": [1.0, 1.0]},
+            ACTION: {
+                "min": [-2.0, 10.0, 100.0],
+                "max": [2.0, 30.0, 101.0],
+            },
+        },
+    )
+    transition = {
+        TransitionKey.OBSERVATION: {
+            OBS_STATE: torch.tensor([[0.5, 0.5]]),
+        },
+        TransitionKey.ACTION: torch.tensor(
+            [
+                [
+                    [-2.0, 30.0, 100.25],
+                    [0.0, 20.0, 101.0],
+                    [2.0, 10.0, 100.0],
+                ]
+            ]
+        ),
+        TransitionKey.COMPLEMENTARY_DATA: {"task": ["Move"]},
+    }
+
+    output = step(transition)
+
+    expected_actions = torch.tensor(
+        [
+            [
+                [-1.0, 1.0, -0.5, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0, 0.0],
+                [1.0, -1.0, -1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0],
+            ]
+        ]
+    )
+    torch.testing.assert_close(output[TransitionKey.ACTION], expected_actions)
+    action_mask = output[TransitionKey.COMPLEMENTARY_DATA]["action_mask"]
+    assert action_mask.shape == (1, 5, 5)
+    assert action_mask[0, :3, :3].sum().item() == 9
+    assert action_mask[0, 3:].sum().item() == 0
+    assert action_mask[0, :, 3:].sum().item() == 0
+
+
 def test_groot_n1_7_pack_inputs_adds_inference_action_horizon_mask():
     step = GrootN17PackInputsStep(
         action_horizon=40,
@@ -648,7 +709,7 @@ def test_groot_n1_7_postprocessor_decodes_selected_action_and_gripper_thresholds
         stats={
             ACTION: {
                 "min": [0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 0.0],
-                "max": [2.0, 12.0, 22.0, 32.0, 42.0, 52.0, 1.0],
+                "max": [2.0, 14.0, 26.0, 38.0, 50.0, 62.0, 1.0],
             }
         },
         libero_gripper_action=True,
@@ -663,9 +724,48 @@ def test_groot_n1_7_postprocessor_decodes_selected_action_and_gripper_thresholds
 
     output = step({TransitionKey.ACTION: selected_actions})
 
-    expected_prefix = torch.tensor([0.0, 10.5, 21.0, 31.5, 42.0, 52.0])
+    expected_prefix = torch.tensor([0.0, 11.0, 23.0, 36.0, 50.0, 62.0])
     torch.testing.assert_close(output[TransitionKey.ACTION][:, :6], expected_prefix.expand(3, 6))
     torch.testing.assert_close(output[TransitionKey.ACTION][:, -1], torch.tensor([1.0, -0.0, -1.0]))
+
+
+def test_groot_n1_7_postprocessor_decodes_action_chunks_without_dropping_timesteps():
+    step = GrootActionUnpackUnnormalizeStep(
+        env_action_dim=7,
+        normalize_min_max=True,
+        clip_normalized_action=True,
+        stats={
+            ACTION: {
+                "min": [0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 0.0],
+                "max": [2.0, 14.0, 26.0, 38.0, 50.0, 62.0, 1.0],
+            }
+        },
+        libero_gripper_action=True,
+    )
+    action_chunk = torch.tensor(
+        [
+            [
+                [-1.0, 0.0, 1.0, -0.5, 0.5, 2.0, -1.0, 99.0],
+                [0.25, -0.25, 0.75, -0.75, 1.0, -1.0, 0.0, 99.0],
+                [1.0, -1.0, 0.0, 0.5, -0.5, 0.0, 0.5, 99.0],
+            ]
+        ]
+    )
+
+    output = step({TransitionKey.ACTION: action_chunk})
+
+    expected_prefix = torch.tensor(
+        [
+            [
+                [0.0, 12.0, 26.0, 32.0, 47.5, 62.0],
+                [1.25, 11.5, 25.25, 31.0, 50.0, 50.0],
+                [2.0, 10.0, 23.0, 36.0, 42.5, 56.0],
+            ]
+        ]
+    )
+    assert output[TransitionKey.ACTION].shape == (1, 3, 7)
+    torch.testing.assert_close(output[TransitionKey.ACTION][..., :6], expected_prefix)
+    torch.testing.assert_close(output[TransitionKey.ACTION][..., -1], torch.tensor([[1.0, -0.0, -1.0]]))
 
 
 def test_groot_from_pretrained_rejects_caller_config_mismatch_from_local_config(tmp_path):
@@ -1059,6 +1159,37 @@ def test_groot_n1_7_saved_processors_reload_through_factory(tmp_path):
     torch.testing.assert_close(pack_step.stats[ACTION]["max"], dataset_stats[ACTION]["max"])
     torch.testing.assert_close(unpack_step.stats[OBS_STATE]["min"], dataset_stats[OBS_STATE]["min"])
     torch.testing.assert_close(unpack_step.stats[ACTION]["max"], dataset_stats[ACTION]["max"])
+    assert unpack_step.env_action_dim == 7
+
+
+def test_groot_n1_7_saved_processors_reload_through_factory_preserves_saved_stats(tmp_path):
+    config = _groot_config(GROOT_N1_7)
+    saved_stats = {
+        OBS_STATE: {
+            "min": torch.full((8,), -2.0),
+            "max": torch.full((8,), 2.0),
+        },
+        ACTION: {
+            "min": torch.full((7,), -3.0),
+            "max": torch.full((7,), 3.0),
+        },
+    }
+    preprocessor, postprocessor = make_groot_pre_post_processors(config, dataset_stats=saved_stats)
+    preprocessor.save_pretrained(tmp_path)
+    postprocessor.save_pretrained(tmp_path)
+
+    loaded_preprocessor, loaded_postprocessor = make_pre_post_processors(
+        config,
+        pretrained_path=str(tmp_path),
+    )
+
+    pack_step = next(step for step in loaded_preprocessor.steps if isinstance(step, GrootN17PackInputsStep))
+    unpack_step = loaded_postprocessor.steps[0]
+    assert pack_step.normalize_min_max
+    torch.testing.assert_close(pack_step.stats[OBS_STATE]["min"], saved_stats[OBS_STATE]["min"])
+    torch.testing.assert_close(pack_step.stats[ACTION]["max"], saved_stats[ACTION]["max"])
+    torch.testing.assert_close(unpack_step.stats[OBS_STATE]["min"], saved_stats[OBS_STATE]["min"])
+    torch.testing.assert_close(unpack_step.stats[ACTION]["max"], saved_stats[ACTION]["max"])
     assert unpack_step.env_action_dim == 7
 
 

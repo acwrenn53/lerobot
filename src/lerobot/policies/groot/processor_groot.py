@@ -1382,10 +1382,9 @@ class GrootActionUnpackUnnormalizeStep(ProcessorStep):
         if not isinstance(action, torch.Tensor):
             return transition
 
-        # Select last timestep and slice to env dimension
-        if action.dim() == 3:
-            action = action[:, -1, :]
-        # Now action is (B, D_model)
+        # Slice to env dimension while preserving an optional action horizon.
+        # Sync rollout postprocesses selected actions as (B, D); RTC postprocesses
+        # chunks as (B, T, D), matching Isaac-GR00T's decode_action contract.
         if self.env_action_dim and action.shape[-1] >= self.env_action_dim:
             action = action[..., : self.env_action_dim]
 

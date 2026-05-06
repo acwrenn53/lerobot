@@ -280,6 +280,7 @@ def make_pre_post_processors(
         if isinstance(policy_cfg, GrootConfig):
             # GROOT handles normalization in its pack-inputs step
             # Need to override both stats AND normalize_min_max since saved config might be empty
+            dataset_stats = kwargs.get("dataset_stats")
             preprocessor_overrides = {}
             postprocessor_overrides = {}
             pack_inputs_key = (
@@ -288,17 +289,19 @@ def make_pre_post_processors(
                 else "groot_pack_inputs_v3"
             )
             preprocessor_overrides[pack_inputs_key] = {
-                "stats": kwargs.get("dataset_stats"),
                 "normalize_min_max": True,
             }
+            if dataset_stats is not None:
+                preprocessor_overrides[pack_inputs_key]["stats"] = dataset_stats
 
             # Also ensure postprocessing slices to env action dim and unnormalizes with dataset stats
             env_action_dim = policy_cfg.output_features[ACTION].shape[0]
             postprocessor_overrides["groot_action_unpack_unnormalize_v1"] = {
-                "stats": kwargs.get("dataset_stats"),
                 "normalize_min_max": True,
                 "env_action_dim": env_action_dim,
             }
+            if dataset_stats is not None:
+                postprocessor_overrides["groot_action_unpack_unnormalize_v1"]["stats"] = dataset_stats
             kwargs["preprocessor_overrides"] = preprocessor_overrides
             kwargs["postprocessor_overrides"] = postprocessor_overrides
 
