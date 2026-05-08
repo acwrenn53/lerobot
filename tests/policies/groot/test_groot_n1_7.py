@@ -470,7 +470,7 @@ def test_raw_n1_7_checkpoint_requires_percentile_stats_when_config_uses_percenti
         make_pre_post_processors(config, pretrained_path=str(model_path))
 
 
-def test_raw_n1_7_checkpoint_processors_prefer_dataset_stats_when_supplied(tmp_path):
+def test_raw_n1_7_checkpoint_processors_prefer_checkpoint_stats_when_dataset_stats_supplied(tmp_path):
     model_path = tmp_path / "libero_spatial"
     _write_raw_n1_7_libero_checkpoint(model_path)
     config = _raw_n1_7_libero_config(model_path)
@@ -495,10 +495,22 @@ def test_raw_n1_7_checkpoint_processors_prefer_dataset_stats_when_supplied(tmp_p
     unpack_actions = next(
         step for step in postprocessor.steps if isinstance(step, GrootActionUnpackUnnormalizeStep)
     )
-    torch.testing.assert_close(pack_inputs.stats[OBS_STATE]["min"], dataset_stats[OBS_STATE]["min"])
-    torch.testing.assert_close(pack_inputs.stats[ACTION]["max"], dataset_stats[ACTION]["max"])
-    torch.testing.assert_close(unpack_actions.stats[OBS_STATE]["min"], dataset_stats[OBS_STATE]["min"])
-    torch.testing.assert_close(unpack_actions.stats[ACTION]["max"], dataset_stats[ACTION]["max"])
+    torch.testing.assert_close(
+        torch.as_tensor(pack_inputs.stats[OBS_STATE]["min"]),
+        torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
+    )
+    torch.testing.assert_close(
+        torch.as_tensor(pack_inputs.stats[ACTION]["max"]),
+        torch.tensor([109.0, 110.0, 111.0, 112.0, 113.0, 114.0, 115.0]),
+    )
+    torch.testing.assert_close(
+        torch.as_tensor(unpack_actions.stats[OBS_STATE]["min"]),
+        torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
+    )
+    torch.testing.assert_close(
+        torch.as_tensor(unpack_actions.stats[ACTION]["max"]),
+        torch.tensor([109.0, 110.0, 111.0, 112.0, 113.0, 114.0, 115.0]),
+    )
 
 
 def test_groot_n1_7_saved_processors_round_trip_checkpoint_specific_fields(tmp_path):

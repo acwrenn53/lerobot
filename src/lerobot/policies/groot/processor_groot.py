@@ -320,6 +320,12 @@ def _as_float_list(values: Any) -> list[float]:
     return [float(values)]
 
 
+def _has_modality_stats(stats: dict[str, dict[str, Any]] | None) -> bool:
+    if not stats:
+        return False
+    return any(bool(modality_stats) for modality_stats in stats.values())
+
+
 def make_groot_pre_post_processors(
     config: GrootConfig, dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None
 ) -> tuple[
@@ -363,7 +369,8 @@ def make_groot_pre_post_processors(
             if checkpoint_assets is not None and checkpoint_assets.valid_action_horizon is not None
             else action_horizon
         )
-        padded_stats = dataset_stats or (checkpoint_assets.stats if checkpoint_assets is not None else {})
+        checkpoint_stats = checkpoint_assets.stats if checkpoint_assets is not None else None
+        padded_stats = checkpoint_stats if _has_modality_stats(checkpoint_stats) else (dataset_stats or {})
         embodiment_mapping = (
             checkpoint_assets.embodiment_mapping
             if checkpoint_assets is not None

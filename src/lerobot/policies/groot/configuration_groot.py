@@ -480,7 +480,11 @@ class GrootConfig(PreTrainedConfig):
     @property
     def action_delta_indices(self) -> list[int]:
         """Return indices for delta actions."""
-        model_action_horizon = 40 if self.model_version == GROOT_N1_7 else 16
+        model_action_horizon = 16
+        if self.model_version == GROOT_N1_7:
+            model_action_horizon = (
+                infer_groot_n1_7_action_horizon(self.base_model_path, self.embodiment_tag) or 40
+            )
         return list(range(min(self.chunk_size, model_action_horizon)))
 
     @property
