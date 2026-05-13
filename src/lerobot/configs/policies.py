@@ -203,24 +203,6 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
                     f"{CONFIG_NAME} not found on the HuggingFace Hub in {model_id}"
                 ) from e
 
-        if config_file is None:
-            raise FileNotFoundError(f"{CONFIG_NAME} not found in {model_id}")
-
-        with open(config_file) as f:
-            config = json.load(f)
-
-        cli_overrides = policy_kwargs.pop("cli_overrides", [])
-        if "type" not in config:
-            compat_config = _maybe_load_groot_n1_7_policy_config(
-                model_id=model_id,
-                config_file=config_file,
-                config=config,
-                cache_dir=cache_dir,
-                cli_overrides=cli_overrides,
-            )
-            if compat_config is not None:
-                return compat_config
-
         # HACK: Parse the original config to get the config subclass, so that we can
         # apply cli overrides.
         # This is very ugly, ideally we'd like to be able to do that natively with draccus
@@ -228,81 +210,17 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
         with draccus.config_type("json"):
             orig_config = draccus.parse(cls, config_file, args=[])
 
+        if config_file is None:
+            raise FileNotFoundError(f"{CONFIG_NAME} not found in {model_id}")
+
+        with open(config_file) as f:
+            config = json.load(f)
+
         config.pop("type")
         with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as f:
             json.dump(config, f)
             config_file = f.name
 
+        cli_overrides = policy_kwargs.pop("cli_overrides", [])
         with draccus.config_type("json"):
             return draccus.parse(orig_config.__class__, config_file, args=cli_overrides)
-
-
-def _maybe_load_groot_n1_7_policy_config(
-    *,
-    model_id: str,
-    config_file: str,
-    config: dict[str, Any],
-    cache_dir: str | Path | None,
-    cli_overrides: list[str] | None,
-) -> PreTrainedConfig | None:
-    from lerobot.policies.groot.configuration_groot import (
-        GROOT_N1_7,
-        GROOT_N1_7_BACKBONE_MODEL,
-        GrootConfig,
-        infer_groot_model_version,
-        infer_groot_n1_7_action_execution_horizon,
-        infer_groot_n1_7_action_horizon,
-        infer_groot_n1_7_embodiment_tag,
-        is_raw_groot_n1_7_checkpoint,
-        resolve_groot_n1_7_backbone_model,
-    )
-
-    config_path = Path(config_file)
-    checkpoint_path = Path(model_id).expanduser() if Path(model_id).is_dir() else config_path.parent
-    if not is_raw_groot_n1_7_checkpoint(checkpoint_path):
-        if infer_groot_model_version(str(config_path)) != GROOT_N1_7:
-            return None
-        checkpoint_path = Path(model_id).expanduser() if Path(model_id).is_dir() else config_path.parent
-
-    backbone_model = config.get("model_name")
-    if not isinstance(backbone_model, str):
-        backbone_model = GROOT_N1_7_BACKBONE_MODEL
-
-    groot_config: dict[str, Any] = {
-        "model_version": GROOT_N1_7,
-        "base_model_path": str(checkpoint_path),
-        "n1_7_backbone_model": resolve_groot_n1_7_backbone_model(backbone_model, cache_dir=cache_dir),
-    }
-    if isinstance(config.get("max_state_dim"), int):
-        groot_config["max_state_dim"] = config["max_state_dim"]
-    if isinstance(config.get("max_action_dim"), int):
-        groot_config["max_action_dim"] = config["max_action_dim"]
-    if isinstance(config.get("action_horizon"), int):
-        groot_config["chunk_size"] = config["action_horizon"]
-        groot_config["n_action_steps"] = config["action_horizon"]
-    image_target_size = config.get("image_target_size")
-    if (
-        isinstance(image_target_size, list)
-        and len(image_target_size) == 2
-        and all(isinstance(value, int) for value in image_target_size)
-    ):
-        groot_config["image_size"] = image_target_size
-
-    embodiment_tag = infer_groot_n1_7_embodiment_tag(checkpoint_path)
-    if embodiment_tag is not None:
-        groot_config["embodiment_tag"] = embodiment_tag
-        action_horizon = infer_groot_n1_7_action_horizon(checkpoint_path, embodiment_tag)
-        if action_horizon is not None:
-            groot_config["n_action_steps"] = min(groot_config.get("n_action_steps", action_horizon), action_horizon)
-        execution_horizon = infer_groot_n1_7_action_execution_horizon(checkpoint_path, embodiment_tag)
-        if execution_horizon is not None:
-            groot_config["n_action_steps"] = min(
-                groot_config.get("n_action_steps", execution_horizon), execution_horizon
-            )
-
-    with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as f:
-        json.dump(groot_config, f)
-        compat_config_file = f.name
-
-    with draccus.config_type("json"):
-        return draccus.parse(GrootConfig, compat_config_file, args=cli_overrides or [])

@@ -134,7 +134,7 @@ Preliminary LeRobot integration results:
 
 Replace the `XX` placeholders with final eval artifacts before merge.
 
-Download the suite checkpoint locally, then point `--policy.path` at the downloaded subdirectory:
+Download the suite checkpoint locally, then point `--policy.base_model_path` at the downloaded subdirectory. `--policy.path` is reserved for LeRobot checkpoints that contain a LeRobot `config.json` with a `type` field.
 
 ```bash
 huggingface-cli download nvidia/GR00T-N1.7-LIBERO \
@@ -142,7 +142,10 @@ huggingface-cli download nvidia/GR00T-N1.7-LIBERO \
   --local-dir ./GR00T-N1.7-LIBERO
 
 lerobot-eval \
-  --policy.path=./GR00T-N1.7-LIBERO/libero_spatial \
+  --policy.type=groot \
+  --policy.model_version=n1.7 \
+  --policy.base_model_path=./GR00T-N1.7-LIBERO/libero_spatial \
+  --policy.embodiment_tag=libero_sim \
   --env.type=libero \
   --env.task=libero_spatial \
   --eval.n_episodes=50
