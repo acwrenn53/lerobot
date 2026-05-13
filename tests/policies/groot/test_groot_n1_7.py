@@ -100,7 +100,7 @@ def test_n1_7_backbone_accepts_transformers_5_layout_and_forwards_mm_token_type_
             self.visual = nn.Linear(1, 1)
 
     class FakeQwen3VLForConditionalGeneration(nn.Module):
-        config = SimpleNamespace(image_token_id=42)
+        config = SimpleNamespace(image_token_id=42, video_token_id=43)
 
         def __init__(self):
             super().__init__()
@@ -159,6 +159,23 @@ def test_n1_7_backbone_accepts_transformers_5_layout_and_forwards_mm_token_type_
 
     assert backbone.model.forward_kwargs["mm_token_type_ids"].tolist() == [[0, 1, 0]]
     assert output["backbone_features"].shape == (1, 3, 4)
+
+    output = backbone.forward(
+        BatchFeature(
+            data={
+                "input_ids": torch.tensor([[1, 42, 43, 2]]),
+                "attention_mask": torch.tensor([[1, 1, 1, 0]]),
+                "pixel_values": torch.zeros(1, 3, 2, 2),
+                "image_grid_thw": torch.ones(1, 3, dtype=torch.long),
+                "pixel_values_videos": torch.zeros(1, 3, 2, 2),
+                "video_grid_thw": torch.ones(1, 3, dtype=torch.long),
+            }
+        )
+    )
+
+    assert backbone.model.forward_kwargs["mm_token_type_ids"].tolist() == [[0, 1, 2, 0]]
+    assert backbone.model.forward_kwargs["mm_token_type_ids"].dtype == torch.int32
+    assert output["backbone_features"].shape == (1, 4, 4)
 
 
 def test_n1_7_backbone_preserves_missing_qwen_optional_dependency_error(monkeypatch):
@@ -1406,6 +1423,9 @@ def test_groot_policy_forwards_n1_7_qwen_inputs(monkeypatch):
         "attention_mask": torch.ones(2, 8, dtype=torch.long),
         "pixel_values": torch.zeros(4, 3, 16, 16),
         "image_grid_thw": torch.ones(4, 3, dtype=torch.long),
+        "mm_token_type_ids": torch.zeros(2, 8, dtype=torch.int32),
+        "pixel_values_videos": torch.zeros(1, 3, 16, 16),
+        "video_grid_thw": torch.ones(1, 3, dtype=torch.long),
         "next.state": torch.ones(2, 1, 132),
         "info": {"ignored": True},
     }
@@ -1423,6 +1443,9 @@ def test_groot_policy_forwards_n1_7_qwen_inputs(monkeypatch):
         "attention_mask",
         "pixel_values",
         "image_grid_thw",
+        "mm_token_type_ids",
+        "pixel_values_videos",
+        "video_grid_thw",
     }
 
 

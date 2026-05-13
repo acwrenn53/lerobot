@@ -298,7 +298,17 @@ class GrootPolicy(PreTrainedPolicy):
             allowed_base.update({"action", "action_mask"})
 
         if self.config.model_version == GROOT_N1_7:
-            allowed_base.update({"input_ids", "attention_mask", "pixel_values", "image_grid_thw"})
+            allowed_base.update(
+                {
+                    "input_ids",
+                    "attention_mask",
+                    "pixel_values",
+                    "image_grid_thw",
+                    "mm_token_type_ids",
+                    "pixel_values_videos",
+                    "video_grid_thw",
+                }
+            )
             allowed_base.add("action_mask")
         else:
             allowed_base.update({"action_mask"} if include_action else set())

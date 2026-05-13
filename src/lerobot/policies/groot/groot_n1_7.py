@@ -61,6 +61,80 @@ def _copy_default(value: Any) -> Any:
     return deepcopy(value)
 
 
+GR00T_N1_7_DEFAULTS: dict[str, Any] = {
+    "model_dtype": "bfloat16",
+    "dtype": "bfloat16",
+    "model_name": "nvidia/Cosmos-Reason2-2B",
+    "backbone_model_type": "qwen",
+    "model_revision": None,
+    "tune_top_llm_layers": 0,
+    "backbone_embedding_dim": 2048,
+    "tune_llm": False,
+    "tune_visual": False,
+    "select_layer": 12,
+    "reproject_vision": False,
+    "use_flash_attention": True,
+    "load_bf16": False,
+    "backbone_trainable_params_fp32": True,
+    "image_crop_size": (230, 230),
+    "image_target_size": (256, 256),
+    "shortest_image_edge": None,
+    "crop_fraction": None,
+    "random_rotation_angle": None,
+    "color_jitter_params": None,
+    "use_albumentations_transforms": True,
+    "extra_augmentation_config": None,
+    "formalize_language": True,
+    "apply_sincos_state_encoding": False,
+    "use_percentiles": True,
+    "use_relative_action": False,
+    "max_state_dim": 132,
+    "max_action_dim": 132,
+    "action_horizon": 40,
+    "hidden_size": 1024,
+    "input_embedding_dim": 1536,
+    "state_history_length": 1,
+    "add_pos_embed": True,
+    "attn_dropout": 0.2,
+    "use_vlln": True,
+    "max_seq_len": 1024,
+    "use_alternate_vl_dit": True,
+    "attend_text_every_n_blocks": 2,
+    "diffusion_model_cfg": {
+        "positional_embeddings": None,
+        "num_layers": 32,
+        "num_attention_heads": 32,
+        "attention_head_dim": 48,
+        "norm_type": "ada_norm",
+        "dropout": 0.2,
+        "final_dropout": True,
+        "output_dim": 1024,
+        "interleave_self_attention": True,
+    },
+    "vl_self_attention_cfg": {
+        "positional_embeddings": None,
+        "num_layers": 4,
+        "num_attention_heads": 32,
+        "attention_head_dim": 64,
+        "dropout": 0.2,
+        "final_dropout": True,
+    },
+    "num_inference_timesteps": 4,
+    "noise_beta_alpha": 1.5,
+    "noise_beta_beta": 1.0,
+    "noise_s": 0.999,
+    "num_timestep_buckets": 1000,
+    "tune_projector": True,
+    "tune_diffusion_model": True,
+    "tune_vlln": True,
+    "state_dropout_prob": 0.2,
+    "exclude_state": False,
+    "use_mean_std": False,
+    "max_num_embodiments": 32,
+    "rtc_ramp_rate": 6.0,
+}
+
+
 class GR00TN17Config(PretrainedConfig):
     """Configuration for NVIDIA GR00T N1.7.
 
@@ -72,82 +146,11 @@ class GR00TN17Config(PretrainedConfig):
 
     model_type = "Gr00tN1d7"
 
-    _defaults: dict[str, Any] = {
-        "model_dtype": "bfloat16",
-        "dtype": "bfloat16",
-        "model_name": "nvidia/Cosmos-Reason2-2B",
-        "backbone_model_type": "qwen",
-        "model_revision": None,
-        "tune_top_llm_layers": 0,
-        "backbone_embedding_dim": 2048,
-        "tune_llm": False,
-        "tune_visual": False,
-        "select_layer": 12,
-        "reproject_vision": False,
-        "use_flash_attention": True,
-        "load_bf16": False,
-        "backbone_trainable_params_fp32": True,
-        "image_crop_size": (230, 230),
-        "image_target_size": (256, 256),
-        "shortest_image_edge": None,
-        "crop_fraction": None,
-        "random_rotation_angle": None,
-        "color_jitter_params": None,
-        "use_albumentations_transforms": True,
-        "extra_augmentation_config": None,
-        "formalize_language": True,
-        "apply_sincos_state_encoding": False,
-        "use_percentiles": True,
-        "use_relative_action": False,
-        "max_state_dim": 132,
-        "max_action_dim": 132,
-        "action_horizon": 40,
-        "hidden_size": 1024,
-        "input_embedding_dim": 1536,
-        "state_history_length": 1,
-        "add_pos_embed": True,
-        "attn_dropout": 0.2,
-        "use_vlln": True,
-        "max_seq_len": 1024,
-        "use_alternate_vl_dit": True,
-        "attend_text_every_n_blocks": 2,
-        "diffusion_model_cfg": {
-            "positional_embeddings": None,
-            "num_layers": 32,
-            "num_attention_heads": 32,
-            "attention_head_dim": 48,
-            "norm_type": "ada_norm",
-            "dropout": 0.2,
-            "final_dropout": True,
-            "output_dim": 1024,
-            "interleave_self_attention": True,
-        },
-        "vl_self_attention_cfg": {
-            "positional_embeddings": None,
-            "num_layers": 4,
-            "num_attention_heads": 32,
-            "attention_head_dim": 64,
-            "dropout": 0.2,
-            "final_dropout": True,
-        },
-        "num_inference_timesteps": 4,
-        "noise_beta_alpha": 1.5,
-        "noise_beta_beta": 1.0,
-        "noise_s": 0.999,
-        "num_timestep_buckets": 1000,
-        "tune_projector": True,
-        "tune_diffusion_model": True,
-        "tune_vlln": True,
-        "state_dropout_prob": 0.2,
-        "exclude_state": False,
-        "use_mean_std": False,
-        "max_num_embodiments": 32,
-        "rtc_ramp_rate": 6.0,
-    }
+    _defaults = GR00T_N1_7_DEFAULTS
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        for key, value in self._defaults.items():
+        for key, value in GR00T_N1_7_DEFAULTS.items():
             setattr(self, key, _copy_default(kwargs.pop(key, value)))
         for key, value in kwargs.items():
             setattr(self, key, value)
@@ -358,12 +361,33 @@ class Qwen3Backbone(nn.Module):
     def prepare_input(self, batch: dict[str, Any]) -> BatchFeature:
         return BatchFeature(data=batch)
 
+    def _ensure_mm_token_type_ids(self, model_input: dict[str, torch.Tensor]) -> None:
+        if "mm_token_type_ids" in model_input:
+            return
+        if "image_grid_thw" not in model_input and "video_grid_thw" not in model_input:
+            return
+
+        input_ids = model_input.get("input_ids")
+        if input_ids is None:
+            return
+
+        mm_token_type_ids = torch.zeros(input_ids.shape, dtype=torch.int32, device=input_ids.device)
+        image_token_id = getattr(self.model.config, "image_token_id", None)
+        video_token_id = getattr(self.model.config, "video_token_id", None)
+        if image_token_id is not None:
+            mm_token_type_ids[input_ids == image_token_id] = 1
+        if video_token_id is not None:
+            mm_token_type_ids[input_ids == video_token_id] = 2
+
+        model_input["mm_token_type_ids"] = mm_token_type_ids
+
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
         keys_to_use = ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"]
         optional_keys = ["mm_token_type_ids", "pixel_values_videos", "video_grid_thw"]
         model_input = {key: vl_input[key] for key in keys_to_use}
         model_input.update({key: vl_input[key] for key in optional_keys if key in vl_input})
+        self._ensure_mm_token_type_ids(model_input)
         outputs = self.model(**model_input, output_hidden_states=True)
         features = outputs.hidden_states[-1]
         image_mask = model_input["input_ids"] == self.model.config.image_token_id
