@@ -367,9 +367,9 @@ def _flatten_n1_7_modality_stats(
 ) -> dict[str, list[float]]:
     """Flatten one N1.7 modality's grouped statistics in checkpoint order.
 
-    When checkpoints request percentile normalization, q01/q99 replace min/max.
-    Relative action groups read from ``relative_action`` stats so normalized
-    model inputs match Isaac-GR00T's processor.
+    When checkpoints request percentile normalization, q01/q99 replace min/max
+    for regular groups. Relative action groups read from ``relative_action``
+    stats and keep min/max, matching Isaac-GR00T's processor override.
     """
 
     source_stats = embodiment_stats.get(modality, {})
@@ -400,17 +400,19 @@ def _flatten_n1_7_modality_stats(
             if not isinstance(modality_key, str):
                 continue
             key_source_stats = source_stats
+            key_stat_name = source_stat_name
             if modality == "action" and use_relative_action and idx < len(action_configs):
                 action_config = action_configs[idx]
                 if isinstance(action_config, dict) and _config_value(action_config.get("rep")) == "relative":
                     key_source_stats = relative_stats
+                    key_stat_name = stat_name
             key_stats = key_source_stats.get(modality_key, {})
             if not isinstance(key_stats, dict):
                 raise KeyError(f"Missing statistics for {modality}.{modality_key}")
-            raw_values = key_stats.get(source_stat_name)
+            raw_values = key_stats.get(key_stat_name)
             if raw_values is None:
                 raise KeyError(
-                    f"Missing '{source_stat_name}' statistics for {modality}.{modality_key}"
+                    f"Missing '{key_stat_name}' statistics for {modality}.{modality_key}"
                 )
             values.extend(_as_float_list(raw_values))
         if values:
@@ -1622,16 +1624,13 @@ def _n1_7_decode_stats_for_action(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Select the min/max arrays needed to decode one checkpoint action group."""
 
-    modality = (
-        "relative_action"
-        if use_relative_action and _config_value(action_config.get("rep")) == "relative"
-        else "action"
-    )
+    is_relative = use_relative_action and _config_value(action_config.get("rep")) == "relative"
+    modality = "relative_action" if is_relative else "action"
     stats = raw_stats.get(modality, {}).get(key, {})
     if not isinstance(stats, dict):
         raise KeyError(f"Missing N1.7 statistics for {modality}.{key}")
-    min_name = "q01" if use_percentiles else "min"
-    max_name = "q99" if use_percentiles else "max"
+    min_name = "min" if is_relative else ("q01" if use_percentiles else "min")
+    max_name = "max" if is_relative else ("q99" if use_percentiles else "max")
     if min_name not in stats or max_name not in stats:
         raise KeyError(f"Missing '{min_name}'/'{max_name}' statistics for {modality}.{key}")
     return np.asarray(stats[min_name], dtype=np.float32), np.asarray(stats[max_name], dtype=np.float32)
