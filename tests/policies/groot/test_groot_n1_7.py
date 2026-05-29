@@ -1806,3 +1806,7 @@ def test_gr00t_n1_7_model_forward_with_mocked_backbone():
     inference_inputs = {key: value for key, value in inputs.items() if key != "action"}
     action_output = model.get_action(inference_inputs)
     assert action_output["action_pred"].shape == (2, config.action_horizon, config.max_action_dim)
+
+    inputs["action_mask"] = torch.ones(2, config.action_horizon)
+    with pytest.raises(ValueError, match="training action_mask must match action shape"):
+        model.forward(inputs)
