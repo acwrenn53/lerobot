@@ -234,7 +234,9 @@ class MultiEmbodimentActionEncoder(nn.Module):
         self.W3 = CategorySpecificLinear(num_embodiments, hidden_size, hidden_size)
         self.pos_encoding = SinusoidalPositionalEncoding(hidden_size)
 
-    def forward(self, actions: torch.Tensor, timesteps: torch.Tensor, cat_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, actions: torch.Tensor, timesteps: torch.Tensor, cat_ids: torch.Tensor
+    ) -> torch.Tensor:
         batch_size, horizon, _ = actions.shape
         if timesteps.dim() != 1 or timesteps.shape[0] != batch_size:
             raise ValueError("Expected `timesteps` to have shape (B,).")
@@ -616,9 +618,9 @@ class GR00TN17ActionHead(nn.Module):
             t = torch.linspace(0.0, 1.0, intermediate_steps + 2, device=device)
             ramp = 1 - torch.exp(-options["rtc_ramp_rate"] * t)
             ramp = ramp / ramp[-1].clamp_min(1e-8)
-            vel_strength[:, options["rtc_frozen_steps"] : options["rtc_overlap_steps"], :] = ramp[1:-1][
-                None, :, None
-            ].to(device)
+            vel_strength[:, options["rtc_frozen_steps"] : options["rtc_overlap_steps"], :] = ramp[
+                1:-1
+            ][None, :, None].to(device)
 
         for t_step in range(self.num_inference_timesteps):
             t_cont = t_step / float(self.num_inference_timesteps)
