@@ -85,6 +85,12 @@ N1_7_EMBODIMENT_MAPPING = {
     "new_embodiment": 10,
 }
 
+_N1_7_RAW_STATE_CACHE: dict[str, dict[str, np.ndarray]] = {}
+
+
+def _n1_7_state_cache_key(value: str | None) -> str:
+    return value or "groot_n1_7_default"
+
 
 @dataclass
 class _GrootN17CheckpointProcessorAssets:
@@ -465,6 +471,7 @@ def make_groot_pre_post_processors(
             env_action_dim = int(config.output_features[ACTION].shape[0])
         except Exception:
             env_action_dim = 0
+        state_cache_key = f"groot_n1_7:{config.embodiment_tag}"
         pack_step = GrootN17PackInputsStep(
             state_horizon=1,
             action_horizon=action_horizon,
@@ -482,6 +489,7 @@ def make_groot_pre_post_processors(
             video_modality_keys=video_modality_keys,
             raw_stats=checkpoint_assets.raw_stats if checkpoint_assets is not None else None,
             modality_config=checkpoint_assets.modality_config if checkpoint_assets is not None else None,
+            state_cache_key=state_cache_key,
         )
 
         input_steps: list[ProcessorStep] = [
@@ -513,6 +521,7 @@ def make_groot_pre_post_processors(
                     use_percentiles=checkpoint_assets.use_percentiles,
                     use_relative_action=checkpoint_assets.use_relative_action,
                     pack_step=pack_step,
+                    state_cache_key=state_cache_key,
                 )
                 if checkpoint_assets is not None
                 else GrootActionUnpackUnnormalizeStep(
@@ -1071,6 +1080,7 @@ class GrootN17PackInputsStep(ProcessorStep):
     video_modality_keys: list[str] | None = None
     raw_stats: dict[str, Any] | None = None
     modality_config: dict[str, Any] | None = None
+    state_cache_key: str = ""
     _last_raw_state: dict[str, np.ndarray] | None = field(default=None, init=False, repr=False)
 
     def _ordered_image_keys(self, obs: dict[str, Any]) -> list[str]:
@@ -1156,6 +1166,7 @@ class GrootN17PackInputsStep(ProcessorStep):
                 start_idx += dim
             if grouped:
                 self._last_raw_state = grouped
+                _N1_7_RAW_STATE_CACHE[_n1_7_state_cache_key(self.state_cache_key)] = grouped
 
         img_keys = self._ordered_image_keys(obs)
         if img_keys:
@@ -1266,6 +1277,9 @@ class GrootN17PackInputsStep(ProcessorStep):
             "normalize_min_max": self.normalize_min_max,
             "clip_outliers": self.clip_outliers,
             "video_modality_keys": self.video_modality_keys,
+            "raw_stats": self.raw_stats,
+            "modality_config": self.modality_config,
+            "state_cache_key": self.state_cache_key,
         }
 
     def get_cached_raw_state(self) -> dict[str, np.ndarray] | None:
@@ -1587,6 +1601,7 @@ class GrootN17ActionDecodeStep(ProcessorStep):
     modality_config: dict[str, Any] | None = None
     use_percentiles: bool = False
     use_relative_action: bool = False
+    state_cache_key: str = ""
     pack_step: GrootN17PackInputsStep | None = field(default=None, repr=False)
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
@@ -1634,6 +1649,8 @@ class GrootN17ActionDecodeStep(ProcessorStep):
 
         if self.use_relative_action:
             raw_state = self.pack_step.get_cached_raw_state() if self.pack_step is not None else None
+            if raw_state is None:
+                raw_state = _N1_7_RAW_STATE_CACHE.get(_n1_7_state_cache_key(self.state_cache_key))
             if raw_state is None:
                 raise RuntimeError(
                     "GrootN17ActionDecodeStep requires cached raw state from GrootN17PackInputsStep "
@@ -1683,6 +1700,7 @@ class GrootN17ActionDecodeStep(ProcessorStep):
             "modality_config": self.modality_config,
             "use_percentiles": self.use_percentiles,
             "use_relative_action": self.use_relative_action,
+            "state_cache_key": self.state_cache_key,
         }
 
 
