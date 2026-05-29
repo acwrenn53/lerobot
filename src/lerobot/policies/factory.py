@@ -73,11 +73,22 @@ def _reconnect_relative_absolute_steps(
     That reference is not serializable, so we re-establish it here after loading.
     """
     relative_step = next((s for s in preprocessor.steps if isinstance(s, RelativeActionsProcessorStep)), None)
-    if relative_step is None:
+    if relative_step is not None:
+        for step in postprocessor.steps:
+            if isinstance(step, AbsoluteActionsProcessorStep) and step.relative_step is None:
+                step.relative_step = relative_step
+
+    try:
+        from .groot.processor_groot import GrootN17ActionDecodeStep, GrootN17PackInputsStep
+    except Exception:
+        return
+
+    n17_pack_step = next((s for s in preprocessor.steps if isinstance(s, GrootN17PackInputsStep)), None)
+    if n17_pack_step is None:
         return
     for step in postprocessor.steps:
-        if isinstance(step, AbsoluteActionsProcessorStep) and step.relative_step is None:
-            step.relative_step = relative_step
+        if isinstance(step, GrootN17ActionDecodeStep) and step.pack_step is None:
+            step.pack_step = n17_pack_step
 
 
 def get_policy_class(name: str) -> type[PreTrainedPolicy]:

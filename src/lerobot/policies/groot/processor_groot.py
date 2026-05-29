@@ -89,10 +89,15 @@ N1_7_EMBODIMENT_MAPPING = {
 @dataclass
 class _GrootN17CheckpointProcessorAssets:
     stats: dict[str, dict[str, Any]]
+    raw_stats: dict[str, Any]
+    modality_config: dict[str, Any]
     embodiment_mapping: dict[str, int]
     formalize_language: bool
     valid_action_horizon: int | None
     max_action_horizon: int | None
+    video_horizon: int | None
+    use_percentiles: bool
+    use_relative_action: bool
     clip_outliers: bool
     video_modality_keys: list[str] | None
     image_crop_size: list[int] | None
@@ -112,7 +117,27 @@ def _load_n1_7_checkpoint_processor_assets(config: GrootConfig) -> _GrootN17Chec
     if not isinstance(processor_kwargs, dict):
         processor_kwargs = {}
 
-    stats = _load_n1_7_checkpoint_stats(checkpoint_path, processor_kwargs, config.embodiment_tag)
+    all_stats = _read_json(checkpoint_path / "statistics.json")
+    raw_stats = all_stats.get(config.embodiment_tag)
+    if not isinstance(raw_stats, dict):
+        raw_stats = {}
+
+    modality_configs = processor_kwargs.get("modality_configs", {})
+    if not isinstance(modality_configs, dict):
+        modality_configs = {}
+    modality_config = modality_configs.get(config.embodiment_tag)
+    if not isinstance(modality_config, dict):
+        modality_config = {}
+
+    use_relative_action = bool(processor_kwargs.get("use_relative_action", False))
+    stats = _load_n1_7_checkpoint_stats(
+        checkpoint_path,
+        processor_kwargs,
+        config.embodiment_tag,
+        raw_stats=raw_stats,
+        modality_config=modality_config,
+        use_relative_action=use_relative_action,
+    )
     embodiment_mapping = _load_n1_7_embodiment_mapping(checkpoint_path) or dict(N1_7_EMBODIMENT_MAPPING)
     formalize_language = processor_kwargs.get("formalize_language", True)
     if not isinstance(formalize_language, bool):
@@ -125,19 +150,23 @@ def _load_n1_7_checkpoint_processor_assets(config: GrootConfig) -> _GrootN17Chec
         use_albumentations = False
 
     valid_action_horizon = _load_n1_7_checkpoint_action_horizon(processor_kwargs, config.embodiment_tag)
-    video_modality_keys = _load_n1_7_checkpoint_video_modality_keys(
-        processor_kwargs, config.embodiment_tag
-    )
+    video_horizon = _load_n1_7_checkpoint_video_horizon(processor_kwargs, config.embodiment_tag)
+    video_modality_keys = _load_n1_7_checkpoint_video_modality_keys(processor_kwargs, config.embodiment_tag)
     max_action_horizon = processor_kwargs.get("max_action_horizon")
     if not isinstance(max_action_horizon, int):
         max_action_horizon = None
 
     return _GrootN17CheckpointProcessorAssets(
         stats=stats,
+        raw_stats=raw_stats,
+        modality_config=modality_config,
         embodiment_mapping=embodiment_mapping,
         formalize_language=formalize_language,
         valid_action_horizon=valid_action_horizon,
         max_action_horizon=max_action_horizon,
+        video_horizon=video_horizon,
+        use_percentiles=bool(processor_kwargs.get("use_percentiles", False)),
+        use_relative_action=use_relative_action,
         clip_outliers=clip_outliers,
         video_modality_keys=video_modality_keys,
         image_crop_size=_as_int_pair(processor_kwargs.get("image_crop_size")),
@@ -173,33 +202,43 @@ def _load_n1_7_embodiment_mapping(checkpoint_path: Path) -> dict[str, int] | Non
 
 
 def _load_n1_7_checkpoint_stats(
-    checkpoint_path: Path, processor_kwargs: dict[str, Any], embodiment_tag: str
+    checkpoint_path: Path,
+    processor_kwargs: dict[str, Any],
+    embodiment_tag: str,
+    *,
+    raw_stats: dict[str, Any] | None = None,
+    modality_config: dict[str, Any] | None = None,
+    use_relative_action: bool = False,
 ) -> dict[str, dict[str, Any]]:
-    all_stats = _read_json(checkpoint_path / "statistics.json")
-    embodiment_stats = all_stats.get(embodiment_tag)
-    if not isinstance(embodiment_stats, dict):
+    if raw_stats is None:
+        all_stats = _read_json(checkpoint_path / "statistics.json")
+        raw_stats = all_stats.get(embodiment_tag)
+    if not isinstance(raw_stats, dict):
         return {}
 
-    modality_configs = processor_kwargs.get("modality_configs", {})
-    if not isinstance(modality_configs, dict):
-        return {}
-    embodiment_config = modality_configs.get(embodiment_tag)
-    if not isinstance(embodiment_config, dict):
+    if modality_config is None:
+        modality_configs = processor_kwargs.get("modality_configs", {})
+        if not isinstance(modality_configs, dict):
+            return {}
+        modality_config = modality_configs.get(embodiment_tag)
+    if not isinstance(modality_config, dict):
         return {}
 
     use_percentiles = processor_kwargs.get("use_percentiles", False)
     return {
         OBS_STATE: _flatten_n1_7_modality_stats(
-            embodiment_stats=embodiment_stats,
-            embodiment_config=embodiment_config,
+            embodiment_stats=raw_stats,
+            embodiment_config=modality_config,
             modality="state",
             use_percentiles=bool(use_percentiles),
+            use_relative_action=use_relative_action,
         ),
         ACTION: _flatten_n1_7_modality_stats(
-            embodiment_stats=embodiment_stats,
-            embodiment_config=embodiment_config,
+            embodiment_stats=raw_stats,
+            embodiment_config=modality_config,
             modality="action",
             use_percentiles=bool(use_percentiles),
+            use_relative_action=use_relative_action,
         ),
     }
 
@@ -218,6 +257,25 @@ def _load_n1_7_checkpoint_action_horizon(
     if not isinstance(action_config, dict):
         return None
     delta_indices = action_config.get("delta_indices", [])
+    if not isinstance(delta_indices, list):
+        return None
+    return len(delta_indices) or None
+
+
+def _load_n1_7_checkpoint_video_horizon(
+    processor_kwargs: dict[str, Any],
+    embodiment_tag: str,
+) -> int | None:
+    modality_configs = processor_kwargs.get("modality_configs", {})
+    if not isinstance(modality_configs, dict):
+        return None
+    embodiment_config = modality_configs.get(embodiment_tag, {})
+    if not isinstance(embodiment_config, dict):
+        return None
+    video_config = embodiment_config.get("video", {})
+    if not isinstance(video_config, dict):
+        return None
+    delta_indices = video_config.get("delta_indices", [])
     if not isinstance(delta_indices, list):
         return None
     return len(delta_indices) or None
@@ -276,6 +334,7 @@ def _flatten_n1_7_modality_stats(
     embodiment_config: dict[str, Any],
     modality: str,
     use_percentiles: bool,
+    use_relative_action: bool,
 ) -> dict[str, list[float]]:
     source_stats = embodiment_stats.get(modality, {})
     modality_config = embodiment_config.get(modality, {})
@@ -286,6 +345,13 @@ def _flatten_n1_7_modality_stats(
         return {}
 
     flattened: dict[str, list[float]] = {}
+    action_configs = modality_config.get("action_configs", []) if modality == "action" else []
+    if not isinstance(action_configs, list):
+        action_configs = []
+    relative_stats = embodiment_stats.get("relative_action", {})
+    if not isinstance(relative_stats, dict):
+        relative_stats = {}
+
     for stat_name in ("min", "max", "mean", "std"):
         values: list[float] = []
         source_stat_name = stat_name
@@ -294,17 +360,20 @@ def _flatten_n1_7_modality_stats(
         elif use_percentiles and stat_name == "max":
             source_stat_name = "q99"
 
-        for modality_key in modality_keys:
+        for idx, modality_key in enumerate(modality_keys):
             if not isinstance(modality_key, str):
                 continue
-            key_stats = source_stats.get(modality_key, {})
+            key_source_stats = source_stats
+            if modality == "action" and use_relative_action and idx < len(action_configs):
+                action_config = action_configs[idx]
+                if isinstance(action_config, dict) and action_config.get("rep") == "RELATIVE":
+                    key_source_stats = relative_stats
+            key_stats = key_source_stats.get(modality_key, {})
             if not isinstance(key_stats, dict):
                 raise KeyError(f"Missing statistics for {modality}.{modality_key}")
             raw_values = key_stats.get(source_stat_name)
             if raw_values is None:
-                raise KeyError(
-                    f"Missing '{source_stat_name}' statistics for {modality}.{modality_key}"
-                )
+                raise KeyError(f"Missing '{source_stat_name}' statistics for {modality}.{modality_key}")
             values.extend(_as_float_list(raw_values))
         if values:
             flattened[stat_name] = values
@@ -383,25 +452,29 @@ def make_groot_pre_post_processors(
             env_action_dim = int(config.output_features[ACTION].shape[0])
         except Exception:
             env_action_dim = 0
+        pack_step = GrootN17PackInputsStep(
+            state_horizon=1,
+            action_horizon=action_horizon,
+            valid_action_horizon=valid_action_horizon,
+            video_horizon=checkpoint_assets.video_horizon if checkpoint_assets is not None else None,
+            max_state_dim=config.max_state_dim,
+            max_action_dim=config.max_action_dim,
+            language_key="task",
+            formalize_language=formalize_language,
+            embodiment_tag=config.embodiment_tag,
+            embodiment_mapping=embodiment_mapping,
+            normalize_min_max=True,
+            stats=padded_stats,
+            clip_outliers=clip_outliers,
+            video_modality_keys=video_modality_keys,
+            raw_stats=checkpoint_assets.raw_stats if checkpoint_assets is not None else None,
+            modality_config=checkpoint_assets.modality_config if checkpoint_assets is not None else None,
+        )
 
         input_steps: list[ProcessorStep] = [
             RenameObservationsProcessorStep(rename_map={}),
             AddBatchDimensionProcessorStep(),
-            GrootN17PackInputsStep(
-                state_horizon=1,
-                action_horizon=action_horizon,
-                valid_action_horizon=valid_action_horizon,
-                max_state_dim=config.max_state_dim,
-                max_action_dim=config.max_action_dim,
-                language_key="task",
-                formalize_language=formalize_language,
-                embodiment_tag=config.embodiment_tag,
-                embodiment_mapping=embodiment_mapping,
-                normalize_min_max=True,
-                stats=padded_stats,
-                clip_outliers=clip_outliers,
-                video_modality_keys=video_modality_keys,
-            ),
+            pack_step,
             GrootN17VLMEncodeStep(
                 model_name=config.n1_7_backbone_model,
                 image_crop_size=checkpoint_assets.image_crop_size if checkpoint_assets is not None else None,
@@ -419,14 +492,22 @@ def make_groot_pre_post_processors(
             DeviceProcessorStep(device=config.device),
         ]
         output_steps: list[ProcessorStep] = [
-            GrootActionUnpackUnnormalizeStep(
-                env_action_dim=env_action_dim,
-                stats=padded_stats,
-                normalize_min_max=True,
-                clip_normalized_action=True,
-                libero_gripper_action=checkpoint_assets is not None
-                and config.embodiment_tag == "libero_sim"
-                and env_action_dim == 7,
+            (
+                GrootN17ActionDecodeStep(
+                    env_action_dim=env_action_dim,
+                    raw_stats=checkpoint_assets.raw_stats,
+                    modality_config=checkpoint_assets.modality_config,
+                    use_percentiles=checkpoint_assets.use_percentiles,
+                    use_relative_action=checkpoint_assets.use_relative_action,
+                    pack_step=pack_step,
+                )
+                if checkpoint_assets is not None
+                else GrootActionUnpackUnnormalizeStep(
+                    env_action_dim=env_action_dim,
+                    stats=padded_stats,
+                    normalize_min_max=True,
+                    clip_normalized_action=True,
+                )
             ),
             DeviceProcessorStep(device="cpu"),
         ]
@@ -534,11 +615,31 @@ def make_groot_pre_post_processors(
 # GR00T specific processor steps
 
 
-def _to_uint8_np_bhwc(img_t: torch.Tensor) -> np.ndarray:
-    # img_t: (B, C, H, W) float in [0,1] or uint8
+def _to_uint8_np_bthwc(img_t: torch.Tensor) -> np.ndarray:
+    # img_t: (B, C, H, W) or (B, T, C, H, W), float in [0,1] or uint8
     if img_t.dtype.is_floating_point:
         img_t = (img_t.clamp(0, 1) * 255.0).to(torch.uint8)
-    return rearrange(img_t.cpu().numpy(), "b c h w -> b h w c")
+    if img_t.dim() == 4:
+        return rearrange(img_t.cpu().numpy(), "b c h w -> b 1 h w c")
+    if img_t.dim() == 5:
+        return rearrange(img_t.cpu().numpy(), "b t c h w -> b t h w c")
+    raise ValueError(f"Expected image tensor shape (B, C, H, W) or (B, T, C, H, W), got {tuple(img_t.shape)}")
+
+
+def _to_uint8_np_bhwc(img_t: torch.Tensor) -> np.ndarray:
+    return _to_uint8_np_bthwc(img_t)[:, 0]
+
+
+def _align_video_horizon(video: np.ndarray, horizon: int | None) -> np.ndarray:
+    if horizon is None or horizon <= 0:
+        return video
+    current = video.shape[1]
+    if current == horizon:
+        return video
+    if current > horizon:
+        return video[:, -horizon:]
+    pad = np.repeat(video[:, :1], horizon - current, axis=1)
+    return np.concatenate([pad, video], axis=1)
 
 
 def _infer_n1_7_batch_size_and_device(
@@ -944,6 +1045,7 @@ class GrootN17PackInputsStep(ProcessorStep):
     state_horizon: int = 1
     action_horizon: int = 40
     valid_action_horizon: int = 40
+    video_horizon: int | None = None
     max_state_dim: int = 132
     max_action_dim: int = 132
     language_key: str = "task"
@@ -954,6 +1056,9 @@ class GrootN17PackInputsStep(ProcessorStep):
     stats: dict[str, dict[str, Any]] | None = None
     clip_outliers: bool = True
     video_modality_keys: list[str] | None = None
+    raw_stats: dict[str, Any] | None = None
+    modality_config: dict[str, Any] | None = None
+    _last_raw_state: dict[str, np.ndarray] | None = field(default=None, init=False, repr=False)
 
     def _ordered_image_keys(self, obs: dict[str, Any]) -> list[str]:
         available = {key for key in obs if key.startswith(OBS_IMAGES)}
@@ -1014,11 +1119,36 @@ class GrootN17PackInputsStep(ProcessorStep):
                 normalized = normalized.clamp(-1.0, 1.0)
             return normalized
 
+        def _cache_raw_state(state: torch.Tensor) -> None:
+            if self.modality_config is None or self.raw_stats is None:
+                return
+            state_config = self.modality_config.get("state", {})
+            if not isinstance(state_config, dict):
+                return
+            state_keys = state_config.get("modality_keys", [])
+            if not isinstance(state_keys, list):
+                return
+
+            raw_state = state.detach().cpu().float().numpy()
+            start_idx = 0
+            grouped: dict[str, np.ndarray] = {}
+            for key in state_keys:
+                if not isinstance(key, str):
+                    continue
+                key_stats = self.raw_stats.get("state", {}).get(key, {})
+                dim = len(key_stats.get("mean") or key_stats.get("min") or key_stats.get("q01") or [])
+                if dim <= 0:
+                    continue
+                grouped[key] = raw_state[:, start_idx : start_idx + dim]
+                start_idx += dim
+            if grouped:
+                self._last_raw_state = grouped
+
         img_keys = self._ordered_image_keys(obs)
         if img_keys:
-            cams = [_to_uint8_np_bhwc(obs[k]) for k in img_keys]
-            video = np.stack(cams, axis=1)  # (B, V, H, W, C)
-            obs["video"] = np.expand_dims(video, axis=1)  # (B, 1, V, H, W, C)
+            cams = [_align_video_horizon(_to_uint8_np_bthwc(obs[k]), self.video_horizon) for k in img_keys]
+            video = np.stack(cams, axis=2)  # (B, T, V, H, W, C)
+            obs["video"] = video
             image_keys_to_remove = [key for key in obs if key.startswith(OBS_IMAGES)]
             if OBS_IMAGE in obs:
                 image_keys_to_remove.append(OBS_IMAGE)
@@ -1038,16 +1168,13 @@ class GrootN17PackInputsStep(ProcessorStep):
                 raise ValueError(f"state must be (B, D), got {tuple(state.shape)}")
             bsz, dim = state.shape
             if dim > self.max_state_dim:
-                raise ValueError(
-                    f"State dimension {dim} exceeds max_state_dim {self.max_state_dim}."
-                )
+                raise ValueError(f"State dimension {dim} exceeds max_state_dim {self.max_state_dim}.")
+            _cache_raw_state(state)
             if self.normalize_min_max:
                 state = _min_max_norm(state, OBS_STATE)
             state = state.unsqueeze(1)
             if dim < self.max_state_dim:
-                pad = torch.zeros(
-                    bsz, 1, self.max_state_dim - dim, dtype=state.dtype, device=state.device
-                )
+                pad = torch.zeros(bsz, 1, self.max_state_dim - dim, dtype=state.dtype, device=state.device)
                 state = torch.cat([state, pad], dim=2)
             obs["state"] = state
 
@@ -1062,13 +1189,9 @@ class GrootN17PackInputsStep(ProcessorStep):
 
             bsz, horizon, dim = action.shape
             if horizon > self.action_horizon:
-                raise ValueError(
-                    f"Action horizon {horizon} exceeds action_horizon {self.action_horizon}."
-                )
+                raise ValueError(f"Action horizon {horizon} exceeds action_horizon {self.action_horizon}.")
             if dim > self.max_action_dim:
-                raise ValueError(
-                    f"Action dimension {dim} exceeds max_action_dim {self.max_action_dim}."
-                )
+                raise ValueError(f"Action dimension {dim} exceeds max_action_dim {self.max_action_dim}.")
             if self.normalize_min_max:
                 flat = _min_max_norm(action.reshape(bsz * horizon, dim), ACTION)
                 action = flat.view(bsz, horizon, dim)
@@ -1092,7 +1215,9 @@ class GrootN17PackInputsStep(ProcessorStep):
             if valid_horizon < horizon:
                 action = action.clone()
                 action[:, valid_horizon:, :] = 0
-            action_mask = torch.zeros(bsz, horizon, self.max_action_dim, dtype=torch.float32, device=action.device)
+            action_mask = torch.zeros(
+                bsz, horizon, self.max_action_dim, dtype=torch.float32, device=action.device
+            )
             action_mask[:, :valid_horizon, :valid_dim] = 1.0
             transition[TransitionKey.ACTION] = action
             comp["action_mask"] = action_mask
@@ -1118,6 +1243,7 @@ class GrootN17PackInputsStep(ProcessorStep):
             "state_horizon": self.state_horizon,
             "action_horizon": self.action_horizon,
             "valid_action_horizon": self.valid_action_horizon,
+            "video_horizon": self.video_horizon,
             "max_state_dim": self.max_state_dim,
             "max_action_dim": self.max_action_dim,
             "language_key": self.language_key,
@@ -1128,6 +1254,9 @@ class GrootN17PackInputsStep(ProcessorStep):
             "clip_outliers": self.clip_outliers,
             "video_modality_keys": self.video_modality_keys,
         }
+
+    def get_cached_raw_state(self) -> dict[str, np.ndarray] | None:
+        return self._last_raw_state
 
     def state_dict(self) -> dict[str, torch.Tensor]:
         if not self.stats:
@@ -1370,6 +1499,174 @@ class GrootEagleCollateStep(ProcessorStep):
 
     def transform_features(self, features):
         return features
+
+
+def _stat_dim_from_entry(entry: dict[str, Any]) -> int:
+    for stat_name in ("mean", "q01", "min", "max", "std"):
+        value = entry.get(stat_name)
+        if isinstance(value, list) and len(value) > 0:
+            return len(value)
+    return 0
+
+
+def _n1_7_decode_stats_for_action(
+    raw_stats: dict[str, Any],
+    key: str,
+    action_config: dict[str, Any],
+    *,
+    use_relative_action: bool,
+    use_percentiles: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    modality = (
+        "relative_action" if use_relative_action and action_config.get("rep") == "RELATIVE" else "action"
+    )
+    stats = raw_stats.get(modality, {}).get(key, {})
+    if not isinstance(stats, dict):
+        raise KeyError(f"Missing N1.7 statistics for {modality}.{key}")
+    min_name = "q01" if use_percentiles else "min"
+    max_name = "q99" if use_percentiles else "max"
+    if min_name not in stats or max_name not in stats:
+        raise KeyError(f"Missing '{min_name}'/'{max_name}' statistics for {modality}.{key}")
+    return np.asarray(stats[min_name], dtype=np.float32), np.asarray(stats[max_name], dtype=np.float32)
+
+
+def _unnormalize_min_max(action: np.ndarray, min_v: np.ndarray, max_v: np.ndarray) -> np.ndarray:
+    return (np.clip(action, -1.0, 1.0) + 1.0) * 0.5 * (max_v - min_v) + min_v
+
+
+def _rot6d_to_matrix(rot6d: np.ndarray) -> np.ndarray:
+    rows = rot6d.reshape(2, 3).astype(np.float64)
+    row1 = rows[0] / np.linalg.norm(rows[0])
+    row2 = rows[1] - np.dot(row1, rows[1]) * row1
+    row2 = row2 / np.linalg.norm(row2)
+    row3 = np.cross(row1, row2)
+    return np.vstack([row1, row2, row3])
+
+
+def _xyz_rot6d_to_homogeneous(xyz_rot6d: np.ndarray) -> np.ndarray:
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = _rot6d_to_matrix(xyz_rot6d[3:])
+    transform[:3, 3] = xyz_rot6d[:3]
+    return transform
+
+
+def _homogeneous_to_xyz_rot6d(transform: np.ndarray) -> np.ndarray:
+    return np.concatenate([transform[:3, 3], transform[:2, :3].reshape(-1)], axis=0)
+
+
+def _relative_eef_to_absolute(action: np.ndarray, reference_state: np.ndarray) -> np.ndarray:
+    out = np.empty_like(action, dtype=np.float64)
+    for batch_idx in range(action.shape[0]):
+        reference = _xyz_rot6d_to_homogeneous(reference_state[batch_idx])
+        for timestep in range(action.shape[1]):
+            relative = _xyz_rot6d_to_homogeneous(action[batch_idx, timestep])
+            out[batch_idx, timestep] = _homogeneous_to_xyz_rot6d(reference @ relative)
+    return out.astype(np.float32)
+
+
+@dataclass
+@ProcessorStepRegistry.register(name="groot_n1_7_action_decode_v1")
+class GrootN17ActionDecodeStep(ProcessorStep):
+    env_action_dim: int = 0
+    raw_stats: dict[str, Any] | None = None
+    modality_config: dict[str, Any] | None = None
+    use_percentiles: bool = False
+    use_relative_action: bool = False
+    pack_step: GrootN17PackInputsStep | None = field(default=None, repr=False)
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        action = transition.get(TransitionKey.ACTION)
+        if not isinstance(action, torch.Tensor):
+            return transition
+        if self.raw_stats is None or self.modality_config is None:
+            return transition
+
+        action_config = self.modality_config.get("action", {})
+        if not isinstance(action_config, dict):
+            return transition
+        action_keys = action_config.get("modality_keys", [])
+        action_configs = action_config.get("action_configs", [])
+        if not isinstance(action_keys, list) or not isinstance(action_configs, list):
+            return transition
+
+        action_np = action.detach().cpu().float().numpy()
+        decoded_groups: dict[str, np.ndarray] = {}
+        start_idx = 0
+        for idx, key in enumerate(action_keys):
+            if not isinstance(key, str):
+                continue
+            stats_entry = self.raw_stats.get("action", {}).get(key, {})
+            if not isinstance(stats_entry, dict):
+                continue
+            dim = _stat_dim_from_entry(stats_entry)
+            if dim <= 0:
+                continue
+            cfg = (
+                action_configs[idx]
+                if idx < len(action_configs) and isinstance(action_configs[idx], dict)
+                else {}
+            )
+            normalized = action_np[..., start_idx : start_idx + dim]
+            min_v, max_v = _n1_7_decode_stats_for_action(
+                self.raw_stats,
+                key,
+                cfg,
+                use_relative_action=self.use_relative_action,
+                use_percentiles=self.use_percentiles,
+            )
+            decoded_groups[key] = _unnormalize_min_max(normalized, min_v, max_v)
+            start_idx += dim
+
+        if self.use_relative_action:
+            raw_state = self.pack_step.get_cached_raw_state() if self.pack_step is not None else None
+            if raw_state is None:
+                raise RuntimeError(
+                    "GrootN17ActionDecodeStep requires cached raw state from GrootN17PackInputsStep "
+                    "to convert relative N1.7 actions back to absolute actions."
+                )
+            for idx, key in enumerate(action_keys):
+                if not isinstance(key, str) or key not in decoded_groups or idx >= len(action_configs):
+                    continue
+                cfg = action_configs[idx]
+                if not isinstance(cfg, dict) or cfg.get("rep") != "RELATIVE":
+                    continue
+                state_key = cfg.get("state_key") or key
+                if state_key not in raw_state:
+                    raise KeyError(f"Missing cached raw state '{state_key}' for relative N1.7 action '{key}'")
+                reference = raw_state[state_key]
+                if cfg.get("type") == "NON_EEF":
+                    decoded_groups[key] = decoded_groups[key] + reference[:, None, :]
+                elif cfg.get("type") == "EEF" and cfg.get("format") == "XYZ_ROT6D":
+                    decoded_groups[key] = _relative_eef_to_absolute(decoded_groups[key], reference)
+                else:
+                    raise ValueError(f"Unsupported relative N1.7 action config for '{key}': {cfg}")
+
+        if not decoded_groups:
+            return transition
+
+        decoded = np.concatenate(
+            [decoded_groups[key] for key in action_keys if isinstance(key, str) and key in decoded_groups],
+            axis=-1,
+        )
+        if self.env_action_dim and decoded.shape[-1] > self.env_action_dim:
+            decoded = decoded[..., : self.env_action_dim]
+        new_transition = transition.copy()
+        new_transition[TransitionKey.ACTION] = torch.as_tensor(
+            decoded, dtype=action.dtype, device=action.device
+        )
+        return new_transition
+
+    def transform_features(self, features):
+        return features
+
+    def get_config(self) -> dict[str, Any]:
+        return {
+            "env_action_dim": self.env_action_dim,
+            "raw_stats": self.raw_stats,
+            "modality_config": self.modality_config,
+            "use_percentiles": self.use_percentiles,
+            "use_relative_action": self.use_relative_action,
+        }
 
 
 @dataclass
