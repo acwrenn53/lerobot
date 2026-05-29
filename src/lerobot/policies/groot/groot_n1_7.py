@@ -397,6 +397,66 @@ class Qwen3Backbone(nn.Module):
 
         model_input["mm_token_type_ids"] = mm_token_type_ids
 
+    def _ensure_legacy_qwen3_position_ids(self, model_input: dict[str, torch.Tensor]) -> None:
+        """Restore the Qwen3-VL text position ids used by older Transformers releases.
+
+        Transformers 5.x computes 3-row multimodal RoPE ids for Qwen3-VL and then
+        drops text position ids before calling text-layer flash attention. GR00T
+        N1.7 was aligned against the older Transformers path, where a fourth text
+        position row is forwarded alongside the temporal/height/width rows. Adding
+        the row here preserves the newer multimodal position computation while
+        keeping flash attention on the legacy code path.
+        """
+
+        if "position_ids" in model_input:
+            return
+
+        qwen3_model = getattr(self.model, "model", self.model)
+        compute_3d_position_ids = getattr(qwen3_model, "compute_3d_position_ids", None)
+        if compute_3d_position_ids is None:
+            return
+
+        position_ids = compute_3d_position_ids(
+            input_ids=model_input.get("input_ids"),
+            image_grid_thw=model_input.get("image_grid_thw"),
+            video_grid_thw=model_input.get("video_grid_thw"),
+            inputs_embeds=None,
+            attention_mask=model_input.get("attention_mask"),
+            past_key_values=None,
+            mm_token_type_ids=model_input.get("mm_token_type_ids"),
+        )
+        if position_ids.ndim == 3 and position_ids.shape[0] == 3:
+            position_ids = torch.cat([position_ids[:1], position_ids], dim=0)
+
+        model_input["position_ids"] = position_ids
+
+    def _last_decoder_layer_output(self, model_input: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Return the pre-final-norm decoder output consumed by the N1.7 action head.
+
+        Older Transformers releases exposed this tensor as ``hidden_states[-1]``.
+        Newer releases expose the post-final-norm tensor there instead. Capturing
+        the last decoder layer output directly keeps the N1.7 action head input
+        stable across Transformers versions.
+        """
+
+        captured: dict[str, torch.Tensor] = {}
+
+        def capture_output(_module: nn.Module, _inputs: tuple[Any, ...], output: Any) -> None:
+            if isinstance(output, torch.Tensor):
+                captured["features"] = output
+            elif isinstance(output, (tuple, list)) and output:
+                captured["features"] = output[0]
+            elif hasattr(output, "last_hidden_state"):
+                captured["features"] = output.last_hidden_state
+
+        hook = self.language_model.layers[-1].register_forward_hook(capture_output)
+        try:
+            outputs = self.model(**model_input, output_hidden_states=True)
+        finally:
+            hook.remove()
+
+        return captured.get("features", outputs.hidden_states[-1])
+
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()
         keys_to_use = ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"]
@@ -404,8 +464,8 @@ class Qwen3Backbone(nn.Module):
         model_input = {key: vl_input[key] for key in keys_to_use}
         model_input.update({key: vl_input[key] for key in optional_keys if key in vl_input})
         self._ensure_mm_token_type_ids(model_input)
-        outputs = self.model(**model_input, output_hidden_states=True)
-        features = outputs.hidden_states[-1]
+        self._ensure_legacy_qwen3_position_ids(model_input)
+        features = self._last_decoder_layer_output(model_input)
         image_mask = model_input["input_ids"] == self.model.config.image_token_id
         attention_mask = model_input["attention_mask"] == 1
         return BatchFeature(
