@@ -405,7 +405,19 @@ def _as_float_list(values: Any) -> list[float]:
 def _config_value(value: Any) -> str:
     if hasattr(value, "value"):
         value = value.value
-    return str(value).lower()
+    text = str(value).lower()
+    return {
+        "relative": "relative",
+        "absolute": "absolute",
+        "delta": "delta",
+        "eef": "eef",
+        "non_eef": "non_eef",
+        "default": "default",
+        "xyz_rot6d": "xyz+rot6d",
+        "xyz+rot6d": "xyz+rot6d",
+        "xyz_rotvec": "xyz+rotvec",
+        "xyz+rotvec": "xyz+rotvec",
+    }.get(text, text)
 
 
 def _has_modality_stats(stats: dict[str, dict[str, Any]] | None) -> bool:
