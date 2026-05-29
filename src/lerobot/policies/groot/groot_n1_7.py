@@ -204,7 +204,13 @@ class CategorySpecificMLP(nn.Module):
 
 
 class SinusoidalPositionalEncoding(nn.Module):
-    """Sinusoidal encoding of shape ``(B, T, D)`` for timestep tensors ``(B, T)``."""
+    """Sinusoidal encoding of shape ``(B, T, D)`` for timestep tensors ``(B, T)``.
+
+    The frequency scalar is intentionally created on CPU and then broadcast with
+    the device-local arange result. That mirrors Isaac-GR00T's N1.7 timestep
+    embedding and avoids tiny dtype/device construction differences in parity
+    tests.
+    """
 
     def __init__(self, embedding_dim: int):
         super().__init__()
@@ -248,7 +254,13 @@ class MultiEmbodimentActionEncoder(nn.Module):
 
 
 class Qwen3Backbone(nn.Module):
-    """Cosmos-Reason2/Qwen3-VL backbone used by GR00T N1.7."""
+    """Cosmos-Reason2/Qwen3-VL backbone used by GR00T N1.7.
+
+    The public checkpoint stores the action head in the GR00T checkpoint but
+    uses a Hugging Face Qwen3-VL-compatible backbone interface. This wrapper
+    keeps the nested HF module layout compatible across transformer versions
+    and exposes the hidden states consumed by the action head.
+    """
 
     def __init__(
         self,
@@ -347,6 +359,8 @@ class Qwen3Backbone(nn.Module):
         model_kwargs: dict[str, Any],
         config_kwargs: dict[str, Any],
     ) -> nn.Module:
+        """Initialize a backbone from config when checkpoint weights load separately."""
+
         if _is_cosmos_reason2_backbone(model_name):
             backbone_config = _cosmos_reason2_qwen3_vl_config()
         else:
@@ -362,6 +376,8 @@ class Qwen3Backbone(nn.Module):
         return BatchFeature(data=batch)
 
     def _ensure_mm_token_type_ids(self, model_input: dict[str, torch.Tensor]) -> None:
+        """Fill Qwen3-VL multimodal token type ids when the processor omits them."""
+
         if "mm_token_type_ids" in model_input:
             return
         if "image_grid_thw" not in model_input and "video_grid_thw" not in model_input:
@@ -687,10 +703,14 @@ class GR00TN17ActionHead(nn.Module):
 
 
 def _is_cosmos_reason2_backbone(model_name: str) -> bool:
+    """Return whether ``model_name`` is the public N1.7 Cosmos-Reason2 backbone."""
+
     return str(model_name).rstrip("/") == "nvidia/Cosmos-Reason2-2B"
 
 
 def _cosmos_reason2_qwen3_vl_config() -> PretrainedConfig:
+    """Build the Qwen3-VL config for Cosmos-Reason2-2B without downloading it."""
+
     if Qwen3VLConfig is None:
         raise ImportError(
             "Qwen3VLConfig is required for GR00T N1.7. "

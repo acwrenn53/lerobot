@@ -94,6 +94,14 @@ def _n1_7_state_cache_key(value: str | None) -> str:
 
 @dataclass
 class _GrootN17CheckpointProcessorAssets:
+    """Processor metadata loaded from a raw Isaac-GR00T N1.7 checkpoint.
+
+    Public N1.7 checkpoints store preprocessing and action-decoding choices next
+    to the model weights. Keeping those values together avoids falling back to
+    LeRobot defaults that are valid for older GR00T variants but change N1.7
+    inputs or decoded actions.
+    """
+
     stats: dict[str, dict[str, Any]]
     raw_stats: dict[str, Any]
     modality_config: dict[str, Any]
@@ -114,6 +122,12 @@ class _GrootN17CheckpointProcessorAssets:
 
 
 def _load_n1_7_checkpoint_processor_assets(config: GrootConfig) -> _GrootN17CheckpointProcessorAssets | None:
+    """Load N1.7 processor settings from checkpoint sidecar JSON files.
+
+    Returns ``None`` for non-raw N1.7 checkpoints so the generic GR00T pipeline
+    can keep using caller-provided dataset stats and config values.
+    """
+
     if not is_raw_groot_n1_7_checkpoint(config.base_model_path):
         return None
 
@@ -218,6 +232,13 @@ def _load_n1_7_checkpoint_stats(
     modality_config: dict[str, Any] | None = None,
     use_relative_action: bool = False,
 ) -> dict[str, dict[str, Any]]:
+    """Convert checkpoint modality-group stats into LeRobot flat tensor stats.
+
+    Isaac-GR00T keeps statistics keyed by semantic groups such as EEF pose and
+    joints. LeRobot normalizers operate over a single vector, so this function
+    preserves checkpoint group order while flattening each selected statistic.
+    """
+
     if raw_stats is None:
         all_stats = _read_json(checkpoint_path / "statistics.json")
         raw_stats = all_stats.get(embodiment_tag)
@@ -344,6 +365,13 @@ def _flatten_n1_7_modality_stats(
     use_percentiles: bool,
     use_relative_action: bool,
 ) -> dict[str, list[float]]:
+    """Flatten one N1.7 modality's grouped statistics in checkpoint order.
+
+    When checkpoints request percentile normalization, q01/q99 replace min/max.
+    Relative action groups read from ``relative_action`` stats so normalized
+    model inputs match Isaac-GR00T's processor.
+    """
+
     source_stats = embodiment_stats.get(modality, {})
     modality_config = embodiment_config.get(modality, {})
     if not isinstance(source_stats, dict) or not isinstance(modality_config, dict):
@@ -669,6 +697,8 @@ def _to_uint8_np_bhwc(img_t: torch.Tensor) -> np.ndarray:
 
 
 def _align_video_horizon(video: np.ndarray, horizon: int | None) -> np.ndarray:
+    """Match the checkpoint video horizon by truncating or left-padding frames."""
+
     if horizon is None or horizon <= 0:
         return video
     current = video.shape[1]
@@ -698,6 +728,8 @@ def _prepare_n1_7_language_batch(
     *,
     formalize_language: bool,
 ) -> list[str]:
+    """Normalize language inputs into one prompt string per batch element."""
+
     default_language = "Perform the task."
     if language is None or (isinstance(language, str) and language == ""):
         languages = [default_language] * batch_size
@@ -746,6 +778,8 @@ def _build_eagle_processor(tokenizer_assets_repo: str = DEFAULT_TOKENIZER_ASSETS
 
 
 def _build_n1_7_processor(model_name: str = GROOT_N1_7_BACKBONE_MODEL) -> ProcessorMixin:
+    """Build the Qwen3-VL processor used by the N1.7 Cosmos-Reason2 backbone."""
+
     try:
         from transformers import (
             AutoTokenizer,
@@ -781,6 +815,8 @@ def _transform_n1_7_image_for_vlm(
     crop_fraction: float | None,
     use_albumentations: bool = False,
 ) -> Image.Image:
+    """Apply the image resize/crop path serialized in the N1.7 checkpoint."""
+
     if image_target_size is None:
         return image
 
@@ -1080,6 +1116,13 @@ class GrootPackInputsStep(ProcessorStep):
 @dataclass
 @ProcessorStepRegistry.register(name="groot_n1_7_pack_inputs_v1")
 class GrootN17PackInputsStep(ProcessorStep):
+    """Pack LeRobot transitions into the raw tensor layout expected by N1.7.
+
+    This step preserves the checkpoint's camera order, video horizon, language
+    formatting, normalization statistics, action mask semantics, and embodiment
+    id mapping before the Qwen3-VL processor sees the sample.
+    """
+
     state_horizon: int = 1
     action_horizon: int = 40
     valid_action_horizon: int = 40
@@ -1100,6 +1143,8 @@ class GrootN17PackInputsStep(ProcessorStep):
     _last_raw_state: dict[str, np.ndarray] | None = field(default=None, init=False, repr=False)
 
     def _ordered_image_keys(self, obs: dict[str, Any]) -> list[str]:
+        """Return image observation keys in the checkpoint-declared camera order."""
+
         available = {key for key in obs if key.startswith(OBS_IMAGES)}
         if not available and OBS_IMAGE in obs:
             return [OBS_IMAGE]
@@ -1305,6 +1350,8 @@ class GrootN17PackInputsStep(ProcessorStep):
         }
 
     def get_cached_raw_state(self) -> dict[str, np.ndarray] | None:
+        """Return the latest unnormalized state split by checkpoint modality key."""
+
         return self._last_raw_state
 
     def state_dict(self) -> dict[str, torch.Tensor]:
@@ -1332,6 +1379,13 @@ class GrootN17PackInputsStep(ProcessorStep):
 @dataclass
 @ProcessorStepRegistry.register(name="groot_n1_7_vlm_encode_v1")
 class GrootN17VLMEncodeStep(ProcessorStep):
+    """Tokenize N1.7's packed video-language prompt with the Qwen3-VL processor.
+
+    The packed video has shape ``(B, T, V, H, W, C)``. Each frame/view becomes
+    an image item in the same chat message so the resulting image tokens match
+    the temporal VLM packing used by Isaac-GR00T.
+    """
+
     model_name: str = GROOT_N1_7_BACKBONE_MODEL
     image_crop_size: list[int] | None = None
     image_target_size: list[int] | None = None
@@ -1566,6 +1620,8 @@ def _n1_7_decode_stats_for_action(
     use_relative_action: bool,
     use_percentiles: bool,
 ) -> tuple[np.ndarray, np.ndarray]:
+    """Select the min/max arrays needed to decode one checkpoint action group."""
+
     modality = (
         "relative_action"
         if use_relative_action and _config_value(action_config.get("rep")) == "relative"
@@ -1606,6 +1662,8 @@ def _homogeneous_to_xyz_rot6d(transform: np.ndarray) -> np.ndarray:
 
 
 def _relative_eef_to_absolute(action: np.ndarray, reference_state: np.ndarray) -> np.ndarray:
+    """Convert relative EEF deltas in xyz+rot6d format to absolute EEF poses."""
+
     out = np.empty_like(action, dtype=np.float64)
     for batch_idx in range(action.shape[0]):
         reference = _xyz_rot6d_to_homogeneous(reference_state[batch_idx])
@@ -1618,6 +1676,14 @@ def _relative_eef_to_absolute(action: np.ndarray, reference_state: np.ndarray) -
 @dataclass
 @ProcessorStepRegistry.register(name="groot_n1_7_action_decode_v1")
 class GrootN17ActionDecodeStep(ProcessorStep):
+    """Decode the full 132-D N1.7 model action back to environment actions.
+
+    N1.7 predicts checkpoint-order action groups. This step unnormalizes each
+    group with the checkpoint stats, converts relative groups to absolute values
+    using the raw state cached during packing, concatenates groups in checkpoint
+    order, and finally slices to the environment action dimension.
+    """
+
     env_action_dim: int = 0
     raw_stats: dict[str, Any] | None = None
     modality_config: dict[str, Any] | None = None
