@@ -366,7 +366,7 @@ def _flatten_n1_7_modality_stats(
             key_source_stats = source_stats
             if modality == "action" and use_relative_action and idx < len(action_configs):
                 action_config = action_configs[idx]
-                if isinstance(action_config, dict) and action_config.get("rep") == "RELATIVE":
+                if isinstance(action_config, dict) and _config_value(action_config.get("rep")) == "relative":
                     key_source_stats = relative_stats
             key_stats = key_source_stats.get(modality_key, {})
             if not isinstance(key_stats, dict):
@@ -394,6 +394,12 @@ def _as_float_list(values: Any) -> list[float]:
             flattened.extend(_as_float_list(value))
         return flattened
     return [float(values)]
+
+
+def _config_value(value: Any) -> str:
+    if hasattr(value, "value"):
+        value = value.value
+    return str(value).lower()
 
 
 def _has_modality_stats(stats: dict[str, dict[str, Any]] | None) -> bool:
@@ -1525,7 +1531,9 @@ def _n1_7_decode_stats_for_action(
     use_percentiles: bool,
 ) -> tuple[np.ndarray, np.ndarray]:
     modality = (
-        "relative_action" if use_relative_action and action_config.get("rep") == "RELATIVE" else "action"
+        "relative_action"
+        if use_relative_action and _config_value(action_config.get("rep")) == "relative"
+        else "action"
     )
     stats = raw_stats.get(modality, {}).get(key, {})
     if not isinstance(stats, dict):
@@ -1635,15 +1643,17 @@ class GrootN17ActionDecodeStep(ProcessorStep):
                 if not isinstance(key, str) or key not in decoded_groups or idx >= len(action_configs):
                     continue
                 cfg = action_configs[idx]
-                if not isinstance(cfg, dict) or cfg.get("rep") != "RELATIVE":
+                if not isinstance(cfg, dict) or _config_value(cfg.get("rep")) != "relative":
                     continue
                 state_key = cfg.get("state_key") or key
                 if state_key not in raw_state:
                     raise KeyError(f"Missing cached raw state '{state_key}' for relative N1.7 action '{key}'")
                 reference = raw_state[state_key]
-                if cfg.get("type") == "NON_EEF":
+                action_type = _config_value(cfg.get("type"))
+                action_format = _config_value(cfg.get("format"))
+                if action_type == "non_eef":
                     decoded_groups[key] = decoded_groups[key] + reference[:, None, :]
-                elif cfg.get("type") == "EEF" and cfg.get("format") == "XYZ_ROT6D":
+                elif action_type == "eef" and action_format == "xyz+rot6d":
                     decoded_groups[key] = _relative_eef_to_absolute(decoded_groups[key], reference)
                 else:
                     raise ValueError(f"Unsupported relative N1.7 action config for '{key}': {cfg}")
