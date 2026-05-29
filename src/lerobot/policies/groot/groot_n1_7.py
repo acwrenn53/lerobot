@@ -631,13 +631,7 @@ class GR00TN17ActionHead(nn.Module):
 
         pred = self.action_decoder(model_output, embodiment_id)
         pred_actions = pred[:, -actions.shape[1] :]
-        action_mask = action_input.action_mask
-        if action_mask.shape != actions.shape:
-            raise ValueError(
-                "GR00T N1.7 training action_mask must match action shape. "
-                f"Got action_mask shape {tuple(action_mask.shape)} and action shape {tuple(actions.shape)}."
-            )
-        action_mask = action_mask.to(dtype=pred_actions.dtype)
+        action_mask = action_input.action_mask.to(dtype=pred_actions.dtype)
         action_loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
         loss = action_loss.sum() / (action_mask.sum() + 1e-6)
         return BatchFeature(
