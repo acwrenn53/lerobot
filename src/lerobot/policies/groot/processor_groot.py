@@ -730,8 +730,6 @@ def _prepare_n1_7_language_batch(
     *,
     formalize_language: bool,
 ) -> list[str]:
-    """Normalize language inputs into one prompt string per batch element."""
-
     default_language = "Perform the task."
     if language is None or (isinstance(language, str) and language == ""):
         languages = [default_language] * batch_size
@@ -780,8 +778,6 @@ def _build_eagle_processor(tokenizer_assets_repo: str = DEFAULT_TOKENIZER_ASSETS
 
 
 def _build_n1_7_processor(model_name: str = GROOT_N1_7_BACKBONE_MODEL) -> ProcessorMixin:
-    """Build the Qwen3-VL processor used by the N1.7 Cosmos-Reason2 backbone."""
-
     try:
         from transformers import (
             AutoTokenizer,
@@ -817,8 +813,6 @@ def _transform_n1_7_image_for_vlm(
     crop_fraction: float | None,
     use_albumentations: bool = False,
 ) -> Image.Image:
-    """Apply the image resize/crop path serialized in the N1.7 checkpoint."""
-
     if image_target_size is None:
         return image
 
@@ -1145,8 +1139,6 @@ class GrootN17PackInputsStep(ProcessorStep):
     _last_raw_state: dict[str, np.ndarray] | None = field(default=None, init=False, repr=False)
 
     def _ordered_image_keys(self, obs: dict[str, Any]) -> list[str]:
-        """Return image observation keys in the checkpoint-declared camera order."""
-
         available = {key for key in obs if key.startswith(OBS_IMAGES)}
         if not available and OBS_IMAGE in obs:
             return [OBS_IMAGE]

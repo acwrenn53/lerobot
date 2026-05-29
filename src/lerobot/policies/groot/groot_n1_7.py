@@ -359,8 +359,6 @@ class Qwen3Backbone(nn.Module):
         model_kwargs: dict[str, Any],
         config_kwargs: dict[str, Any],
     ) -> nn.Module:
-        """Initialize a backbone from config when checkpoint weights load separately."""
-
         if _is_cosmos_reason2_backbone(model_name):
             backbone_config = _cosmos_reason2_qwen3_vl_config()
         else:
@@ -376,8 +374,6 @@ class Qwen3Backbone(nn.Module):
         return BatchFeature(data=batch)
 
     def _ensure_mm_token_type_ids(self, model_input: dict[str, torch.Tensor]) -> None:
-        """Fill Qwen3-VL multimodal token type ids when the processor omits them."""
-
         if "mm_token_type_ids" in model_input:
             return
         if "image_grid_thw" not in model_input and "video_grid_thw" not in model_input:
@@ -763,14 +759,10 @@ class GR00TN17ActionHead(nn.Module):
 
 
 def _is_cosmos_reason2_backbone(model_name: str) -> bool:
-    """Return whether ``model_name`` is the public N1.7 Cosmos-Reason2 backbone."""
-
     return str(model_name).rstrip("/") == "nvidia/Cosmos-Reason2-2B"
 
 
 def _cosmos_reason2_qwen3_vl_config() -> PretrainedConfig:
-    """Build the Qwen3-VL config for Cosmos-Reason2-2B without downloading it."""
-
     if Qwen3VLConfig is None:
         raise ImportError(
             "Qwen3VLConfig is required for GR00T N1.7. "
