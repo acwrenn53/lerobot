@@ -382,10 +382,17 @@ def _flatten_n1_7_modality_stats(
 
 
 def _as_float_list(values: Any) -> list[float]:
-    if isinstance(values, list):
-        return [float(value) for value in values]
     if values is None:
         return []
+    if isinstance(values, torch.Tensor):
+        return values.detach().cpu().reshape(-1).float().tolist()
+    if isinstance(values, np.ndarray):
+        return values.reshape(-1).astype(np.float32).tolist()
+    if isinstance(values, (list, tuple)):
+        flattened: list[float] = []
+        for value in values:
+            flattened.extend(_as_float_list(value))
+        return flattened
     return [float(values)]
 
 
