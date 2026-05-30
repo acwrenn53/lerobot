@@ -28,6 +28,7 @@ GROOT_N1_7 = "n1.7"
 GROOT_N1_5_BASE_MODEL = "nvidia/GR00T-N1.5-3B"
 GROOT_N1_7_BASE_MODEL = "nvidia/GR00T-N1.7-3B"
 GROOT_N1_7_BACKBONE_MODEL = "nvidia/Cosmos-Reason2-2B"
+GROOT_ACTION_DECODE_TRANSFORM_LIBERO = "libero"
 
 _GROOT_MODEL_VERSION_ALIASES = {
     "n1.5": GROOT_N1_5,
@@ -41,12 +42,37 @@ _GROOT_MODEL_VERSION_ALIASES = {
     "1.7": GROOT_N1_7,
 }
 
+_GROOT_ACTION_DECODE_TRANSFORM_ALIASES = {
+    "none": None,
+    "": None,
+    GROOT_ACTION_DECODE_TRANSFORM_LIBERO: GROOT_ACTION_DECODE_TRANSFORM_LIBERO,
+}
+
 
 def normalize_groot_model_version(model_version: str) -> str:
     normalized = _GROOT_MODEL_VERSION_ALIASES.get(model_version.lower())
     if normalized is None:
         supported = ", ".join(sorted({GROOT_N1_5, GROOT_N1_7}))
         raise ValueError(f"Unsupported GR00T model_version '{model_version}'. Supported versions: {supported}.")
+    return normalized
+
+
+def normalize_groot_action_decode_transform(transform: str | None) -> str | None:
+    if transform is None:
+        return None
+    normalized = _GROOT_ACTION_DECODE_TRANSFORM_ALIASES.get(transform.lower())
+    if normalized is None and transform.lower() not in _GROOT_ACTION_DECODE_TRANSFORM_ALIASES:
+        supported = ", ".join(
+            sorted(
+                key
+                for key, value in _GROOT_ACTION_DECODE_TRANSFORM_ALIASES.items()
+                if value is not None
+            )
+        )
+        raise ValueError(
+            f"Unsupported GR00T N1.7 action decode transform '{transform}'. "
+            f"Supported transforms: none, {supported}."
+        )
     return normalized
 
 
@@ -321,6 +347,9 @@ class GrootConfig(PreTrainedConfig):
     # HF repo ID (or local path) for the GR00T N1.7 Cosmos/Qwen3-VL backbone processor.
     n1_7_backbone_model: str = GROOT_N1_7_BACKBONE_MODEL
 
+    # Optional named action transform applied after raw N1.7 checkpoint decoding and before env.step().
+    action_decode_transform: str | None = None
+
     # Embodiment tag to use for training (e.g. 'new_embodiment', 'gr1')
     embodiment_tag: str = "new_embodiment"
 
@@ -381,10 +410,16 @@ class GrootConfig(PreTrainedConfig):
 
     def __post_init__(self):
         self.model_version = normalize_groot_model_version(self.model_version)
+        self.action_decode_transform = normalize_groot_action_decode_transform(
+            self.action_decode_transform
+        )
         if self.base_model_path is None:
             self.base_model_path = (
                 GROOT_N1_7_BASE_MODEL if self.model_version == GROOT_N1_7 else GROOT_N1_5_BASE_MODEL
             )
+
+        if self.action_decode_transform is not None and self.model_version != GROOT_N1_7:
+            raise ValueError("action_decode_transform can only be used with model_version='n1.7'.")
 
         if self.model_version == GROOT_N1_7:
             if self.max_state_dim == 64:

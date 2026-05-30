@@ -30,6 +30,7 @@ from lerobot.policies.groot.configuration_groot import (
     GROOT_N1_5,
     GROOT_N1_5_BASE_MODEL,
     GROOT_N1_7,
+    GROOT_ACTION_DECODE_TRANSFORM_LIBERO,
     GROOT_N1_7_BASE_MODEL,
     GrootConfig,
     infer_groot_n1_7_action_execution_horizon,
@@ -39,6 +40,7 @@ from lerobot.policies.groot.modeling_groot import GrootPolicy
 from lerobot.policies.groot.processor_groot import (
     GrootActionUnpackUnnormalizeStep,
     GrootEagleEncodeStep,
+    GrootN17ActionDecodeStep,
     GrootN17PackInputsStep,
     GrootN17VLMEncodeStep,
     _transform_n1_7_image_for_vlm,
@@ -61,12 +63,16 @@ def _groot_features(state_dim: int, action_dim: int) -> tuple[dict[str, PolicyFe
 
 def _groot_config(model_version: str) -> GrootConfig:
     input_features, output_features = _groot_features(state_dim=8, action_dim=7)
+    kwargs = {}
+    if model_version == GROOT_N1_7:
+        kwargs["action_decode_transform"] = GROOT_ACTION_DECODE_TRANSFORM_LIBERO
     return GrootConfig(
         model_version=model_version,
         input_features=input_features,
         output_features=output_features,
         device="cpu",
         use_bf16=False,
+        **kwargs,
     )
 
 
@@ -80,6 +86,7 @@ def _raw_n1_7_libero_config(model_path) -> GrootConfig:
         output_features=output_features,
         device="cpu",
         use_bf16=False,
+        action_decode_transform=GROOT_ACTION_DECODE_TRANSFORM_LIBERO,
     )
 
 
@@ -359,6 +366,35 @@ def test_groot_n1_7_explicit_selection_uses_n1_7_defaults():
     assert len(config.action_delta_indices) == 40
 
 
+def test_groot_n1_7_accepts_named_action_decode_transform():
+    config = GrootConfig(
+        model_version=GROOT_N1_7,
+        action_decode_transform="libero",
+        device="cpu",
+    )
+
+    assert config.action_decode_transform == GROOT_ACTION_DECODE_TRANSFORM_LIBERO
+
+
+@pytest.mark.parametrize("legacy_transform", ["libero_gripper", "libero-gripper"])
+def test_groot_n1_7_rejects_legacy_libero_gripper_action_decode_transform(legacy_transform):
+    with pytest.raises(ValueError, match="Unsupported GR00T N1.7 action decode transform"):
+        GrootConfig(
+            model_version=GROOT_N1_7,
+            action_decode_transform=legacy_transform,
+            device="cpu",
+        )
+
+
+def test_groot_n1_5_rejects_action_decode_transform():
+    with pytest.raises(ValueError, match="action_decode_transform"):
+        GrootConfig(
+            model_version=GROOT_N1_5,
+            action_decode_transform=GROOT_ACTION_DECODE_TRANSFORM_LIBERO,
+            device="cpu",
+        )
+
+
 def test_groot_n1_7_path_requires_matching_model_version():
     with pytest.raises(ValueError, match="model_version"):
         GrootConfig(base_model_path=GROOT_N1_7_BASE_MODEL, device="cpu")
@@ -431,9 +467,7 @@ def test_raw_n1_7_libero_checkpoint_processors_use_checkpoint_assets(tmp_path):
 
     pack_inputs = next(step for step in preprocessor.steps if isinstance(step, GrootN17PackInputsStep))
     vlm_encode = next(step for step in preprocessor.steps if isinstance(step, GrootN17VLMEncodeStep))
-    unpack_actions = next(
-        step for step in postprocessor.steps if isinstance(step, GrootActionUnpackUnnormalizeStep)
-    )
+    decode_actions = next(step for step in postprocessor.steps if isinstance(step, GrootN17ActionDecodeStep))
 
     assert pack_inputs.embodiment_tag == "libero_sim"
     assert pack_inputs.embodiment_mapping["libero_sim"] == 42
@@ -461,18 +495,11 @@ def test_raw_n1_7_libero_checkpoint_processors_use_checkpoint_assets(tmp_path):
     assert vlm_encode.shortest_image_edge == 256
     assert vlm_encode.crop_fraction == 0.95
     assert vlm_encode.use_albumentations is True
-    assert unpack_actions.stats[ACTION]["max"] == [
-        109.0,
-        110.0,
-        111.0,
-        112.0,
-        113.0,
-        114.0,
-        115.0,
-    ]
-    assert unpack_actions.env_action_dim == 7
-    assert unpack_actions.clip_normalized_action is True
-    assert unpack_actions.libero_gripper_action is True
+    assert decode_actions.raw_stats["action"]["gripper"]["q99"] == [115.0]
+    assert decode_actions.env_action_dim == 7
+    assert decode_actions.use_percentiles is True
+    assert decode_actions.use_relative_action is True
+    assert decode_actions.action_decode_transform == GROOT_ACTION_DECODE_TRANSFORM_LIBERO
 
 
 def test_raw_n1_7_checkpoint_requires_percentile_stats_when_config_uses_percentiles(tmp_path):
@@ -509,9 +536,7 @@ def test_raw_n1_7_checkpoint_processors_prefer_checkpoint_stats_when_dataset_sta
     )
 
     pack_inputs = next(step for step in preprocessor.steps if isinstance(step, GrootN17PackInputsStep))
-    unpack_actions = next(
-        step for step in postprocessor.steps if isinstance(step, GrootActionUnpackUnnormalizeStep)
-    )
+    decode_actions = next(step for step in postprocessor.steps if isinstance(step, GrootN17ActionDecodeStep))
     torch.testing.assert_close(
         torch.as_tensor(pack_inputs.stats[OBS_STATE]["min"]),
         torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
@@ -520,14 +545,8 @@ def test_raw_n1_7_checkpoint_processors_prefer_checkpoint_stats_when_dataset_sta
         torch.as_tensor(pack_inputs.stats[ACTION]["max"]),
         torch.tensor([109.0, 110.0, 111.0, 112.0, 113.0, 114.0, 115.0]),
     )
-    torch.testing.assert_close(
-        torch.as_tensor(unpack_actions.stats[OBS_STATE]["min"]),
-        torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
-    )
-    torch.testing.assert_close(
-        torch.as_tensor(unpack_actions.stats[ACTION]["max"]),
-        torch.tensor([109.0, 110.0, 111.0, 112.0, 113.0, 114.0, 115.0]),
-    )
+    assert decode_actions.raw_stats["action"]["gripper"]["q99"] == [115.0]
+    assert decode_actions.action_decode_transform == GROOT_ACTION_DECODE_TRANSFORM_LIBERO
 
 
 def test_groot_n1_7_saved_processors_round_trip_checkpoint_specific_fields(tmp_path):
@@ -551,10 +570,8 @@ def test_groot_n1_7_saved_processors_round_trip_checkpoint_specific_fields(tmp_p
     pack_inputs = next(
         step for step in loaded_preprocessor.steps if isinstance(step, GrootN17PackInputsStep)
     )
-    unpack_actions = next(
-        step
-        for step in loaded_postprocessor.steps
-        if isinstance(step, GrootActionUnpackUnnormalizeStep)
+    decode_actions = next(
+        step for step in loaded_postprocessor.steps if isinstance(step, GrootN17ActionDecodeStep)
     )
 
     assert pack_inputs.valid_action_horizon == 16
@@ -565,13 +582,9 @@ def test_groot_n1_7_saved_processors_round_trip_checkpoint_specific_fields(tmp_p
         pack_inputs.stats[OBS_STATE]["min"],
         torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
     )
-    assert unpack_actions.env_action_dim == 7
-    assert unpack_actions.libero_gripper_action is True
-    assert unpack_actions.clip_normalized_action is True
-    torch.testing.assert_close(
-        unpack_actions.stats[ACTION]["max"],
-        torch.tensor([109.0, 110.0, 111.0, 112.0, 113.0, 114.0, 115.0]),
-    )
+    assert decode_actions.env_action_dim == 7
+    assert decode_actions.action_decode_transform == GROOT_ACTION_DECODE_TRANSFORM_LIBERO
+    assert decode_actions.raw_stats["action"]["gripper"]["q99"] == [115.0]
 
 
 def test_groot_n1_7_pack_inputs_rejects_state_dim_above_core_max():
@@ -870,6 +883,80 @@ def test_groot_n1_7_postprocessor_clips_normalized_action_before_unnormalizing()
     output = step(transition)
 
     torch.testing.assert_close(output[TransitionKey.ACTION], torch.tensor([[0.0, 5.0, 10.0]]))
+
+
+def test_groot_n1_7_action_decode_applies_named_libero_transform_from_modality_key():
+    unit_stats = {
+        "min": [0.0],
+        "max": [1.0],
+        "mean": [0.5],
+        "std": [1.0],
+        "q01": [0.0],
+        "q99": [1.0],
+    }
+    step = GrootN17ActionDecodeStep(
+        env_action_dim=3,
+        raw_stats={
+            "action": {
+                "x": unit_stats,
+                "gripper": unit_stats,
+                "y": unit_stats,
+            }
+        },
+        modality_config={
+            "action": {
+                "modality_keys": ["x", "gripper", "y"],
+                "action_configs": [{}, {}, {}],
+            }
+        },
+        action_decode_transform=GROOT_ACTION_DECODE_TRANSFORM_LIBERO,
+    )
+    action = torch.tensor(
+        [
+            [
+                [-1.0, -1.0, 1.0],
+                [1.0, 0.0, -1.0],
+                [0.0, 1.0, 0.0],
+            ]
+        ]
+    )
+
+    output = step({TransitionKey.ACTION: action})
+
+    expected = torch.tensor(
+        [
+            [
+                [0.0, 1.0, 1.0],
+                [1.0, -0.0, 0.0],
+                [0.5, -1.0, 0.5],
+            ]
+        ]
+    )
+    torch.testing.assert_close(output[TransitionKey.ACTION], expected)
+
+
+def test_groot_n1_7_action_decode_requires_gripper_key_for_libero_transform():
+    step = GrootN17ActionDecodeStep(
+        env_action_dim=1,
+        raw_stats={
+            "action": {
+                "x": {
+                    "min": [0.0],
+                    "max": [1.0],
+                },
+            }
+        },
+        modality_config={
+            "action": {
+                "modality_keys": ["x"],
+                "action_configs": [{}],
+            }
+        },
+        action_decode_transform=GROOT_ACTION_DECODE_TRANSFORM_LIBERO,
+    )
+
+    with pytest.raises(KeyError, match="gripper"):
+        step({TransitionKey.ACTION: torch.zeros(1, 1, 1)})
 
 
 def test_groot_n1_7_postprocessor_converts_libero_gripper_convention():

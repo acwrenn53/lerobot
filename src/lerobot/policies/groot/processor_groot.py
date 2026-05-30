@@ -61,6 +61,7 @@ from lerobot.utils.constants import (
 
 from .configuration_groot import (
     GROOT_N1_7,
+    GROOT_ACTION_DECODE_TRANSFORM_LIBERO,
     GROOT_N1_7_BACKBONE_MODEL,
     GrootConfig,
     is_raw_groot_n1_7_checkpoint,
@@ -558,25 +559,27 @@ def make_groot_pre_post_processors(
             ),
             DeviceProcessorStep(device=config.device),
         ]
+        if checkpoint_assets is None:
+            action_decode_step: ProcessorStep = GrootActionUnpackUnnormalizeStep(
+                env_action_dim=env_action_dim,
+                stats=padded_stats,
+                normalize_min_max=True,
+                clip_normalized_action=True,
+            )
+        else:
+            action_decode_step = GrootN17ActionDecodeStep(
+                env_action_dim=env_action_dim,
+                raw_stats=checkpoint_assets.raw_stats,
+                modality_config=checkpoint_assets.modality_config,
+                use_percentiles=checkpoint_assets.use_percentiles,
+                use_relative_action=checkpoint_assets.use_relative_action,
+                pack_step=pack_step,
+                state_cache_key=state_cache_key,
+                action_decode_transform=config.action_decode_transform,
+            )
+
         output_steps: list[ProcessorStep] = [
-            (
-                GrootN17ActionDecodeStep(
-                    env_action_dim=env_action_dim,
-                    raw_stats=checkpoint_assets.raw_stats,
-                    modality_config=checkpoint_assets.modality_config,
-                    use_percentiles=checkpoint_assets.use_percentiles,
-                    use_relative_action=checkpoint_assets.use_relative_action,
-                    pack_step=pack_step,
-                    state_cache_key=state_cache_key,
-                )
-                if checkpoint_assets is not None
-                else GrootActionUnpackUnnormalizeStep(
-                    env_action_dim=env_action_dim,
-                    stats=padded_stats,
-                    normalize_min_max=True,
-                    clip_normalized_action=True,
-                )
-            ),
+            action_decode_step,
             DeviceProcessorStep(device="cpu"),
         ]
         return (
@@ -1664,6 +1667,50 @@ def _relative_eef_to_absolute(action: np.ndarray, reference_state: np.ndarray) -
     return out.astype(np.float32)
 
 
+def _n1_7_action_group_slice(
+    action_keys: list[Any], decoded_groups: dict[str, np.ndarray], target_key: str
+) -> slice:
+    start_idx = 0
+    for key in action_keys:
+        if not isinstance(key, str) or key not in decoded_groups:
+            continue
+        dim = decoded_groups[key].shape[-1]
+        end_idx = start_idx + dim
+        if key == target_key:
+            return slice(start_idx, end_idx)
+        start_idx = end_idx
+
+    raise KeyError(f"Missing N1.7 action group '{target_key}' required by action decode transform.")
+
+
+def _apply_n1_7_action_decode_transform(
+    decoded: np.ndarray,
+    *,
+    transform: str | None,
+    action_keys: list[Any],
+    decoded_groups: dict[str, np.ndarray],
+) -> np.ndarray:
+    if transform is None:
+        return decoded
+
+    if transform == GROOT_ACTION_DECODE_TRANSFORM_LIBERO:
+        gripper_slice = _n1_7_action_group_slice(action_keys, decoded_groups, "gripper")
+        if gripper_slice.stop is None or gripper_slice.stop > decoded.shape[-1]:
+            raise ValueError(
+                "N1.7 LIBERO action decode transform requested, but the decoded gripper action "
+                "is outside the sliced environment action."
+            )
+        if gripper_slice.stop - gripper_slice.start != 1:
+            raise ValueError("N1.7 LIBERO action decode transform expects a scalar gripper action.")
+
+        transformed = decoded.copy()
+        gripper = transformed[..., gripper_slice]
+        transformed[..., gripper_slice] = -np.sign(2.0 * gripper - 1.0)
+        return transformed
+
+    raise ValueError(f"Unsupported N1.7 action decode transform '{transform}'.")
+
+
 @dataclass
 @ProcessorStepRegistry.register(name="groot_n1_7_action_decode_v1")
 class GrootN17ActionDecodeStep(ProcessorStep):
@@ -1681,6 +1728,7 @@ class GrootN17ActionDecodeStep(ProcessorStep):
     use_percentiles: bool = False
     use_relative_action: bool = False
     state_cache_key: str = ""
+    action_decode_transform: str | None = None
     pack_step: GrootN17PackInputsStep | None = field(default=None, repr=False)
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
@@ -1763,6 +1811,12 @@ class GrootN17ActionDecodeStep(ProcessorStep):
         )
         if self.env_action_dim and decoded.shape[-1] > self.env_action_dim:
             decoded = decoded[..., : self.env_action_dim]
+        decoded = _apply_n1_7_action_decode_transform(
+            decoded,
+            transform=self.action_decode_transform,
+            action_keys=action_keys,
+            decoded_groups=decoded_groups,
+        )
         new_transition = transition.copy()
         new_transition[TransitionKey.ACTION] = torch.as_tensor(
             decoded, dtype=action.dtype, device=action.device
@@ -1780,6 +1834,7 @@ class GrootN17ActionDecodeStep(ProcessorStep):
             "use_percentiles": self.use_percentiles,
             "use_relative_action": self.use_relative_action,
             "state_cache_key": self.state_cache_key,
+            "action_decode_transform": self.action_decode_transform,
         }
 
 
