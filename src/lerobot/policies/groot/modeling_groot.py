@@ -341,25 +341,87 @@ class GrootPolicy(PreTrainedPolicy):
 
         return loss, loss_dict
 
+    def _prepare_n1_7_rtc_inputs(
+        self,
+        prev_chunk_left_over: Tensor | None,
+        inference_delay: int | None,
+    ) -> tuple[Tensor | None, dict | None]:
+        """Prepare GR00T N1.7 RTC overlap inputs from the previous unprocessed action chunk."""
+        if self.config.model_version != GROOT_N1_7 or prev_chunk_left_over is None:
+            return None, None
+
+        if prev_chunk_left_over.numel() == 0:
+            return None, None
+
+        prev_actions = prev_chunk_left_over
+        if prev_actions.ndim == 2:
+            prev_actions = prev_actions.unsqueeze(0)
+        elif prev_actions.ndim != 3:
+            raise ValueError(
+                "prev_chunk_left_over must have shape (T, action_dim) or "
+                f"(B, T, action_dim), got {tuple(prev_actions.shape)}"
+            )
+
+        action_head = getattr(self._groot_model, "action_head", None)
+        model_action_dim = int(getattr(action_head, "action_dim", prev_actions.shape[-1]))
+        if prev_actions.shape[-1] < model_action_dim:
+            pad = torch.zeros(
+                *prev_actions.shape[:-1],
+                model_action_dim - prev_actions.shape[-1],
+                dtype=prev_actions.dtype,
+                device=prev_actions.device,
+            )
+            prev_actions = torch.cat([prev_actions, pad], dim=-1)
+        elif prev_actions.shape[-1] > model_action_dim:
+            prev_actions = prev_actions[..., :model_action_dim]
+
+        prev_steps = int(prev_actions.shape[1])
+        if prev_steps <= 0:
+            return None, None
+
+        action_horizon = int(getattr(getattr(self._groot_model, "config", None), "action_horizon", prev_steps))
+        overlap_steps = min(prev_steps, action_horizon)
+        frozen_steps = min(max(0, int(inference_delay or 0)), overlap_steps)
+        rtc_ramp_rate = float(getattr(getattr(self._groot_model, "config", None), "rtc_ramp_rate", 6.0))
+
+        return prev_actions, {
+            "action_horizon": prev_steps,
+            "rtc_overlap_steps": overlap_steps,
+            "rtc_frozen_steps": frozen_steps,
+            "rtc_ramp_rate": rtc_ramp_rate,
+        }
+
     @torch.no_grad()
-    def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
+    def predict_action_chunk(
+        self,
+        batch: dict[str, Tensor],
+        inference_delay: int | None = None,
+        prev_chunk_left_over: Tensor | None = None,
+    ) -> Tensor:
         """Predict a chunk of actions for inference by delegating to Isaac-GR00T.
 
         Returns a tensor of shape (B, n_action_steps, action_dim).
         """
         self.eval()
 
+        prev_actions, rtc_options = self._prepare_n1_7_rtc_inputs(
+            prev_chunk_left_over=prev_chunk_left_over,
+            inference_delay=inference_delay,
+        )
+
         # Preprocessing is handled by the processor pipeline, so we just filter the batch.
-        # During inference, we do not pass action because it is predicted.
+        # During inference, action is only provided for GR00T N1.7 RTC overlap.
         # N1.7 still carries a 2-D action horizon mask from its checkpoint processor.
-        groot_inputs = self._filter_groot_inputs(batch, include_action=False)
+        groot_inputs = self._filter_groot_inputs(batch, include_action=prev_actions is not None)
+        if prev_actions is not None:
+            groot_inputs[ACTION] = prev_actions
 
         # Get device from model parameters
         device = next(self.parameters()).device
 
         # Use bf16 autocast for inference to keep memory low and match backbone dtype
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=self.config.use_bf16):
-            outputs = self._groot_model.get_action(groot_inputs)
+            outputs = self._groot_model.get_action(groot_inputs, options=rtc_options)
 
         actions = outputs.get("action_pred")
 
