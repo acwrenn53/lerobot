@@ -233,14 +233,9 @@ class ActionQueue:
         """
         effective_delay = max(0, real_delay)
 
-        if self.queue is None or self.last_index >= len(self.queue):
-            return 0 if self.cfg.enabled else effective_delay
-        if not self.cfg.enabled:
-            return effective_delay
-
         if action_index_before_inference is not None:
             indexes_diff = max(0, self.last_index - action_index_before_inference)
-            if abs(indexes_diff - real_delay) > 1:
+            if indexes_diff != real_delay:
                 logger.warning(
                     "Indexes diff is not equal to real delay. indexes_diff=%d, real_delay=%d",
                     indexes_diff,

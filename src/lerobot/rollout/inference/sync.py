@@ -94,36 +94,26 @@ class SyncInferenceEngine(InferenceEngine):
         self._preprocessor.reset()
         self._postprocessor.reset()
 
-    def _can_pop_cached_action_without_observation(self) -> bool:
-        """Return true when GR00T can serve its internal action queue without a fresh batch."""
-        if getattr(self._policy.config, "type", None) != "groot":
-            return False
-        queue = getattr(self._policy, "_action_queue", None)
-        return queue is not None and len(queue) > 0
-
     def get_action(self, obs_frame: dict | None) -> torch.Tensor | None:
         """Run the full inference pipeline on ``obs_frame`` and return an action tensor."""
         if obs_frame is None:
             return None
-        cached_action = self._can_pop_cached_action_without_observation()
-        # GR00T chunk policies pop cached actions without reading the batch, so
-        # avoid image/device preprocessing until a new chunk is actually needed.
-        observation = None if cached_action else copy(obs_frame)
+        # Shallow copy is intentional: the caller (`send_next_action`) builds
+        # ``obs_frame`` fresh per tick via ``build_dataset_frame``, so the
+        # tensor/array values are not shared with any other reader.
+        observation = copy(obs_frame)
         autocast_ctx = (
             torch.autocast(device_type=self._device.type)
             if self._device.type == "cuda" and self._policy.config.use_amp
             else nullcontext()
         )
         with torch.inference_mode(), autocast_ctx:
-            if not cached_action:
-                observation = prepare_observation_for_inference(
-                    observation, self._device, self._task, self._robot_type
-                )
-                observation = self._preprocessor(observation)
-
-            action = self._policy.select_action(observation if observation is not None else {})
+            observation = prepare_observation_for_inference(
+                observation, self._device, self._task, self._robot_type
+            )
+            observation = self._preprocessor(observation)
+            action = self._policy.select_action(observation)
             action = self._postprocessor(action)
-
         action_tensor = action.squeeze(0).cpu()
 
         # Reorder to match dataset action ordering so the caller can treat
