@@ -350,6 +350,11 @@ class GrootConfig(PreTrainedConfig):
     # Optional named action transform applied after raw N1.7 checkpoint decoding and before env.step().
     action_decode_transform: str | None = None
 
+    # Optional relative-action settings recorded by GR00T training configs.
+    use_relative_actions: bool = False
+    relative_exclude_joints: list[str] | None = None
+    action_feature_names: list[str] | None = None
+
     # Embodiment tag to use for training (e.g. 'new_embodiment', 'gr1')
     embodiment_tag: str = "new_embodiment"
 
