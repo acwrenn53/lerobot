@@ -1885,6 +1885,13 @@ class GrootN17ActionDecodeStep(ProcessorStep):
                 use_relative_action=self.use_relative_action,
                 use_percentiles=self.use_percentiles,
             )
+            if min_v.ndim == 2:
+                if normalized.ndim == 2:
+                    min_v = min_v[0]
+                    max_v = max_v[0]
+                elif normalized.ndim == 3:
+                    min_v = min_v[: normalized.shape[1]]
+                    max_v = max_v[: normalized.shape[1]]
             decoded_groups[key] = _unnormalize_min_max(normalized, min_v, max_v)
             start_idx += dim
 
@@ -1910,7 +1917,10 @@ class GrootN17ActionDecodeStep(ProcessorStep):
                 action_type = _config_value(cfg.get("type"))
                 action_format = _config_value(cfg.get("format"))
                 if action_type == "non_eef":
-                    decoded_groups[key] = decoded_groups[key] + reference[:, None, :]
+                    if decoded_groups[key].ndim == 2:
+                        decoded_groups[key] = decoded_groups[key] + reference
+                    else:
+                        decoded_groups[key] = decoded_groups[key] + reference[:, None, :]
                 elif action_type == "eef" and action_format == "xyz+rot6d":
                     decoded_groups[key] = _relative_eef_to_absolute(decoded_groups[key], reference)
                 else:
