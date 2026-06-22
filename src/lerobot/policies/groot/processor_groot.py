@@ -15,7 +15,7 @@
 # limitations under the License.
 
 import logging
-from copy import copy
+from copy import copy, deepcopy
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -55,6 +55,7 @@ from lerobot.processor import (
     RenameObservationsProcessorStep,
     batch_to_transition,
     policy_action_to_transition,
+    to_relative_actions,
     transition_to_batch,
     transition_to_policy_action,
 )
@@ -136,6 +137,13 @@ class _GrootN17CheckpointProcessorAssets:
     shortest_image_edge: int | None
     crop_fraction: float | None
     use_albumentations: bool
+
+
+@dataclass(frozen=True)
+class _GrootN17ActionGroup:
+    key: str
+    indices: list[int]
+    relative: bool
 
 
 def _load_n1_7_checkpoint_processor_assets(config: GrootConfig) -> _GrootN17CheckpointProcessorAssets | None:
@@ -336,25 +344,22 @@ def _load_n1_7_checkpoint_video_modality_keys(
     return keys or None
 
 
-# GR00T normalizes state/action inside its own processor steps and so deliberately has no
-# NormalizerProcessorStep/UnnormalizerProcessorStep (see GrootConfig.normalization_mapping, which is
-# IDENTITY for every feature). lerobot-train nonetheless emits these standard override keys
-# unconditionally, so for a GR00T pipeline they legitimately match no step. They are dropped up front
-# by _drop_groot_absent_standard_overrides so they neither break loading nor mask genuine typos.
-_GROOT_ABSENT_STANDARD_OVERRIDE_KEYS = frozenset({"normalizer_processor", "unnormalizer_processor"})
+# GR00T normalizes and represents actions inside its own processor steps, so it deliberately has no
+# standard NormalizerProcessorStep/UnnormalizerProcessorStep or generic relative/absolute action steps.
+# ``lerobot-train`` can still emit those generic override keys; for a GR00T pipeline they legitimately
+# match no step, so drop them up front without masking unrelated typo keys.
+_GROOT_ABSENT_STANDARD_OVERRIDE_KEYS = frozenset(
+    {
+        "absolute_actions_processor",
+        "normalizer_processor",
+        "relative_actions_processor",
+        "unnormalizer_processor",
+    }
+)
 
 
 def _drop_groot_absent_standard_overrides(overrides: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Strip standard normalization override keys that a GR00T pipeline has no step for.
-
-    ``lerobot-train`` emits ``normalizer_processor``/``unnormalizer_processor`` overrides
-    unconditionally, but GR00T normalizes inside its own steps and has no such step (see
-    ``GrootConfig.normalization_mapping``). Both override-application paths reject keys that match no
-    step — ``_apply_groot_step_overrides`` raises for the freshly built raw-checkpoint pipeline, and
-    ``PolicyProcessorPipeline.from_pretrained`` raises via its used-override validation for the
-    serialized pipeline — so these keys are removed before either path runs. Any other unknown key
-    (e.g. a typo) is left in place and still raises.
-    """
+    """Strip standard override keys that a GR00T pipeline has no step for."""
 
     if not overrides:
         return overrides
@@ -434,6 +439,7 @@ def make_groot_pre_post_processors_from_pretrained(
     pretrained_path: str,
     *,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
+    dataset_meta: Any | None = None,
     preprocessor_overrides: dict[str, Any] | None = None,
     postprocessor_overrides: dict[str, Any] | None = None,
     preprocessor_config_filename: str = f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json",
@@ -456,6 +462,7 @@ def make_groot_pre_post_processors_from_pretrained(
         preprocessor, postprocessor = make_groot_pre_post_processors(
             config=processor_cfg,
             dataset_stats=dataset_stats,
+            dataset_meta=dataset_meta,
         )
         # Raw checkpoints have no serialized pipelines to load overrides into,
         # so apply the caller overrides (e.g. device and rename_map from
@@ -545,8 +552,491 @@ def _reconnect_groot_n1_7_pack_decode_steps(
             step.pack_step = pack_step
 
 
+def _resolve_feature_names_from_dataset_meta(dataset_meta: Any | None, feature_key: str) -> list[str] | None:
+    features = getattr(dataset_meta, "features", {}) or {}
+    feature = features.get(feature_key) if isinstance(features, dict) else None
+    names = feature.get("names") if isinstance(feature, dict) else getattr(feature, "names", None)
+    return list(names) if names is not None else None
+
+
+def _resolve_action_feature_names_from_dataset_meta(dataset_meta: Any | None) -> list[str] | None:
+    return _resolve_feature_names_from_dataset_meta(dataset_meta, ACTION)
+
+
+def _resolve_visual_modality_keys_from_dataset_meta(dataset_meta: Any | None) -> list[str] | None:
+    features = getattr(dataset_meta, "features", {}) or {}
+    if not isinstance(features, dict):
+        return None
+
+    keys: list[str] = []
+    for key, value in features.items():
+        dtype = value.get("dtype") if isinstance(value, dict) else getattr(value, "dtype", None)
+        feature_type = value.get("type") if isinstance(value, dict) else getattr(value, "type", None)
+        is_visual = dtype in {"image", "video"} or str(feature_type).upper().endswith("VISUAL")
+        if not is_visual or not isinstance(key, str) or not key.startswith(f"{OBS_IMAGES}."):
+            continue
+        keys.append(key.removeprefix(f"{OBS_IMAGES}."))
+    return keys or None
+
+
+def _as_int(value: Any) -> int:
+    if isinstance(value, torch.Tensor):
+        return int(value.item())
+    item = getattr(value, "item", None)
+    if callable(item):
+        return int(item())
+    return int(value)
+
+
+def _to_float_tensor(value: Any, *, key: str) -> torch.Tensor:
+    if value is None:
+        raise ValueError(f"Cannot compute relative action statistics: sample is missing '{key}'.")
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().float()
+    return torch.as_tensor(value, dtype=torch.float32)
+
+
+def _state_reference_batch(state: torch.Tensor) -> torch.Tensor:
+    if state.ndim == 1:
+        return state.unsqueeze(0)
+    if state.ndim == 2:
+        return state
+    if state.ndim > 2:
+        return state.reshape(-1, state.shape[-1])[-1:].contiguous()
+    raise ValueError(f"observation.state must have at least 1 dimension, got shape {tuple(state.shape)}.")
+
+
+def _action_training_batch(action: torch.Tensor, state_batch: torch.Tensor) -> torch.Tensor:
+    if action.ndim == 1:
+        return action.unsqueeze(0)
+    if action.ndim == 2:
+        if state_batch.shape[0] == action.shape[0] and state_batch.shape[0] > 1:
+            return action
+        return action.unsqueeze(0)
+    if action.ndim == 3:
+        return action
+    raise ValueError(f"action must be (D,), (T, D), (B, D), or (B, T, D), got {tuple(action.shape)}.")
+
+
+def _relative_action_chunks_by_horizon(
+    relative_action: torch.Tensor, pad_mask: Any | None
+) -> list[list[np.ndarray]]:
+    if relative_action.ndim == 2:
+        relative_action = relative_action.unsqueeze(0)
+    if relative_action.ndim != 3:
+        raise ValueError(
+            "Cannot compute horizon-preserving relative action statistics from "
+            f"shape {tuple(relative_action.shape)}."
+        )
+
+    batch_size, horizon, _action_dim = relative_action.shape
+    keep = torch.ones(batch_size, horizon, dtype=torch.bool)
+    if pad_mask is not None:
+        mask = torch.as_tensor(pad_mask, dtype=torch.bool).cpu()
+        if mask.ndim == 1 and batch_size == 1 and mask.numel() == horizon:
+            keep[0] = ~mask
+        elif mask.ndim == 2 and tuple(mask.shape) == (batch_size, horizon):
+            keep = ~mask
+
+    chunks: list[list[np.ndarray]] = [[] for _ in range(horizon)]
+    relative_np = relative_action.detach().cpu().numpy()
+    for batch_idx in range(batch_size):
+        for horizon_idx in range(horizon):
+            if keep[batch_idx, horizon_idx]:
+                chunks[horizon_idx].append(relative_np[batch_idx, horizon_idx])
+    return chunks
+
+
+def _compute_horizon_relative_action_stats(chunks_by_horizon: list[list[np.ndarray]]) -> dict[str, np.ndarray]:
+    if not chunks_by_horizon or not any(chunks_by_horizon):
+        raise ValueError("Cannot compute relative action statistics without unpadded action vectors.")
+
+    stats: dict[str, list[np.ndarray]] = {key: [] for key in ("min", "max", "mean", "std", "q01", "q99")}
+    counts: list[int] = []
+    for horizon_idx, vectors in enumerate(chunks_by_horizon):
+        if len(vectors) < 2:
+            raise ValueError(
+                "Cannot compute horizon-preserving relative action statistics from fewer than 2 "
+                f"unpadded vectors at action timestep {horizon_idx}."
+            )
+        values = np.stack(vectors, axis=0).astype(np.float32)
+        stats["min"].append(np.min(values, axis=0))
+        stats["max"].append(np.max(values, axis=0))
+        stats["mean"].append(np.mean(values, axis=0))
+        stats["std"].append(np.std(values, axis=0))
+        stats["q01"].append(np.quantile(values, 0.01, axis=0).astype(np.float32))
+        stats["q99"].append(np.quantile(values, 0.99, axis=0).astype(np.float32))
+        counts.append(len(vectors))
+
+    computed = {key: np.stack(values, axis=0) for key, values in stats.items()}
+    computed["count"] = np.asarray(counts, dtype=np.int64)
+    return computed
+
+
+def _iter_action_state_training_samples(dataset: Any):
+    ensure_reader = getattr(dataset, "_ensure_reader", None)
+    if callable(ensure_reader):
+        reader = ensure_reader()
+        if reader.hf_dataset is None:
+            reader.load_and_activate()
+        delta_indices = getattr(reader, "delta_indices", None)
+        for idx in range(len(dataset)):
+            item = reader.hf_dataset[idx]
+            action = item.get(ACTION)
+            state = item.get(OBS_STATE)
+            pad_mask = None
+            if delta_indices is not None and ACTION in delta_indices:
+                ep_idx = _as_int(item["episode_index"])
+                abs_idx = _as_int(item["index"])
+                query_indices, padding = reader._get_query_indices(abs_idx, ep_idx)
+                action = reader._query_hf_dataset({ACTION: query_indices[ACTION]})[ACTION]
+                pad_mask = padding.get(f"{ACTION}_is_pad")
+            yield action, state, pad_mask
+        return
+
+    for idx in range(len(dataset)):
+        item = dataset[idx]
+        yield item.get(ACTION), item.get(OBS_STATE), item.get(f"{ACTION}_is_pad")
+
+
+def _make_relative_action_training_stats(
+    dataset: Any,
+    *,
+    exclude_joints: list[str] | None,
+    action_names: list[str] | None,
+    preserve_action_horizon: bool = True,
+) -> dict[str, dict[str, Any]]:
+    try:
+        dataset_len = len(dataset)
+    except TypeError as exc:
+        raise ValueError(
+            "Cannot compute relative action statistics for a dataset without a finite length. "
+            "Disable streaming or provide precomputed relative action statistics."
+        ) from exc
+
+    if dataset_len == 0:
+        raise ValueError("Cannot compute relative action statistics for an empty dataset.")
+
+    relative_step = RelativeActionsProcessorStep(
+        enabled=True,
+        exclude_joints=list(exclude_joints or []),
+        action_names=action_names,
+    )
+    stats = deepcopy(getattr(getattr(dataset, "meta", None), "stats", {}) or {})
+    chunks_by_horizon: list[list[np.ndarray]] | None = None
+    num_vectors = 0
+
+    for action_value, state_value, pad_mask in _iter_action_state_training_samples(dataset):
+        action = _to_float_tensor(action_value, key=ACTION)
+        state = _to_float_tensor(state_value, key=OBS_STATE)
+        state_batch = _state_reference_batch(state)
+        action_batch = _action_training_batch(action, state_batch)
+        if action_batch.shape[0] != state_batch.shape[0]:
+            if state_batch.shape[0] == 1:
+                state_batch = state_batch.expand(action_batch.shape[0], -1)
+            else:
+                raise ValueError(
+                    "Cannot compute relative action statistics: action and state batch sizes differ "
+                    f"({action_batch.shape[0]} vs {state_batch.shape[0]})."
+                )
+
+        relative_action = to_relative_actions(
+            action_batch,
+            state_batch,
+            relative_step._build_mask(action_batch.shape[-1]),
+        )
+        if not preserve_action_horizon:
+            relative_action = relative_action.reshape(-1, relative_action.shape[-1]).unsqueeze(0)
+            pad_mask = None
+        sample_chunks = _relative_action_chunks_by_horizon(relative_action, pad_mask)
+        if chunks_by_horizon is None:
+            chunks_by_horizon = [[] for _ in range(len(sample_chunks))]
+        if len(sample_chunks) != len(chunks_by_horizon):
+            raise ValueError(
+                "Cannot compute horizon-preserving relative action statistics from samples with "
+                f"different action horizons ({len(sample_chunks)} vs {len(chunks_by_horizon)})."
+            )
+        for horizon_idx, vectors in enumerate(sample_chunks):
+            chunks_by_horizon[horizon_idx].extend(vectors)
+            num_vectors += len(vectors)
+
+    if num_vectors < 2:
+        raise ValueError("Cannot compute relative action statistics from fewer than 2 unpadded action vectors.")
+
+    stats[ACTION] = _compute_horizon_relative_action_stats(chunks_by_horizon or [])
+    return stats
+
+
+def _stats_preserve_action_horizon(stats: dict[str, dict[str, Any]] | None) -> bool:
+    if not stats or ACTION not in stats:
+        return False
+    action_stats = stats.get(ACTION) or {}
+    for stat_name in ("min", "max", "mean", "std", "q01", "q99"):
+        value = action_stats.get(stat_name)
+        if value is None:
+            continue
+        return torch.as_tensor(value).ndim >= 2
+    return False
+
+
+def _make_relative_action_training_stats_from_dataset_meta(
+    config: GrootConfig, dataset_meta: Any | None
+) -> dict[str, dict[str, Any]] | None:
+    repo_id = getattr(dataset_meta, "repo_id", None)
+    root = getattr(dataset_meta, "root", None)
+    fps = getattr(dataset_meta, "fps", None)
+    if dataset_meta is None or repo_id is None or root is None or fps is None:
+        return None
+
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    delta_timestamps = {ACTION: [index / fps for index in config.action_delta_indices]}
+    dataset = LeRobotDataset(
+        repo_id,
+        root=root,
+        delta_timestamps=delta_timestamps,
+        revision=getattr(dataset_meta, "revision", None),
+        download_videos=False,
+        return_uint8=True,
+    )
+    return _make_relative_action_training_stats(
+        dataset,
+        exclude_joints=list(config.relative_exclude_joints or []),
+        action_names=_resolve_action_feature_names_from_dataset_meta(dataset_meta),
+        preserve_action_horizon=True,
+    )
+
+
+def _slice_stats_entry(stats: dict[str, Any], indices: list[int]) -> dict[str, Any]:
+    if not indices:
+        return {}
+
+    max_index = max(indices)
+    sliced: dict[str, Any] = {}
+    for stat_name, value in stats.items():
+        if stat_name == "count":
+            sliced[stat_name] = torch.as_tensor(value).flatten().tolist()
+            continue
+        tensor = torch.as_tensor(value, dtype=torch.float32)
+        if tensor.ndim >= 2:
+            if tensor.shape[-1] <= max_index:
+                continue
+            sliced[stat_name] = tensor[..., indices].tolist()
+        else:
+            tensor = tensor.flatten()
+            if tensor.numel() <= max_index:
+                continue
+            sliced[stat_name] = [float(tensor[index].item()) for index in indices]
+
+    if "min" in sliced and "max" in sliced:
+        min_arr = np.asarray(sliced["min"], dtype=np.float32)
+        max_arr = np.asarray(sliced["max"], dtype=np.float32)
+        if "mean" not in sliced:
+            sliced["mean"] = ((min_arr + max_arr) * 0.5).tolist()
+        if "std" not in sliced:
+            sliced["std"] = (np.abs(max_arr - min_arr) * 0.5).tolist()
+    return sliced
+
+
+def _feature_group_key(name: str) -> str:
+    base = name.removesuffix(".pos").split(".")[-1]
+    return base.replace(" ", "_") or "action"
+
+
+def _infer_n1_7_action_groups(
+    action_names: list[str],
+    *,
+    action_dim: int,
+    exclude_joints: list[str],
+) -> list[_GrootN17ActionGroup]:
+    if not action_names or action_dim <= 0:
+        return []
+
+    names = list(action_names[:action_dim])
+    exclude_tokens = [str(token).lower() for token in exclude_joints if token]
+    groups: list[_GrootN17ActionGroup] = []
+    current_indices: list[int] = []
+
+    def flush_relative_group() -> None:
+        if not current_indices:
+            return
+        key = (
+            "single_arm"
+            if not any(group.key == "single_arm" for group in groups)
+            else f"single_arm_{len(groups)}"
+        )
+        groups.append(_GrootN17ActionGroup(key=key, indices=list(current_indices), relative=True))
+        current_indices.clear()
+
+    for index, name in enumerate(names):
+        lowered = str(name).lower()
+        is_excluded = any(token == lowered or token in lowered for token in exclude_tokens)
+        if is_excluded:
+            flush_relative_group()
+            groups.append(
+                _GrootN17ActionGroup(key=_feature_group_key(str(name)), indices=[index], relative=False)
+            )
+        else:
+            current_indices.append(index)
+
+    flush_relative_group()
+    return groups
+
+
+def _group_stats_by_action_groups(
+    stats: dict[str, Any], groups: list[_GrootN17ActionGroup]
+) -> dict[str, dict[str, list[float]]]:
+    return {group.key: _slice_stats_entry(stats, group.indices) for group in groups}
+
+
+def _grouped_stats_support_percentiles(
+    raw_stats: dict[str, Any],
+    modality_config: dict[str, Any],
+    *,
+    use_relative_action: bool,
+) -> bool:
+    state_keys = modality_config.get("state", {}).get("modality_keys", [])
+    for key in state_keys:
+        stats = raw_stats.get("state", {}).get(key, {})
+        if "q01" not in stats or "q99" not in stats:
+            return False
+
+    action_cfg = modality_config.get("action", {})
+    action_keys = action_cfg.get("modality_keys", [])
+    action_configs = action_cfg.get("action_configs", [])
+    for idx, key in enumerate(action_keys):
+        cfg = action_configs[idx] if idx < len(action_configs) else {}
+        is_relative = (
+            use_relative_action and isinstance(cfg, dict) and config_value(cfg.get("rep")) == "relative"
+        )
+        if is_relative:
+            continue
+        stats = raw_stats.get("action", {}).get(key, {})
+        if "q01" not in stats or "q99" not in stats:
+            return False
+    return True
+
+
+def _build_n1_7_relative_action_processor_assets(
+    config: GrootConfig,
+    dataset_stats: dict[str, dict[str, Any]] | None,
+    dataset_meta: Any | None,
+    *,
+    base_assets: _GrootN17CheckpointProcessorAssets | None = None,
+) -> _GrootN17CheckpointProcessorAssets | None:
+    if not config.use_relative_actions or not dataset_stats:
+        return None
+
+    try:
+        action_dim = int(config.output_features[ACTION].shape[0])
+    except Exception:
+        return None
+
+    action_names = _resolve_action_feature_names_from_dataset_meta(dataset_meta)
+    if not action_names:
+        return None
+
+    groups = _infer_n1_7_action_groups(
+        action_names,
+        action_dim=action_dim,
+        exclude_joints=list(config.relative_exclude_joints or []),
+    )
+    if not groups or not any(group.relative for group in groups):
+        return None
+
+    meta_stats = getattr(dataset_meta, "stats", None) or {}
+    state_stats = (meta_stats.get(OBS_STATE) if isinstance(meta_stats, dict) else None) or dataset_stats.get(
+        OBS_STATE, {}
+    )
+    absolute_action_stats = (
+        meta_stats.get(ACTION) if isinstance(meta_stats, dict) else None
+    ) or dataset_stats.get(ACTION, {})
+    relative_action_stats = dataset_stats.get(ACTION, {})
+    if not state_stats or not absolute_action_stats or not relative_action_stats:
+        return None
+
+    raw_stats: dict[str, Any] = {
+        "state": _group_stats_by_action_groups(state_stats, groups),
+        "action": _group_stats_by_action_groups(absolute_action_stats, groups),
+        "relative_action": {
+            group.key: _slice_stats_entry(relative_action_stats, group.indices)
+            for group in groups
+            if group.relative
+        },
+    }
+
+    action_configs = [
+        {
+            "rep": "RELATIVE" if group.relative else "ABSOLUTE",
+            "type": "NON_EEF",
+            "format": "DEFAULT",
+            "state_key": None,
+        }
+        for group in groups
+    ]
+    action_horizon = min(config.chunk_size, 40)
+    modality_config: dict[str, Any] = {
+        "state": {"modality_keys": [group.key for group in groups]},
+        "action": {
+            "modality_keys": [group.key for group in groups],
+            "action_configs": action_configs,
+            "delta_indices": list(range(action_horizon)),
+        },
+    }
+    video_modality_keys = (
+        base_assets.video_modality_keys if base_assets is not None else None
+    ) or _resolve_visual_modality_keys_from_dataset_meta(dataset_meta)
+    if video_modality_keys:
+        modality_config["video"] = {
+            "modality_keys": list(video_modality_keys),
+            "delta_indices": [0],
+        }
+
+    use_percentiles = _grouped_stats_support_percentiles(raw_stats, modality_config, use_relative_action=True)
+    flat_stats = {
+        OBS_STATE: flatten_n1_7_modality_stats(
+            embodiment_stats=raw_stats,
+            embodiment_config=modality_config,
+            modality="state",
+            use_percentiles=use_percentiles,
+            use_relative_action=True,
+        ),
+        ACTION: flatten_n1_7_modality_stats(
+            embodiment_stats=raw_stats,
+            embodiment_config=modality_config,
+            modality="action",
+            use_percentiles=use_percentiles,
+            use_relative_action=True,
+        ),
+    }
+
+    return _GrootN17CheckpointProcessorAssets(
+        stats=flat_stats,
+        raw_stats=raw_stats,
+        modality_config=modality_config,
+        embodiment_mapping=base_assets.embodiment_mapping
+        if base_assets is not None
+        else dict(N1_7_EMBODIMENT_MAPPING),
+        formalize_language=base_assets.formalize_language if base_assets is not None else True,
+        valid_action_horizon=action_horizon,
+        max_action_horizon=action_horizon,
+        video_horizon=base_assets.video_horizon if base_assets is not None else None,
+        use_percentiles=use_percentiles,
+        use_relative_action=True,
+        clip_outliers=base_assets.clip_outliers if base_assets is not None else True,
+        video_modality_keys=video_modality_keys,
+        image_crop_size=base_assets.image_crop_size if base_assets is not None else None,
+        image_target_size=base_assets.image_target_size if base_assets is not None else None,
+        shortest_image_edge=base_assets.shortest_image_edge if base_assets is not None else None,
+        crop_fraction=base_assets.crop_fraction if base_assets is not None else None,
+        use_albumentations=base_assets.use_albumentations if base_assets is not None else False,
+    )
+
+
 def make_groot_pre_post_processors(
-    config: GrootConfig, dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None
+    config: GrootConfig,
+    dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
+    dataset_meta: Any | None = None,
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
@@ -576,7 +1066,29 @@ def make_groot_pre_post_processors(
         Tuple of (preprocessor, postprocessor) pipelines
     """
 
+    dataset_meta = dataset_meta or getattr(config, "_runtime_dataset_meta", None)
     checkpoint_assets = _load_n1_7_checkpoint_processor_assets(config)
+    checkpoint_stats = checkpoint_assets.stats if checkpoint_assets is not None else None
+    checkpoint_has_stats = has_modality_stats(checkpoint_stats)
+    if config.use_relative_actions and not checkpoint_has_stats:
+        relative_dataset_stats = dataset_stats
+        if not _stats_preserve_action_horizon(relative_dataset_stats):
+            relative_dataset_stats = _make_relative_action_training_stats_from_dataset_meta(config, dataset_meta)
+        relative_assets = _build_n1_7_relative_action_processor_assets(
+            config,
+            relative_dataset_stats,
+            dataset_meta,
+            base_assets=checkpoint_assets,
+        )
+        if relative_assets is None:
+            raise ValueError(
+                "GR00T relative-action training requires horizon-preserving relative action statistics. "
+                "Pass dataset_meta with a local LeRobot dataset root, or pass precomputed relative dataset_stats."
+            )
+        checkpoint_assets = relative_assets
+        checkpoint_stats = checkpoint_assets.stats
+        checkpoint_has_stats = has_modality_stats(checkpoint_stats)
+
     action_horizon = (
         checkpoint_assets.max_action_horizon
         if checkpoint_assets is not None and checkpoint_assets.max_action_horizon is not None
@@ -587,8 +1099,6 @@ def make_groot_pre_post_processors(
         if checkpoint_assets is not None and checkpoint_assets.valid_action_horizon is not None
         else action_horizon
     )
-    checkpoint_stats = checkpoint_assets.stats if checkpoint_assets is not None else None
-    checkpoint_has_stats = has_modality_stats(checkpoint_stats)
     padded_stats = checkpoint_stats if checkpoint_has_stats else (dataset_stats or {})
     embodiment_mapping = (
         checkpoint_assets.embodiment_mapping
@@ -618,6 +1128,7 @@ def make_groot_pre_post_processors(
         clip_outliers=clip_outliers,
         video_modality_keys=video_modality_keys,
         raw_stats=checkpoint_assets.raw_stats if checkpoint_assets is not None else None,
+        use_percentiles=checkpoint_assets.use_percentiles if checkpoint_assets is not None else False,
         modality_config=checkpoint_assets.modality_config if checkpoint_assets is not None else None,
     )
 
@@ -654,6 +1165,17 @@ def make_groot_pre_post_processors(
         ),
         DeviceProcessorStep(device=config.device),
     ]
+    uses_native_relative_actions = bool(
+        checkpoint_assets is not None and checkpoint_assets.use_relative_action
+    )
+    relative_step: RelativeActionsProcessorStep | None = None
+    if config.use_relative_actions and not uses_native_relative_actions:
+        relative_step = RelativeActionsProcessorStep(
+            enabled=True,
+            exclude_joints=list(config.relative_exclude_joints or []),
+            action_names=_resolve_action_feature_names_from_dataset_meta(dataset_meta),
+        )
+        input_steps.insert(2, relative_step)
 
     if checkpoint_assets is not None and not checkpoint_has_stats and not has_modality_stats(padded_stats):
         raise ValueError(
@@ -686,10 +1208,10 @@ def make_groot_pre_post_processors(
             action_decode_transform=config.action_decode_transform,
         )
 
-    output_steps: list[ProcessorStep] = [
-        action_decode_step,
-        DeviceProcessorStep(device="cpu"),
-    ]
+    output_steps: list[ProcessorStep] = [action_decode_step]
+    if relative_step is not None:
+        output_steps.append(AbsoluteActionsProcessorStep(enabled=True, relative_step=relative_step))
+    output_steps.append(DeviceProcessorStep(device="cpu"))
 
     return (
         PolicyProcessorPipeline[dict[str, Any], dict[str, Any]](
@@ -899,6 +1421,7 @@ class GrootN17PackInputsStep(ProcessorStep):
     normalize_min_max: bool = True
     stats: dict[str, dict[str, Any]] | None = None
     clip_outliers: bool = True
+    use_percentiles: bool = False
     video_modality_keys: list[str] | None = None
     raw_stats: dict[str, Any] | None = None
     modality_config: dict[str, Any] | None = None
@@ -965,9 +1488,159 @@ class GrootN17PackInputsStep(ProcessorStep):
                 )
         return ordered
 
+    def _state_groups_from_tensor(self, state: torch.Tensor) -> dict[str, torch.Tensor]:
+        if self.modality_config is None or self.raw_stats is None:
+            return {}
+        state_config = self.modality_config.get("state", {})
+        if not isinstance(state_config, dict):
+            return {}
+        state_keys = state_config.get("modality_keys", [])
+        if not isinstance(state_keys, list):
+            return {}
+
+        grouped: dict[str, torch.Tensor] = {}
+        start_idx = 0
+        for key in state_keys:
+            if not isinstance(key, str):
+                continue
+            key_stats = self.raw_stats.get("state", {}).get(key, {})
+            dim = stat_dim_from_entry(key_stats) if isinstance(key_stats, dict) else 0
+            if dim <= 0:
+                continue
+            grouped[key] = state[:, start_idx : start_idx + dim]
+            start_idx += dim
+        return grouped
+
+    def _convert_relative_action_groups_for_training(
+        self, action: torch.Tensor, state: torch.Tensor
+    ) -> torch.Tensor:
+        if self.modality_config is None or self.raw_stats is None:
+            return action
+
+        action_config = self.modality_config.get("action", {})
+        if not isinstance(action_config, dict):
+            return action
+        action_keys = action_config.get("modality_keys", [])
+        action_configs = action_config.get("action_configs", [])
+        if not isinstance(action_keys, list) or not isinstance(action_configs, list):
+            return action
+
+        state_groups = self._state_groups_from_tensor(state)
+        if not state_groups:
+            return action
+
+        converted = action
+        start_idx = 0
+        cloned = False
+        for idx, key in enumerate(action_keys):
+            if not isinstance(key, str):
+                continue
+            key_stats = self.raw_stats.get("action", {}).get(key, {})
+            dim = stat_dim_from_entry(key_stats) if isinstance(key_stats, dict) else 0
+            if dim <= 0:
+                continue
+            end_idx = start_idx + dim
+            if end_idx > action.shape[-1]:
+                break
+
+            cfg = (
+                action_configs[idx]
+                if idx < len(action_configs) and isinstance(action_configs[idx], dict)
+                else {}
+            )
+            if config_value(cfg.get("rep")) == "relative":
+                action_type = config_value(cfg.get("type"))
+                if action_type != "non_eef":
+                    raise ValueError(f"Unsupported relative N1.7 action config for '{key}': {cfg}")
+                state_key = cfg.get("state_key") or key
+                reference = state_groups.get(state_key)
+                if reference is None:
+                    raise KeyError(f"Missing raw state group '{state_key}' for relative N1.7 action '{key}'")
+                if reference.shape[-1] != dim:
+                    raise ValueError(
+                        f"Relative N1.7 action group '{key}' has dim {dim}, but state group "
+                        f"'{state_key}' has dim {reference.shape[-1]}."
+                    )
+                if not cloned:
+                    converted = action.clone()
+                    cloned = True
+                converted[..., start_idx:end_idx] -= reference[:, None, :]
+
+            start_idx = end_idx
+
+        return converted
+
+    def _normalize_action_groups_for_training(self, action: torch.Tensor) -> torch.Tensor | None:
+        if self.modality_config is None or self.raw_stats is None:
+            return None
+
+        action_config = self.modality_config.get("action", {})
+        if not isinstance(action_config, dict):
+            return None
+        action_keys = action_config.get("modality_keys", [])
+        action_configs = action_config.get("action_configs", [])
+        if not isinstance(action_keys, list) or not isinstance(action_configs, list):
+            return None
+
+        normalized_groups: list[torch.Tensor] = []
+        start_idx = 0
+        for idx, key in enumerate(action_keys):
+            if not isinstance(key, str):
+                continue
+            cfg = (
+                action_configs[idx]
+                if idx < len(action_configs) and isinstance(action_configs[idx], dict)
+                else {}
+            )
+            is_relative = config_value(cfg.get("rep")) == "relative"
+            stats_modality = "relative_action" if is_relative else "action"
+            key_stats = self.raw_stats.get(stats_modality, {}).get(key, {})
+            dim = stat_dim_from_entry(key_stats) if isinstance(key_stats, dict) else 0
+            if dim <= 0:
+                continue
+            end_idx = start_idx + dim
+            if end_idx > action.shape[-1]:
+                return None
+
+            min_v, max_v = _n1_7_decode_stats_for_action(
+                self.raw_stats,
+                key,
+                cfg,
+                use_relative_action=True,
+                use_percentiles=self.use_percentiles,
+            )
+            group = action[..., start_idx:end_idx]
+            min_t = torch.as_tensor(min_v, dtype=group.dtype, device=group.device)
+            max_t = torch.as_tensor(max_v, dtype=group.dtype, device=group.device)
+            if min_t.ndim == 1:
+                min_t = min_t.view(1, 1, -1)
+                max_t = max_t.view(1, 1, -1)
+            elif min_t.ndim == 2:
+                if group.shape[1] > min_t.shape[0]:
+                    return None
+                min_t = min_t[: group.shape[1]].unsqueeze(0)
+                max_t = max_t[: group.shape[1]].unsqueeze(0)
+            else:
+                return None
+
+            denom = max_t - min_t
+            mask = denom != 0
+            safe_denom = torch.where(mask, denom, torch.ones_like(denom))
+            normalized = torch.where(mask, 2 * (group - min_t) / safe_denom - 1, torch.zeros_like(group))
+            if self.clip_outliers:
+                normalized = normalized.clamp(-1.0, 1.0)
+            normalized_groups.append(normalized)
+            start_idx = end_idx
+
+        if not normalized_groups or start_idx != action.shape[-1]:
+            return None
+        return torch.cat(normalized_groups, dim=-1)
+
+
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         obs = transition.get(TransitionKey.OBSERVATION, {}) or {}
         comp = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}) or {}
+        raw_state_for_action: torch.Tensor | None = None
 
         def _align_vec(vec: Any, target_dim: int, *, default: float) -> torch.Tensor:
             t = torch.as_tensor(vec)
@@ -1052,6 +1725,7 @@ class GrootN17PackInputsStep(ProcessorStep):
             if dim > self.max_state_dim:
                 raise ValueError(f"State dimension {dim} exceeds max_state_dim {self.max_state_dim}.")
             _cache_raw_state(state)
+            raw_state_for_action = state
             if self.normalize_min_max:
                 state = _min_max_norm(state, OBS_STATE)
             state = state.unsqueeze(1)
@@ -1074,9 +1748,15 @@ class GrootN17PackInputsStep(ProcessorStep):
                 raise ValueError(f"Action horizon {horizon} exceeds action_horizon {self.action_horizon}.")
             if dim > self.max_action_dim:
                 raise ValueError(f"Action dimension {dim} exceeds max_action_dim {self.max_action_dim}.")
+            if raw_state_for_action is not None:
+                action = self._convert_relative_action_groups_for_training(action, raw_state_for_action)
             if self.normalize_min_max:
-                flat = _min_max_norm(action.reshape(bsz * horizon, dim), ACTION)
-                action = flat.view(bsz, horizon, dim)
+                normalized_action = self._normalize_action_groups_for_training(action)
+                if normalized_action is not None:
+                    action = normalized_action
+                else:
+                    flat = _min_max_norm(action.reshape(bsz * horizon, dim), ACTION)
+                    action = flat.view(bsz, horizon, dim)
             valid_dim = min(dim, self.max_action_dim)
             valid_horizon = min(horizon, self.valid_action_horizon, self.action_horizon)
             if dim < self.max_action_dim:
@@ -1094,13 +1774,34 @@ class GrootN17PackInputsStep(ProcessorStep):
                 )
                 action = torch.cat([action, pad], dim=1)
                 horizon = self.action_horizon
-            if valid_horizon < horizon:
+            horizon_valid = torch.zeros(bsz, horizon, dtype=torch.bool, device=action.device)
+            horizon_valid[:, :valid_horizon] = True
+            action_is_pad = comp.get(f"{ACTION}_is_pad")
+            if action_is_pad is None:
+                action_is_pad = comp.get("action_horizon_is_pad")
+            if action_is_pad is not None:
+                action_pad = torch.as_tensor(action_is_pad, dtype=torch.bool, device=action.device)
+                if action_pad.ndim == 1:
+                    if bsz == 1 and action_pad.numel() == horizon:
+                        action_pad = action_pad.unsqueeze(0)
+                    elif horizon == 1 and action_pad.numel() == bsz:
+                        action_pad = action_pad.view(bsz, 1)
+                if action_pad.ndim != 2 or action_pad.shape[0] != bsz:
+                    raise ValueError(
+                        "action_is_pad must have shape (B, T) matching the action batch; "
+                        f"got {tuple(action_pad.shape)} for action {tuple(action.shape)}."
+                    )
+                pad_horizon = min(horizon, action_pad.shape[1])
+                horizon_valid[:, :pad_horizon] &= ~action_pad[:, :pad_horizon]
+
+            if valid_horizon < horizon or action_is_pad is not None:
                 action = action.clone()
                 action[:, valid_horizon:, :] = 0
+                action = action * horizon_valid.unsqueeze(-1).to(dtype=action.dtype)
             action_mask = torch.zeros(
                 bsz, horizon, self.max_action_dim, dtype=torch.float32, device=action.device
             )
-            action_mask[:, :valid_horizon, :valid_dim] = 1.0
+            action_mask[:, :, :valid_dim] = horizon_valid.unsqueeze(-1).to(dtype=action_mask.dtype)
             transition[TransitionKey.ACTION] = action
             comp["action_mask"] = action_mask
 
@@ -1134,6 +1835,7 @@ class GrootN17PackInputsStep(ProcessorStep):
             "embodiment_mapping": self.embodiment_mapping,
             "normalize_min_max": self.normalize_min_max,
             "clip_outliers": self.clip_outliers,
+            "use_percentiles": self.use_percentiles,
             "video_modality_keys": self.video_modality_keys,
             "raw_stats": self.raw_stats,
             "modality_config": self.modality_config,

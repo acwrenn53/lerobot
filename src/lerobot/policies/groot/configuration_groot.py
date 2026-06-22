@@ -324,6 +324,11 @@ class GrootConfig(PreTrainedConfig):
     # Set to True only after installing a flash-attn build matching your torch/CUDA env.
     use_flash_attention: bool = False
 
+    # Enable GR00T-style state-relative action chunks. Prefer deriving action representation from
+    # embodiment metadata; relative_exclude_joints is a flat-vector override for datasets without it.
+    use_relative_actions: bool = False
+    relative_exclude_joints: list[str] = field(default_factory=list)
+
     # Training parameters
     optimizer_lr: float = 1e-4
     optimizer_betas: tuple[float, float] = (0.95, 0.999)

@@ -23,13 +23,13 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 import torch
+from safetensors.torch import load_file
 from torch import nn
 
 from lerobot.configs import FeatureType, PolicyFeature
 from lerobot.policies.factory import make_policy_config, make_pre_post_processors
 from lerobot.policies.groot.configuration_groot import (
     GROOT_ACTION_DECODE_TRANSFORM_LIBERO,
-    GROOT_N1_7,
     GROOT_N1_7_BASE_MODEL,
     GrootConfig,
     infer_groot_n1_7_action_execution_horizon,
@@ -41,6 +41,7 @@ from lerobot.policies.groot.processor_groot import (
     GrootN17ActionDecodeStep,
     GrootN17PackInputsStep,
     GrootN17VLMEncodeStep,
+    _make_relative_action_training_stats,
     _transform_n1_7_image_for_vlm_albumentations,
     make_groot_pre_post_processors,
 )
@@ -65,11 +66,10 @@ def _groot_features(
     )
 
 
-def _groot_config(model_version: str = GROOT_N1_7) -> GrootConfig:
+def _groot_config() -> GrootConfig:
     input_features, output_features = _groot_features(state_dim=8, action_dim=7)
     kwargs = {"action_decode_transform": GROOT_ACTION_DECODE_TRANSFORM_LIBERO}
     return GrootConfig(
-        model_version=model_version,
         input_features=input_features,
         output_features=output_features,
         device="cpu",
@@ -81,7 +81,6 @@ def _groot_config(model_version: str = GROOT_N1_7) -> GrootConfig:
 def _raw_n1_7_libero_config(model_path) -> GrootConfig:
     input_features, output_features = _groot_features(state_dim=8, action_dim=7)
     return GrootConfig(
-        model_version=GROOT_N1_7,
         base_model_path=str(model_path),
         embodiment_tag="libero_sim",
         input_features=input_features,
@@ -349,7 +348,6 @@ class _DummyGrootModel(nn.Module):
 def test_groot_defaults_use_n1_7():
     config = GrootConfig(device="cpu")
 
-    assert config.model_version == GROOT_N1_7
     assert config.base_model_path == GROOT_N1_7_BASE_MODEL
     assert config.max_state_dim == 132
     assert config.max_action_dim == 132
@@ -360,7 +358,6 @@ def test_groot_defaults_use_n1_7():
 
 def test_groot_n1_7_accepts_named_action_decode_transform():
     config = GrootConfig(
-        model_version=GROOT_N1_7,
         action_decode_transform="libero",
         device="cpu",
     )
@@ -372,22 +369,14 @@ def test_groot_n1_7_accepts_named_action_decode_transform():
 def test_groot_n1_7_rejects_legacy_libero_gripper_action_decode_transform(legacy_transform):
     with pytest.raises(ValueError, match="Unsupported GR00T N1.7 action decode transform"):
         GrootConfig(
-            model_version=GROOT_N1_7,
             action_decode_transform=legacy_transform,
             device="cpu",
         )
 
 
-@pytest.mark.parametrize("legacy_version", ["n1.5", "n1_5", "n15", "1.5"])
-def test_groot_rejects_n1_5_aliases(legacy_version):
-    with pytest.raises(ValueError, match="Unsupported GR00T model_version"):
-        GrootConfig(model_version=legacy_version, device="cpu")
-
-
 def test_groot_config_rejects_mismatched_n1_5_path_for_n1_7():
     with pytest.raises(ValueError, match="does not match base_model_path"):
         GrootConfig(
-            model_version=GROOT_N1_7,
             base_model_path="nvidia/GR00T-N1.5-3B",
             device="cpu",
         )
@@ -396,10 +385,9 @@ def test_groot_config_rejects_mismatched_n1_5_path_for_n1_7():
 def test_groot_n1_7_can_be_selected_from_policy_config_factory_without_external_gr00t():
     sys.modules.pop("gr00t", None)
 
-    config = make_policy_config("groot", model_version=GROOT_N1_7, device="cpu")
+    config = make_policy_config("groot", device="cpu")
 
     assert isinstance(config, GrootConfig)
-    assert config.model_version == GROOT_N1_7
     assert "gr00t" not in sys.modules
 
 
@@ -415,7 +403,7 @@ def test_groot_predict_action_chunk_forwards_n1_7_rtc_prefix(monkeypatch):
 
     dummy_model = _DummyGrootModel()
     monkeypatch.setattr(GR00TN17, "from_pretrained", classmethod(lambda cls, **kwargs: dummy_model))
-    config = _groot_config(GROOT_N1_7)
+    config = _groot_config()
     policy = GrootPolicy(config)
     policy.config.rtc_config = SimpleNamespace(execution_horizon=6)
 
@@ -444,7 +432,7 @@ def test_groot_predict_action_chunk_strips_padded_n1_7_rtc_prefix(monkeypatch):
 
     dummy_model = _DummyGrootModel()
     monkeypatch.setattr(GR00TN17, "from_pretrained", classmethod(lambda cls, **kwargs: dummy_model))
-    config = _groot_config(GROOT_N1_7)
+    config = _groot_config()
     policy = GrootPolicy(config)
     policy.config.rtc_config = SimpleNamespace(execution_horizon=6)
 
@@ -488,7 +476,6 @@ def test_groot_n1_7_predict_action_chunk_truncates_to_checkpoint_valid_horizon(t
     monkeypatch.setattr(GR00TN17, "from_pretrained", classmethod(lambda cls, **kwargs: HorizonModel()))
     input_features, output_features = _groot_features(state_dim=8, action_dim=7)
     config = GrootConfig(
-        model_version=GROOT_N1_7,
         base_model_path=str(model_path),
         embodiment_tag="libero_sim",
         input_features=input_features,
@@ -516,7 +503,6 @@ def test_groot_from_pretrained_rejects_mismatched_caller_config(tmp_path):
     # so construction itself raises before from_pretrained is reached.
     with pytest.raises(ValueError, match="does not match base_model_path"):
         config = GrootConfig(
-            model_version=GROOT_N1_7,
             base_model_path="nvidia/GR00T-N1.5-3B",
             input_features=input_features,
             output_features=output_features,
@@ -532,13 +518,12 @@ def test_groot_from_pretrained_keeps_matching_caller_config(tmp_path, monkeypatc
 
     model_path = tmp_path / "GR00T-N1.7-local"
     model_path.mkdir()
-    config = _groot_config(GROOT_N1_7)
+    config = _groot_config()
 
     monkeypatch.setattr(GR00TN17, "from_pretrained", classmethod(lambda cls, **kwargs: _DummyGrootModel()))
 
     policy = GrootPolicy.from_pretrained(model_path, config=config)
 
-    assert policy.config.model_version == GROOT_N1_7
     assert policy.config.base_model_path == str(model_path)
 
 
@@ -553,7 +538,6 @@ def test_groot_from_pretrained_infers_n1_7_from_ambiguous_local_config(tmp_path,
 
     policy = GrootPolicy.from_pretrained(model_path)
 
-    assert policy.config.model_version == GROOT_N1_7
     assert policy.config.base_model_path == str(model_path)
 
 
@@ -1019,6 +1003,93 @@ def test_groot_n1_7_pack_inputs_normalizes_action_chunk_per_dimension_before_pad
     assert action_mask[0, :, 3:].sum().item() == 0
 
 
+def test_groot_n1_7_pack_inputs_trains_native_relative_groups_with_absolute_gripper():
+    step = GrootN17PackInputsStep(
+        action_horizon=2,
+        valid_action_horizon=2,
+        max_state_dim=6,
+        max_action_dim=6,
+        normalize_min_max=True,
+        clip_outliers=False,
+        stats={
+            OBS_STATE: {
+                "min": [-100.0, -100.0, -100.0, -100.0, -100.0, 0.0],
+                "max": [100.0, 100.0, 100.0, 100.0, 100.0, 100.0],
+            },
+            ACTION: {
+                "min": [-10.0, -10.0, -10.0, -10.0, -10.0, 0.0],
+                "max": [10.0, 10.0, 10.0, 10.0, 10.0, 100.0],
+            },
+        },
+        raw_stats={
+            "state": {
+                "single_arm": {"min": [-100.0] * 5, "max": [100.0] * 5},
+                "gripper": {"min": [0.0], "max": [100.0]},
+            },
+            "action": {
+                "single_arm": {"min": [-100.0] * 5, "max": [100.0] * 5},
+                "gripper": {"min": [0.0], "max": [100.0]},
+            },
+            "relative_action": {
+                "single_arm": {"min": [-10.0] * 5, "max": [10.0] * 5},
+            },
+        },
+        modality_config={
+            "state": {"modality_keys": ["single_arm", "gripper"]},
+            "action": {
+                "modality_keys": ["single_arm", "gripper"],
+                "action_configs": [
+                    {"rep": "RELATIVE", "type": "NON_EEF", "format": "DEFAULT", "state_key": None},
+                    {"rep": "ABSOLUTE", "type": "NON_EEF", "format": "DEFAULT", "state_key": None},
+                ],
+                "delta_indices": [0, 1],
+            },
+        },
+    )
+    transition = {
+        TransitionKey.OBSERVATION: {
+            OBS_STATE: torch.tensor([[10.0, 20.0, 30.0, 40.0, 50.0, 25.0]]),
+        },
+        TransitionKey.ACTION: torch.tensor(
+            [
+                [
+                    [12.0, 18.0, 35.0, 30.0, 55.0, 0.0],
+                    [9.0, 21.0, 27.0, 43.0, 50.0, 100.0],
+                ]
+            ]
+        ),
+        TransitionKey.COMPLEMENTARY_DATA: {"task": ["Move"]},
+    }
+
+    output = step(transition)
+
+    expected_actions = torch.tensor(
+        [
+            [
+                [0.2, -0.2, 0.5, -1.0, 0.5, -1.0],
+                [-0.1, 0.1, -0.3, 0.3, 0.0, 1.0],
+            ]
+        ]
+    )
+    torch.testing.assert_close(output[TransitionKey.ACTION], expected_actions)
+
+
+def test_groot_policy_ignores_rtc_leftovers_for_relative_actions():
+    policy = object.__new__(GrootPolicy)
+    policy.config = SimpleNamespace(use_relative_actions=True)
+    policy._warned_native_relative_rtc_prefix_disabled = False
+    inputs = {"state": torch.zeros(1, 1, 132)}
+
+    output_inputs, options = policy._prepare_n1_7_rtc_inputs(
+        inputs,
+        inference_delay=1,
+        prev_chunk_left_over=torch.ones(8, 6),
+    )
+
+    assert output_inputs is inputs
+    assert options is None
+
+
 def test_groot_n1_7_pack_inputs_adds_inference_action_horizon_mask():
     step = GrootN17PackInputsStep(
         action_horizon=40,
@@ -1041,6 +1112,49 @@ def test_groot_n1_7_pack_inputs_adds_inference_action_horizon_mask():
     assert action_mask[:, :16].sum().item() == 32
     assert action_mask[:, 16:].sum().item() == 0
     assert output[TransitionKey.COMPLEMENTARY_DATA]["embodiment_id"].dtype == torch.int32
+
+
+def test_groot_n1_7_pack_inputs_masks_padded_action_horizons():
+    step = GrootN17PackInputsStep(
+        action_horizon=4,
+        valid_action_horizon=4,
+        max_state_dim=3,
+        max_action_dim=5,
+        normalize_min_max=False,
+    )
+    action = torch.arange(2 * 4 * 3, dtype=torch.float32).view(2, 4, 3)
+    action_is_pad = torch.tensor(
+        [
+            [False, True, False, True],
+            [True, False, False, False],
+        ]
+    )
+    transition = {
+        TransitionKey.OBSERVATION: {
+            OBS_STATE: torch.zeros(2, 3),
+        },
+        TransitionKey.ACTION: action.clone(),
+        TransitionKey.COMPLEMENTARY_DATA: {
+            "task": ["Move", "Place"],
+            "action_is_pad": action_is_pad,
+        },
+    }
+
+    output = step(transition)
+
+    expected_valid = (~action_is_pad).float()
+    action_mask = output[TransitionKey.COMPLEMENTARY_DATA]["action_mask"]
+    assert action_mask.shape == (2, 4, 5)
+    torch.testing.assert_close(action_mask[..., :3], expected_valid.unsqueeze(-1).expand(-1, -1, 3))
+    assert action_mask[..., 3:].sum().item() == 0
+
+    packed_action = output[TransitionKey.ACTION]
+    assert packed_action.shape == (2, 4, 5)
+    torch.testing.assert_close(packed_action[0, 0, :3], action[0, 0])
+    torch.testing.assert_close(packed_action[0, 2, :3], action[0, 2])
+    assert packed_action[0, 1].abs().sum().item() == 0
+    assert packed_action[0, 3].abs().sum().item() == 0
+    assert packed_action[1, 0].abs().sum().item() == 0
 
 
 def test_groot_n1_7_pack_inputs_orders_video_by_checkpoint_modality_keys():
@@ -1338,7 +1452,6 @@ def test_groot_from_pretrained_rejects_caller_config_mismatch_from_local_config(
     # so construction itself raises before from_pretrained is reached.
     with pytest.raises(ValueError, match="does not match base_model_path"):
         config = GrootConfig(
-            model_version=GROOT_N1_7,
             base_model_path="nvidia/GR00T-N1.5-3B",
             input_features=input_features,
             output_features=output_features,
@@ -1351,7 +1464,7 @@ def test_groot_from_pretrained_rejects_caller_config_mismatch_from_local_config(
 
 def test_groot_n1_7_processors_are_registered_lazily_without_external_gr00t():
     sys.modules.pop("gr00t", None)
-    config = _groot_config(GROOT_N1_7)
+    config = _groot_config()
 
     preprocessor, _ = make_groot_pre_post_processors(config)
     step_types = {type(step) for step in preprocessor.steps}
@@ -1690,7 +1803,7 @@ def test_groot_n1_7_processor_uses_qwen_component_assets(monkeypatch):
 
 
 def test_groot_n1_7_saved_processors_reload_through_factory(tmp_path):
-    config = _groot_config(GROOT_N1_7)
+    config = _groot_config()
     dataset_stats = {
         OBS_STATE: {
             "min": torch.zeros(8),
@@ -1722,7 +1835,7 @@ def test_groot_n1_7_saved_processors_reload_through_factory(tmp_path):
 
 
 def test_groot_n1_7_saved_processors_reload_through_factory_preserves_saved_stats(tmp_path):
-    config = _groot_config(GROOT_N1_7)
+    config = _groot_config()
     saved_stats = {
         OBS_STATE: {
             "min": torch.full((8,), -2.0),
@@ -1752,6 +1865,396 @@ def test_groot_n1_7_saved_processors_reload_through_factory_preserves_saved_stat
     assert unpack_step.env_action_dim == 7
 
 
+def test_groot_n1_7_relative_action_training_processors_save_native_grouped_stats(tmp_path):
+    input_features, output_features = _groot_features(state_dim=6, action_dim=6)
+    action_names = [
+        "shoulder_pan.pos",
+        "shoulder_lift.pos",
+        "elbow_flex.pos",
+        "wrist_flex.pos",
+        "wrist_roll.pos",
+        "gripper.pos",
+    ]
+    config = GrootConfig(
+        input_features=input_features,
+        output_features=output_features,
+        device="cpu",
+        use_bf16=False,
+        action_decode_transform=None,
+        use_relative_actions=True,
+        relative_exclude_joints=["gripper"],
+    )
+    absolute_dataset_stats = {
+        OBS_STATE: {
+            "min": torch.tensor([-50.0, -60.0, -70.0, -80.0, -90.0, 0.0]),
+            "max": torch.tensor([50.0, 60.0, 70.0, 80.0, 90.0, 100.0]),
+        },
+        ACTION: {
+            "min": torch.tensor([-100.0, -110.0, -120.0, -130.0, -140.0, 0.0]),
+            "max": torch.tensor([100.0, 110.0, 120.0, 130.0, 140.0, 100.0]),
+        },
+    }
+    samples = [
+        {
+            OBS_STATE: torch.tensor([10.0, 20.0, 30.0, 40.0, 50.0, 0.0]),
+            ACTION: torch.tensor(
+                [
+                    [8.0, 17.0, 26.0, 35.0, 44.0, 0.0],
+                    [12.0, 23.0, 34.0, 45.0, 56.0, 100.0],
+                ]
+            ),
+        },
+        {
+            OBS_STATE: torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 50.0]),
+            ACTION: torch.tensor(
+                [
+                    [-1.0, -2.0, -3.0, -4.0, -5.0, 25.0],
+                    [1.0, 2.0, 3.0, 4.0, 5.0, 75.0],
+                ]
+            ),
+        },
+    ]
+
+    class _RelativeStatsDataset:
+        meta = SimpleNamespace(
+            stats=absolute_dataset_stats,
+            features={ACTION: {"names": action_names}},
+        )
+
+        def __len__(self):
+            return len(samples)
+
+        def __getitem__(self, idx):
+            return samples[idx]
+
+    relative_dataset_stats = _make_relative_action_training_stats(
+        _RelativeStatsDataset(),
+        exclude_joints=["gripper"],
+        action_names=action_names,
+        preserve_action_horizon=True,
+    )
+    expected_relative_action_stats = {
+        "min": torch.tensor([-2.0, -3.0, -4.0, -5.0, -6.0, 1.0, 2.0, 3.0, 4.0, 5.0, 0.0]),
+        "max": torch.tensor([-1.0, -2.0, -3.0, -4.0, -5.0, 2.0, 3.0, 4.0, 5.0, 6.0, 100.0]),
+    }
+
+    preprocessor, postprocessor = make_groot_pre_post_processors(
+        config, dataset_stats=relative_dataset_stats, dataset_meta=_RelativeStatsDataset.meta
+    )
+    preprocessor.save_pretrained(tmp_path)
+    postprocessor.save_pretrained(tmp_path)
+
+    preprocessor_config = json.loads((tmp_path / "policy_preprocessor.json").read_text())
+    assert not any(
+        step.get("registry_name") == "relative_actions_processor" for step in preprocessor_config["steps"]
+    )
+    pack_entry = next(
+        step
+        for step in preprocessor_config["steps"]
+        if step.get("registry_name") == "groot_n1_7_pack_inputs_v1"
+    )
+    pack_config = pack_entry["config"]
+    assert pack_config["modality_config"]["action"]["modality_keys"] == ["single_arm", "gripper"]
+    assert pack_config["modality_config"]["action"]["action_configs"] == [
+        {"rep": "RELATIVE", "type": "NON_EEF", "format": "DEFAULT", "state_key": None},
+        {"rep": "ABSOLUTE", "type": "NON_EEF", "format": "DEFAULT", "state_key": None},
+    ]
+    assert pack_config["raw_stats"]["relative_action"]["single_arm"]["min"] == [
+        [-2.0, -3.0, -4.0, -5.0, -6.0],
+        [1.0, 2.0, 3.0, 4.0, 5.0],
+    ]
+    assert pack_config["raw_stats"]["relative_action"]["single_arm"]["count"] == [2, 2]
+    assert pack_config["raw_stats"]["action"]["gripper"]["min"] == [0.0]
+    assert pack_config["raw_stats"]["action"]["gripper"]["max"] == [100.0]
+
+    pack_state = load_file(tmp_path / pack_entry["state_file"])
+    torch.testing.assert_close(pack_state[f"{ACTION}.min"], expected_relative_action_stats["min"])
+    torch.testing.assert_close(pack_state[f"{ACTION}.max"], expected_relative_action_stats["max"])
+
+    postprocessor_config = json.loads((tmp_path / "policy_postprocessor.json").read_text())
+    assert not any(
+        step.get("registry_name") == "absolute_actions_processor" for step in postprocessor_config["steps"]
+    )
+    decode_entry = next(
+        step
+        for step in postprocessor_config["steps"]
+        if step.get("registry_name") == "groot_n1_7_action_decode_v1"
+    )
+    decode_config = decode_entry["config"]
+    assert decode_config["use_relative_action"] is True
+    assert decode_config["raw_stats"]["relative_action"]["single_arm"]["max"] == [
+        [-1.0, -2.0, -3.0, -4.0, -5.0],
+        [2.0, 3.0, 4.0, 5.0, 6.0],
+    ]
+    assert decode_config["raw_stats"]["relative_action"]["single_arm"]["count"] == [2, 2]
+    assert decode_config["raw_stats"]["action"]["gripper"]["max"] == [100.0]
+
+
+def test_groot_n1_7_relative_action_processors_compute_stats_from_runtime_dataset_meta(
+    monkeypatch, tmp_path
+):
+    input_features, output_features = _groot_features(state_dim=6, action_dim=6)
+    action_names = [
+        "shoulder_pan.pos",
+        "shoulder_lift.pos",
+        "elbow_flex.pos",
+        "wrist_flex.pos",
+        "wrist_roll.pos",
+        "gripper.pos",
+    ]
+    config = GrootConfig(
+        input_features=input_features,
+        output_features=output_features,
+        device="cpu",
+        use_bf16=False,
+        action_decode_transform=None,
+        chunk_size=2,
+        n_action_steps=2,
+        use_relative_actions=True,
+        relative_exclude_joints=["gripper"],
+    )
+    absolute_dataset_stats = {
+        OBS_STATE: {
+            "min": torch.tensor([-50.0, -60.0, -70.0, -80.0, -90.0, 0.0]),
+            "max": torch.tensor([50.0, 60.0, 70.0, 80.0, 90.0, 100.0]),
+        },
+        ACTION: {
+            "min": torch.tensor([-100.0, -110.0, -120.0, -130.0, -140.0, 0.0]),
+            "max": torch.tensor([100.0, 110.0, 120.0, 130.0, 140.0, 100.0]),
+        },
+    }
+    samples = [
+        {
+            OBS_STATE: torch.tensor([10.0, 20.0, 30.0, 40.0, 50.0, 0.0]),
+            ACTION: torch.tensor(
+                [
+                    [8.0, 17.0, 26.0, 35.0, 44.0, 0.0],
+                    [12.0, 23.0, 34.0, 45.0, 56.0, 100.0],
+                ]
+            ),
+        },
+        {
+            OBS_STATE: torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 50.0]),
+            ACTION: torch.tensor(
+                [
+                    [-1.0, -2.0, -3.0, -4.0, -5.0, 25.0],
+                    [1.0, 2.0, 3.0, 4.0, 5.0, 75.0],
+                ]
+            ),
+        },
+    ]
+    runtime_meta = SimpleNamespace(
+        repo_id="local/relative",
+        root=tmp_path,
+        revision="main",
+        fps=30,
+        stats=absolute_dataset_stats,
+        features={ACTION: {"names": action_names}},
+    )
+
+    class _RelativeStatsDataset:
+        meta = runtime_meta
+
+        def __len__(self):
+            return len(samples)
+
+        def __getitem__(self, idx):
+            return samples[idx]
+
+    def _fake_lerobot_dataset(repo_id, **kwargs):
+        assert repo_id == runtime_meta.repo_id
+        assert kwargs["root"] == runtime_meta.root
+        assert kwargs["revision"] == runtime_meta.revision
+        assert kwargs["download_videos"] is False
+        assert kwargs["delta_timestamps"][ACTION] == [0.0, 1 / runtime_meta.fps]
+        return _RelativeStatsDataset()
+
+    monkeypatch.setattr("lerobot.datasets.lerobot_dataset.LeRobotDataset", _fake_lerobot_dataset)
+    config._runtime_dataset_meta = runtime_meta
+
+    preprocessor, postprocessor = make_groot_pre_post_processors(config, dataset_stats=absolute_dataset_stats)
+
+    assert not any(isinstance(step, RelativeActionsProcessorStep) for step in preprocessor.steps)
+    assert isinstance(postprocessor.steps[0], GrootN17ActionDecodeStep)
+    pack_step = next(step for step in preprocessor.steps if isinstance(step, GrootN17PackInputsStep))
+    assert pack_step.raw_stats["relative_action"]["single_arm"]["min"] == [
+        [-2.0, -3.0, -4.0, -5.0, -6.0],
+        [1.0, 2.0, 3.0, 4.0, 5.0],
+    ]
+    assert pack_step.raw_stats["relative_action"]["single_arm"]["count"] == [2, 2]
+    assert pack_step.raw_stats["action"]["gripper"]["max"] == [100.0]
+
+
+def test_groot_n1_7_generated_relative_stats_match_oss_gr00t_reference_numbers():
+    input_features, output_features = _groot_features(state_dim=6, action_dim=6)
+    action_names = [
+        "shoulder_pan.pos",
+        "shoulder_lift.pos",
+        "elbow_flex.pos",
+        "wrist_flex.pos",
+        "wrist_roll.pos",
+        "gripper.pos",
+    ]
+    config = GrootConfig(
+        input_features=input_features,
+        output_features=output_features,
+        device="cpu",
+        use_bf16=False,
+        action_decode_transform=None,
+        chunk_size=3,
+        n_action_steps=3,
+        use_relative_actions=True,
+        relative_exclude_joints=["gripper"],
+    )
+    absolute_dataset_stats = {
+        OBS_STATE: {
+            "min": torch.tensor([-20.0, -30.0, -40.0, -50.0, -60.0, 0.0]),
+            "max": torch.tensor([80.0, 70.0, 60.0, 50.0, 40.0, 100.0]),
+            "mean": torch.tensor([30.0, 20.0, 10.0, 0.0, -10.0, 50.0]),
+            "std": torch.tensor([10.0, 10.0, 10.0, 10.0, 10.0, 10.0]),
+            "q01": torch.tensor([-10.0, -20.0, -30.0, -40.0, -50.0, 10.0]),
+            "q99": torch.tensor([70.0, 60.0, 50.0, 40.0, 30.0, 90.0]),
+        },
+        ACTION: {
+            "min": torch.tensor([-5.0, -20.0, 0.0, -25.0, 10.0, 20.0]),
+            "max": torch.tensor([20.0, 30.0, 45.0, 60.0, 70.0, 90.0]),
+            "mean": torch.tensor([5.0, 5.0, 20.0, 20.0, 40.0, 55.0]),
+            "std": torch.tensor([5.0, 10.0, 10.0, 20.0, 20.0, 25.0]),
+            "q01": torch.tensor([-4.0, -19.0, 1.0, -24.0, 11.0, 20.0]),
+            "q99": torch.tensor([19.0, 29.0, 44.0, 59.0, 69.0, 90.0]),
+        },
+    }
+    state_a = torch.tensor([10.0, 20.0, 30.0, 40.0, 50.0, 25.0])
+    state_b = torch.tensor([0.0, -10.0, 10.0, -20.0, 20.0, 75.0])
+    action_a = torch.tensor(
+        [
+            [11.0, 22.0, 33.0, 44.0, 55.0, 20.0],
+            [12.0, 24.0, 36.0, 48.0, 60.0, 80.0],
+            [13.0, 26.0, 39.0, 52.0, 65.0, 90.0],
+        ]
+    )
+    action_b = torch.tensor(
+        [
+            [-1.0, -8.0, 13.0, -16.0, 25.0, 30.0],
+            [-2.0, -6.0, 16.0, -12.0, 30.0, 40.0],
+            [-3.0, -4.0, 19.0, -8.0, 35.0, 50.0],
+        ]
+    )
+    samples = [
+        {OBS_STATE: state_a, ACTION: action_a},
+        {OBS_STATE: state_b, ACTION: action_b},
+    ]
+
+    class _Dataset:
+        meta = SimpleNamespace(
+            stats=absolute_dataset_stats,
+            features={ACTION: {"names": action_names}},
+        )
+
+        def __len__(self):
+            return len(samples)
+
+        def __getitem__(self, idx):
+            return samples[idx]
+
+    relative_dataset_stats = _make_relative_action_training_stats(
+        _Dataset(),
+        exclude_joints=["gripper"],
+        action_names=action_names,
+        preserve_action_horizon=True,
+    )
+
+    # Static reference values from OSS GR00T's JointActionChunk.relative_chunking +
+    # calculate_stats_for_key path: stats are computed per chunk timestep, not
+    # flattened over all timesteps.
+    oss_arm_min = torch.tensor(
+        [
+            [-1.0, 2.0, 3.0, 4.0, 5.0],
+            [-2.0, 4.0, 6.0, 8.0, 10.0],
+            [-3.0, 6.0, 9.0, 12.0, 15.0],
+        ]
+    )
+    oss_arm_max = torch.tensor(
+        [
+            [1.0, 2.0, 3.0, 4.0, 5.0],
+            [2.0, 4.0, 6.0, 8.0, 10.0],
+            [3.0, 6.0, 9.0, 12.0, 15.0],
+        ]
+    )
+    oss_arm_mean = torch.tensor(
+        [
+            [0.0, 2.0, 3.0, 4.0, 5.0],
+            [0.0, 4.0, 6.0, 8.0, 10.0],
+            [0.0, 6.0, 9.0, 12.0, 15.0],
+        ]
+    )
+    oss_arm_std = torch.tensor(
+        [
+            [1.0, 0.0, 0.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0, 0.0, 0.0],
+        ]
+    )
+    oss_arm_q01 = torch.tensor(
+        [
+            [-0.98, 2.0, 3.0, 4.0, 5.0],
+            [-1.96, 4.0, 6.0, 8.0, 10.0],
+            [-2.94, 6.0, 9.0, 12.0, 15.0],
+        ]
+    )
+    oss_arm_q99 = torch.tensor(
+        [
+            [0.98, 2.0, 3.0, 4.0, 5.0],
+            [1.96, 4.0, 6.0, 8.0, 10.0],
+            [2.94, 6.0, 9.0, 12.0, 15.0],
+        ]
+    )
+
+    torch.testing.assert_close(torch.as_tensor(relative_dataset_stats[ACTION]["min"][:, :5]), oss_arm_min)
+    torch.testing.assert_close(torch.as_tensor(relative_dataset_stats[ACTION]["max"][:, :5]), oss_arm_max)
+    torch.testing.assert_close(torch.as_tensor(relative_dataset_stats[ACTION]["mean"][:, :5]), oss_arm_mean)
+    torch.testing.assert_close(torch.as_tensor(relative_dataset_stats[ACTION]["std"][:, :5]), oss_arm_std)
+    torch.testing.assert_close(torch.as_tensor(relative_dataset_stats[ACTION]["q01"][:, :5]), oss_arm_q01)
+    torch.testing.assert_close(torch.as_tensor(relative_dataset_stats[ACTION]["q99"][:, :5]), oss_arm_q99)
+
+    preprocessor, postprocessor = make_groot_pre_post_processors(
+        config,
+        dataset_stats=relative_dataset_stats,
+        dataset_meta=_Dataset.meta,
+    )
+    pack_step = next(step for step in preprocessor.steps if isinstance(step, GrootN17PackInputsStep))
+    decode_step = next(step for step in postprocessor.steps if isinstance(step, GrootN17ActionDecodeStep))
+
+    assert pack_step.use_percentiles is True
+    torch.testing.assert_close(
+        torch.as_tensor(pack_step.raw_stats["relative_action"]["single_arm"]["min"]),
+        oss_arm_min,
+    )
+    torch.testing.assert_close(
+        torch.as_tensor(pack_step.raw_stats["relative_action"]["single_arm"]["q99"]),
+        oss_arm_q99,
+    )
+    assert pack_step.stats[ACTION]["min"] == pytest.approx([*oss_arm_min.flatten().tolist(), 20.0])
+    assert pack_step.stats[ACTION]["max"] == pytest.approx([*oss_arm_max.flatten().tolist(), 90.0])
+
+    packed = pack_step(
+        {
+            TransitionKey.OBSERVATION: {OBS_STATE: state_a.unsqueeze(0)},
+            TransitionKey.ACTION: action_a.unsqueeze(0),
+            TransitionKey.COMPLEMENTARY_DATA: {"task": ["Move the vial"]},
+        }
+    )
+    expected_normalized = torch.tensor(
+        [
+            [1.0, 0.0, 0.0, 0.0, 0.0, -1.0],
+            [1.0, 0.0, 0.0, 0.0, 0.0, 5.0 / 7.0],
+            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        ]
+    )
+    torch.testing.assert_close(packed[TransitionKey.ACTION][0, :3, :6], expected_normalized)
+
+    decoded = decode_step({TransitionKey.ACTION: packed[TransitionKey.ACTION]})
+    torch.testing.assert_close(decoded[TransitionKey.ACTION], action_a.unsqueeze(0), atol=1e-5, rtol=1e-5)
 
 
 def test_groot_policy_selects_n1_7_model_class(monkeypatch):
@@ -1765,7 +2268,7 @@ def test_groot_policy_selects_n1_7_model_class(monkeypatch):
 
     monkeypatch.setattr(GR00TN17, "from_pretrained", classmethod(fake_from_pretrained))
 
-    policy = GrootPolicy(_groot_config(GROOT_N1_7))
+    policy = GrootPolicy(_groot_config())
 
     assert called["pretrained_model_name_or_path"] == GROOT_N1_7_BASE_MODEL
     assert isinstance(policy._groot_model, _DummyGrootModel)
@@ -1776,7 +2279,7 @@ def test_groot_policy_forwards_n1_7_qwen_inputs(monkeypatch):
 
     dummy_model = _DummyGrootModel()
     monkeypatch.setattr(GR00TN17, "from_pretrained", classmethod(lambda cls, **kwargs: dummy_model))
-    policy = GrootPolicy(_groot_config(GROOT_N1_7))
+    policy = GrootPolicy(_groot_config())
 
     batch = {
         "state": torch.zeros(2, 1, 132),
@@ -1839,7 +2342,6 @@ def test_groot_n1_7_select_action_uses_checkpoint_valid_horizon(tmp_path, monkey
     monkeypatch.setattr(GR00TN17, "from_pretrained", classmethod(lambda cls, **kwargs: HorizonModel()))
     input_features, output_features = _groot_features(state_dim=8, action_dim=7)
     config = GrootConfig(
-        model_version=GROOT_N1_7,
         base_model_path=str(model_path),
         embodiment_tag="libero_sim",
         input_features=input_features,
