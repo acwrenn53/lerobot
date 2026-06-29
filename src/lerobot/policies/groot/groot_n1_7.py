@@ -73,7 +73,6 @@ GR00T_N1_7_DEFAULTS: dict[str, Any] = {
     "select_layer": 16,
     "reproject_vision": False,
     "use_flash_attention": False,
-    "load_bf16": True,
     "backbone_trainable_params_fp32": True,
     "image_crop_size": N1_7_DEFAULT_IMAGE_CROP_SIZE,
     "image_target_size": N1_7_DEFAULT_IMAGE_TARGET_SIZE,
@@ -248,7 +247,6 @@ class Qwen3Backbone(nn.Module):
         select_layer: int = -1,
         reproject_vision: bool = False,
         use_flash_attention: bool = False,
-        load_bf16: bool = False,
         tune_top_llm_layers: int = 0,
         trainable_params_fp32: bool = False,
         transformers_loading_kwargs: dict[str, Any] | None = None,
@@ -275,9 +273,7 @@ class Qwen3Backbone(nn.Module):
         # N1.7 was trained and released with a bf16 Qwen3-VL backbone. Loading
         # the frozen backbone directly in bf16 keeps inference/training on the
         # same path as OSS GR00T instead of relying on fp32 weights plus autocast.
-        load_bf16 = True
-        if load_bf16:
-            extra_kwargs["torch_dtype"] = torch.bfloat16
+        extra_kwargs["torch_dtype"] = torch.bfloat16
 
         if load_pretrained_weights:
             self.model = Qwen3VLForConditionalGeneration.from_pretrained(
@@ -297,7 +293,7 @@ class Qwen3Backbone(nn.Module):
 
         self.select_layer = select_layer
         self.set_trainable_parameters(tune_llm, tune_visual, tune_top_llm_layers)
-        if load_bf16 and trainable_params_fp32:
+        if trainable_params_fp32:
             for parameter in self.parameters():
                 if parameter.requires_grad:
                     parameter.data = parameter.data.to(torch.float32)
@@ -828,7 +824,6 @@ class GR00TN17(PreTrainedModel):
             select_layer=config.select_layer,
             reproject_vision=config.reproject_vision,
             use_flash_attention=config.use_flash_attention,
-            load_bf16=config.load_bf16,
             tune_top_llm_layers=config.tune_top_llm_layers,
             trainable_params_fp32=config.backbone_trainable_params_fp32,
             transformers_loading_kwargs=transformers_loading_kwargs,

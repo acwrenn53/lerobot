@@ -220,7 +220,6 @@ def test_n1_7_qwen_backbone_forces_bf16_weight_load(monkeypatch):
         model_name="nvidia/Cosmos-Reason2-2B",
         select_layer=1,
         use_flash_attention=False,
-        load_bf16=False,
     )
 
     assert captured_kwargs["torch_dtype"] is torch.bfloat16
