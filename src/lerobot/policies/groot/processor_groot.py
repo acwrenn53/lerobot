@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import logging
 from copy import copy, deepcopy
 from dataclasses import dataclass, field, fields, is_dataclass
@@ -1913,6 +1914,7 @@ class GrootN17VLMEncodeStep(ProcessorStep):
     use_albumentations: bool = False
     device: str | None = None
     _proc: ProcessorMixin | None = field(default=None, init=False, repr=False)
+    _processor_supports_device: bool | None = field(default=None, init=False, repr=False)
 
     @property
     def proc(self) -> ProcessorMixin:
@@ -1920,9 +1922,18 @@ class GrootN17VLMEncodeStep(ProcessorStep):
             self._proc = _build_n1_7_processor(self.model_name)
         return self._proc
 
+    def _supports_device_processing(self) -> bool:
+        if self._processor_supports_device is None:
+            image_processor = getattr(self.proc, "image_processor", None)
+            preprocess = getattr(image_processor, "preprocess", None)
+            self._processor_supports_device = bool(
+                preprocess is not None and "device" in inspect.signature(preprocess).parameters
+            )
+        return self._processor_supports_device
+
     def _target_device(self) -> torch.device | None:
         # The albumentations path is cv2/numpy only, so it cannot run on GPU.
-        if self.device is None or self.use_albumentations:
+        if self.device is None or self.use_albumentations or not self._supports_device_processing():
             return None
         try:
             return get_safe_torch_device(self.device)

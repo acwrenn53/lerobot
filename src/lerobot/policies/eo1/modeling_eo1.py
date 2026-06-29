@@ -37,7 +37,14 @@ from .configuration_eo1 import EO1Config
 if TYPE_CHECKING or _transformers_available:
     from transformers.activations import ACT2FN
     from transformers.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
-    from transformers.utils import torch_compilable_check
+
+    try:
+        from transformers.utils import torch_compilable_check
+    except ImportError:
+
+        def torch_compilable_check(condition, message):
+            if not condition:
+                raise ValueError(message)
 else:
     ACT2FN = None
     Qwen2_5_VLForConditionalGeneration = None

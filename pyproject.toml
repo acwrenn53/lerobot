@@ -68,7 +68,7 @@ dependencies = [
 
     # Config & Hub
     "draccus==0.10.0", # TODO: Relax version constraint
-    "huggingface-hub>=1.0.0,<2.0.0",
+    "huggingface-hub==0.36.2",
     "requests>=2.32.0,<3.0.0",
 
     # Environments
@@ -148,7 +148,7 @@ pygame-dep = ["pygame>=2.5.1,<2.7.0"]
 # fails at load with "liburdfdom_sensor.so.4.0: cannot open shared object file" (see #3755).
 # There is no cmeel-urdfdom 5.x; <5 selects the 4.x ABI the placo/pin wheels are built against.
 placo-dep = ["placo>=0.9.6,<0.9.16", "cmeel-urdfdom>=4,<5", "cmeel-tinyxml2<11"]
-transformers-dep = ["transformers>=5.4.0,<5.6.0"]
+transformers-dep = ["transformers==4.57.3"]
 grpcio-dep = ["grpcio>=1.73.1,<2.0.0", "protobuf>=6.31.1,<8.0.0"]
 accelerate-dep = ["accelerate>=1.14.0,<2.0.0"]
 can-dep = ["python-can>=4.2.0,<5.0.0"]
