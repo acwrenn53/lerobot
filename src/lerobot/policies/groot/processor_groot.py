@@ -68,7 +68,6 @@ from lerobot.utils.constants import (
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
-from lerobot.utils.device_utils import get_safe_torch_device
 
 from .configuration_groot import (
     GROOT_ACTION_DECODE_TRANSFORM_LIBERO,
@@ -1898,11 +1897,11 @@ class GrootN17VLMEncodeStep(ProcessorStep):
     an image item in the same chat message so the resulting image tokens match
     the temporal VLM packing used by Isaac-GR00T.
 
-    Images are handed to the torchvision-backed Qwen3-VL processor as ``(C, H, W)``
-    uint8 tensors (no per-frame PIL roundtrip), and, when ``device`` resolves to a
-    CUDA device, the resize/rescale/normalize/patchify run there. This keeps the
-    output bit-identical on CPU and moves the dominant preprocessing cost off
-    the critical path on GPU.
+    Image geometry and normalization intentionally run on CPU using the operation
+    order from Transformers 4. Qwen receives pre-normalized tensors so Transformers
+    5 cannot fuse rescaling and normalization or introduce CUDA resize differences.
+    This keeps the visual tokens bit-exact with the native Isaac-GR00T stack while
+    the model itself remains on its configured device.
     """
 
     model_name: str = GROOT_N1_7_BACKBONE_MODEL
@@ -1920,18 +1919,29 @@ class GrootN17VLMEncodeStep(ProcessorStep):
             self._proc = _build_n1_7_processor(self.model_name)
         return self._proc
 
+    def _legacy_normalize_image(self, image: Any) -> np.ndarray:
+        image_np = image.detach().cpu().numpy() if torch.is_tensor(image) else np.asarray(image)
+
+        image_processor = self.proc.image_processor
+        scale = image_processor.rescale_factor
+        image_np = image_np.astype(np.float64) * scale
+        image_np = image_np.astype(np.float32)
+
+        mean = np.asarray(image_processor.image_mean, dtype=image_np.dtype)
+        std = np.asarray(image_processor.image_std, dtype=image_np.dtype)
+        if image_np.shape[0] == len(mean):
+            mean = mean[:, None, None]
+            std = std[:, None, None]
+        elif image_np.shape[-1] == len(mean):
+            mean = mean[None, None, :]
+            std = std[None, None, :]
+        else:
+            raise ValueError(f"Cannot infer channel dimension for image shape {image_np.shape}.")
+        return (image_np - mean) / std
+
     def _target_device(self) -> torch.device | None:
-        # The albumentations path is cv2/numpy only, so it cannot run on GPU.
-        if self.device is None or self.use_albumentations:
-            return None
-        try:
-            return get_safe_torch_device(self.device)
-        except (AssertionError, RuntimeError):
-            # A device serialized at train time (e.g. "cuda") may be unavailable
-            # when the processor is reloaded elsewhere (e.g. CPU-only eval), and
-            # this step is not in the standard device-override set. Fall back to
-            # the CPU path, which is bit-identical, instead of crashing.
-            return None
+        # Native N1.7 preprocesses images on CPU with Transformers 4.
+        return None
 
     def _build_sample_images(
         self, video: Any, batch_size: int, target_device: torch.device | None
@@ -1999,6 +2009,11 @@ class GrootN17VLMEncodeStep(ProcessorStep):
 
         target_device = self._target_device()
         sample_images = self._build_sample_images(video, batch_size, target_device)
+        use_legacy_qwen_preprocessing = hasattr(self.proc, "image_processor")
+        if use_legacy_qwen_preprocessing:
+            sample_images = [
+                [self._legacy_normalize_image(image) for image in frames] for frames in sample_images
+            ]
 
         texts: list[str] = []
         images: list[Any] = []
@@ -2028,8 +2043,13 @@ class GrootN17VLMEncodeStep(ProcessorStep):
             "return_tensors": "pt",
             "padding": True,
         }
-        if target_device is not None:
-            proc_kwargs["device"] = str(target_device)
+        if use_legacy_qwen_preprocessing:
+            proc_kwargs.update(
+                {
+                    "do_rescale": False,
+                    "do_normalize": False,
+                }
+            )
         encoded = self.proc(**proc_kwargs)
         for key, value in encoded.items():
             comp[key] = value

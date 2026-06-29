@@ -107,6 +107,42 @@ def test_groot_n1_7_vlm_chat_content_order_matches_oss_reference():
     assert processor.content_types == ["image", "image", "text"]
 
 
+def test_groot_n1_7_qwen_preprocessing_matches_transformers_4_cpu_reference():
+    """Keep Transformers 5 preprocessing bit-exact with the native OSS stack."""
+
+    y, x = np.indices((480, 640), dtype=np.uint16)
+    image = np.stack(
+        ((x + 3 * y) % 256, (2 * x + y) % 256, (x + 5 * y) % 256),
+        axis=-1,
+    ).astype(np.uint8)
+    transition = {
+        TransitionKey.OBSERVATION: {"video": image[None, None, None]},
+        TransitionKey.COMPLEMENTARY_DATA: {
+            "language": ["Pick up the vial and place it in the rack"],
+        },
+    }
+    step = GrootN17VLMEncodeStep(
+        image_crop_size=[230, 230],
+        image_target_size=[256, 256],
+        shortest_image_edge=256,
+        crop_fraction=0.95,
+        use_albumentations=False,
+        device="cuda",
+    )
+
+    encoded = step(transition)[TransitionKey.COMPLEMENTARY_DATA]
+
+    expected_hashes = {
+        "input_ids": "67ae525cbb0eba36d267d6c59c869bd32c3b40699b65e18044e33619ba81cd30",
+        "attention_mask": "b1193e839688a47d72c38f9784add1d9857987c611749848bd4b1d88a7dd763f",
+        "pixel_values": "b1c6a0efae89f7e706d6187ff0f91ae5e1101d0bd440ec43837bf6069efe629f",
+        "image_grid_thw": "53389fa912f56f81bbbe0669ab378c489b4cfaf9501876dcaec451ae86db735b",
+    }
+    for key, expected_hash in expected_hashes.items():
+        actual = encoded[key].detach().cpu().contiguous().numpy()
+        assert hashlib.sha256(actual.tobytes()).hexdigest() == expected_hash, key
+
+
 def test_groot_n1_7_alternate_vl_dit_matches_oss_reference():
     """Run the LeRobot DiT with native OSS weights and identical inputs."""
 
