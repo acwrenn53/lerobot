@@ -73,7 +73,7 @@ GR00T_N1_7_DEFAULTS: dict[str, Any] = {
     "select_layer": 16,
     "reproject_vision": False,
     "use_flash_attention": False,
-    "load_bf16": False,
+    "load_bf16": True,
     "backbone_trainable_params_fp32": True,
     "image_crop_size": N1_7_DEFAULT_IMAGE_CROP_SIZE,
     "image_target_size": N1_7_DEFAULT_IMAGE_TARGET_SIZE,
@@ -272,6 +272,10 @@ class Qwen3Backbone(nn.Module):
             except ImportError:
                 logger.warning("flash_attn is not installed. Falling back to SDPA attention.")
                 extra_kwargs["attn_implementation"] = "sdpa"
+        # N1.7 was trained and released with a bf16 Qwen3-VL backbone. Loading
+        # the frozen backbone directly in bf16 keeps inference/training on the
+        # same path as OSS GR00T instead of relying on fp32 weights plus autocast.
+        load_bf16 = True
         if load_bf16:
             extra_kwargs["torch_dtype"] = torch.bfloat16
 

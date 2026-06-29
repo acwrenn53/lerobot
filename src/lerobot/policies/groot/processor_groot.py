@@ -108,6 +108,8 @@ N1_7_EMBODIMENT_MAPPING = {
     "new_embodiment": 10,
 }
 
+_GROOT_N1_7_ABSOLUTE_ACTION_STATS = "__groot_n1_7_absolute_action_stats"
+
 
 @dataclass
 class _GrootN17CheckpointProcessorAssets:
@@ -692,6 +694,36 @@ def _compute_horizon_relative_action_stats(
     return computed
 
 
+def _vector_rows(value: Any, *, key: str) -> np.ndarray:
+    tensor = _to_float_tensor(value, key=key)
+    if tensor.ndim == 1:
+        tensor = tensor.unsqueeze(0)
+    elif tensor.ndim >= 2:
+        tensor = tensor.reshape(-1, tensor.shape[-1])
+    else:
+        raise ValueError(f"Cannot compute exact GR00T statistics for scalar '{key}'.")
+    return tensor.numpy().astype(np.float32, copy=False)
+
+
+def _compute_exact_vector_stats(rows: list[np.ndarray]) -> dict[str, np.ndarray]:
+    if not rows:
+        raise ValueError("Cannot compute exact GR00T statistics without vectors.")
+    values = np.concatenate(rows, axis=0).astype(np.float32, copy=False)
+    if values.shape[0] < 2:
+        raise ValueError("Cannot compute exact GR00T statistics from fewer than 2 vectors.")
+
+    stats = {
+        "min": np.min(values, axis=0),
+        "max": np.max(values, axis=0),
+        "mean": np.mean(values, axis=0),
+        "std": np.std(values, axis=0),
+        "count": np.asarray([values.shape[0]], dtype=np.int64),
+    }
+    for key, quantile in (("q01", 0.01), ("q10", 0.10), ("q50", 0.50), ("q90", 0.90), ("q99", 0.99)):
+        stats[key] = np.quantile(values, quantile, axis=0).astype(np.float32)
+    return stats
+
+
 def _iter_action_state_training_samples(dataset: Any):
     ensure_reader = getattr(dataset, "_ensure_reader", None)
     if callable(ensure_reader):
@@ -701,8 +733,10 @@ def _iter_action_state_training_samples(dataset: Any):
         delta_indices = getattr(reader, "delta_indices", None)
         for idx in range(len(dataset)):
             item = reader.hf_dataset[idx]
-            action = item.get(ACTION)
-            state = item.get(OBS_STATE)
+            raw_action = item.get(ACTION)
+            raw_state = item.get(OBS_STATE)
+            action = raw_action
+            state = raw_state
             pad_mask = None
             if delta_indices is not None and ACTION in delta_indices:
                 ep_idx = _as_int(item["episode_index"])
@@ -710,12 +744,14 @@ def _iter_action_state_training_samples(dataset: Any):
                 query_indices, padding = reader._get_query_indices(abs_idx, ep_idx)
                 action = reader._query_hf_dataset({ACTION: query_indices[ACTION]})[ACTION]
                 pad_mask = padding.get(f"{ACTION}_is_pad")
-            yield action, state, pad_mask
+            yield action, state, pad_mask, raw_action, raw_state
         return
 
     for idx in range(len(dataset)):
         item = dataset[idx]
-        yield item.get(ACTION), item.get(OBS_STATE), item.get(f"{ACTION}_is_pad")
+        action = item.get(ACTION)
+        state = item.get(OBS_STATE)
+        yield action, state, item.get(f"{ACTION}_is_pad"), action, state
 
 
 def _make_relative_action_training_stats(
@@ -743,11 +779,21 @@ def _make_relative_action_training_stats(
     )
     stats = deepcopy(getattr(getattr(dataset, "meta", None), "stats", {}) or {})
     chunks_by_horizon: list[list[np.ndarray]] | None = None
+    absolute_action_rows: list[np.ndarray] = []
+    state_rows: list[np.ndarray] = []
     num_vectors = 0
 
-    for action_value, state_value, pad_mask in _iter_action_state_training_samples(dataset):
+    for (
+        action_value,
+        state_value,
+        pad_mask,
+        raw_action_value,
+        raw_state_value,
+    ) in _iter_action_state_training_samples(dataset):
         action = _to_float_tensor(action_value, key=ACTION)
         state = _to_float_tensor(state_value, key=OBS_STATE)
+        absolute_action_rows.append(_vector_rows(raw_action_value, key=ACTION))
+        state_rows.append(_vector_rows(raw_state_value, key=OBS_STATE))
         state_batch = _state_reference_batch(state)
         action_batch = _action_training_batch(action, state_batch)
         if action_batch.shape[0] != state_batch.shape[0]:
@@ -784,6 +830,8 @@ def _make_relative_action_training_stats(
             "Cannot compute relative action statistics from fewer than 2 unpadded action vectors."
         )
 
+    stats[OBS_STATE] = _compute_exact_vector_stats(state_rows)
+    stats[_GROOT_N1_7_ABSOLUTE_ACTION_STATS] = _compute_exact_vector_stats(absolute_action_rows)
     stats[ACTION] = _compute_horizon_relative_action_stats(chunks_by_horizon or [])
     return stats
 
@@ -966,12 +1014,14 @@ def _build_n1_7_relative_action_processor_assets(
         return None
 
     meta_stats = getattr(dataset_meta, "stats", None) or {}
-    state_stats = (meta_stats.get(OBS_STATE) if isinstance(meta_stats, dict) else None) or dataset_stats.get(
-        OBS_STATE, {}
+    state_stats = dataset_stats.get(OBS_STATE, {}) or (
+        meta_stats.get(OBS_STATE) if isinstance(meta_stats, dict) else None
     )
     absolute_action_stats = (
-        meta_stats.get(ACTION) if isinstance(meta_stats, dict) else None
-    ) or dataset_stats.get(ACTION, {})
+        dataset_stats.get(_GROOT_N1_7_ABSOLUTE_ACTION_STATS, {})
+        or (meta_stats.get(ACTION) if isinstance(meta_stats, dict) else None)
+        or dataset_stats.get(ACTION, {})
+    )
     relative_action_stats = dataset_stats.get(ACTION, {})
     if not state_stats or not absolute_action_stats or not relative_action_stats:
         return None
@@ -2009,9 +2059,10 @@ class GrootN17VLMEncodeStep(ProcessorStep):
 
         target_device = self._target_device()
         sample_images = self._build_sample_images(video, batch_size, target_device)
-        sample_images = [
-            [self._legacy_normalize_image(image) for image in frames] for frames in sample_images
-        ]
+        if not self.use_albumentations:
+            sample_images = [
+                [self._legacy_normalize_image(image) for image in frames] for frames in sample_images
+            ]
 
         texts: list[str] = []
         images: list[Any] = []
@@ -2040,9 +2091,14 @@ class GrootN17VLMEncodeStep(ProcessorStep):
             "images": images,
             "return_tensors": "pt",
             "padding": True,
-            "do_rescale": False,
-            "do_normalize": False,
         }
+        if not self.use_albumentations:
+            proc_kwargs.update(
+                {
+                    "do_rescale": False,
+                    "do_normalize": False,
+                }
+            )
         encoded = self.proc(**proc_kwargs)
         for key, value in encoded.items():
             comp[key] = value
