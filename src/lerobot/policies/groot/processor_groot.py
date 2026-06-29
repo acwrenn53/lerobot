@@ -2009,11 +2009,9 @@ class GrootN17VLMEncodeStep(ProcessorStep):
 
         target_device = self._target_device()
         sample_images = self._build_sample_images(video, batch_size, target_device)
-        use_legacy_qwen_preprocessing = hasattr(self.proc, "image_processor")
-        if use_legacy_qwen_preprocessing:
-            sample_images = [
-                [self._legacy_normalize_image(image) for image in frames] for frames in sample_images
-            ]
+        sample_images = [
+            [self._legacy_normalize_image(image) for image in frames] for frames in sample_images
+        ]
 
         texts: list[str] = []
         images: list[Any] = []
@@ -2042,14 +2040,9 @@ class GrootN17VLMEncodeStep(ProcessorStep):
             "images": images,
             "return_tensors": "pt",
             "padding": True,
+            "do_rescale": False,
+            "do_normalize": False,
         }
-        if use_legacy_qwen_preprocessing:
-            proc_kwargs.update(
-                {
-                    "do_rescale": False,
-                    "do_normalize": False,
-                }
-            )
         encoded = self.proc(**proc_kwargs)
         for key, value in encoded.items():
             comp[key] = value

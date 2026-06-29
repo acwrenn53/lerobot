@@ -1662,7 +1662,9 @@ def test_groot_n1_7_vlm_encode_uses_per_sample_language():
             self.rendered_texts.append(text)
             return f"rendered:{text}"
 
-        def __call__(self, text, images, return_tensors, padding):
+        def __call__(self, text, images, return_tensors, padding, do_rescale, do_normalize):
+            assert do_rescale is False
+            assert do_normalize is False
             self.encoded_texts = text
             return {
                 "input_ids": torch.arange(len(text)).view(len(text), 1),
@@ -1672,6 +1674,7 @@ def test_groot_n1_7_vlm_encode_uses_per_sample_language():
     fake_proc = FakeProcessor()
     step = GrootN17VLMEncodeStep()
     step._proc = fake_proc
+    step._legacy_normalize_image = lambda image: image
     transition = {
         TransitionKey.OBSERVATION: {
             "video": np.zeros((2, 1, 1, 2, 2, 3), dtype=np.uint8),
@@ -1714,7 +1717,9 @@ def test_groot_n1_7_vlm_encode_packs_images_time_major_then_camera_order():
             self.conversation_texts.append(text)
             return f"rendered:{text}"
 
-        def __call__(self, text, images, return_tensors, padding):
+        def __call__(self, text, images, return_tensors, padding, do_rescale, do_normalize):
+            assert do_rescale is False
+            assert do_normalize is False
             assert return_tensors == "pt"
             assert padding is True
             self.encoded_texts = text
@@ -1729,6 +1734,7 @@ def test_groot_n1_7_vlm_encode_packs_images_time_major_then_camera_order():
     fake_proc = FakeProcessor()
     step = GrootN17VLMEncodeStep()
     step._proc = fake_proc
+    step._legacy_normalize_image = lambda image: image
     video = np.zeros((2, 2, 2, 2, 2, 3), dtype=np.uint8)
     image_id = 1
     for batch_idx in range(2):
@@ -1797,7 +1803,9 @@ def test_groot_n1_7_vlm_encode_transforms_non_square_two_camera_sample_like_core
             assert [item["type"] for item in content] == ["image", "image", "text"]
             return content[-1]["text"]
 
-        def __call__(self, text, images, return_tensors, padding):
+        def __call__(self, text, images, return_tensors, padding, do_rescale, do_normalize):
+            assert do_rescale is False
+            assert do_normalize is False
             self.images = images
             return {
                 "input_ids": torch.ones(len(text), 1, dtype=torch.long),
@@ -1815,6 +1823,7 @@ def test_groot_n1_7_vlm_encode_transforms_non_square_two_camera_sample_like_core
         use_albumentations=True,
     )
     step._proc = fake_proc
+    step._legacy_normalize_image = lambda image: image
 
     step(
         {

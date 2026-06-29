@@ -95,6 +95,7 @@ def test_groot_n1_7_vlm_chat_content_order_matches_oss_reference():
         device="cpu",
     )
     step._proc = processor
+    step._legacy_normalize_image = lambda image: image
     transition = {
         TransitionKey.OBSERVATION: {
             "video": np.zeros((1, 1, 2, 480, 640, 3), dtype=np.uint8),
