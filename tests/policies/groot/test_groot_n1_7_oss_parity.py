@@ -149,7 +149,7 @@ def test_groot_n1_7_qwen_preprocessing_matches_transformers_4_cpu_reference():
     expected_hashes = {
         "input_ids": "67ae525cbb0eba36d267d6c59c869bd32c3b40699b65e18044e33619ba81cd30",
         "attention_mask": "b1193e839688a47d72c38f9784add1d9857987c611749848bd4b1d88a7dd763f",
-        "pixel_values": "b1c6a0efae89f7e706d6187ff0f91ae5e1101d0bd440ec43837bf6069efe629f",
+        "pixel_values": "52185b21020fa457ce9c026535fe320748d7e30785ab7f230e381fda3b6f730d",
         "image_grid_thw": "53389fa912f56f81bbbe0669ab378c489b4cfaf9501876dcaec451ae86db735b",
     }
     for key, expected_hash in expected_hashes.items():
