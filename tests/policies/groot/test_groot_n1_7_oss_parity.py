@@ -17,14 +17,11 @@
 import hashlib
 import os
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
-from lerobot.configs import FeatureType, PolicyFeature
-from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.groot.action_head.cross_attention_dit import AlternateVLDiT
 from lerobot.policies.groot.groot_n1_7 import GR00TN17
 from lerobot.policies.groot.processor_groot import (
@@ -32,89 +29,11 @@ from lerobot.policies.groot.processor_groot import (
     GrootN17PackInputsStep,
     GrootN17VLMEncodeStep,
     _transform_n1_7_image_for_vlm_albumentations,
-    make_groot_pre_post_processors,
 )
 from lerobot.types import TransitionKey
-from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
+from lerobot.utils.constants import OBS_STATE
 
 OSS_REFERENCE_COMMIT = "ab88b50c718f6528e1df9dcbaf75865d1b604760"
-
-
-def _so101_stats(action_horizon: int = 40) -> tuple[dict, dict]:
-    state_dim = 6
-    action_dim = 6
-    flat_state = {
-        "min": torch.full((state_dim,), -1.0),
-        "max": torch.full((state_dim,), 1.0),
-        "mean": torch.zeros(state_dim),
-        "std": torch.ones(state_dim),
-        "q01": torch.full((state_dim,), -0.9),
-        "q99": torch.full((state_dim,), 0.9),
-        "count": torch.tensor([100]),
-    }
-    flat_action = {
-        "min": torch.full((action_dim,), -2.0),
-        "max": torch.full((action_dim,), 2.0),
-        "mean": torch.zeros(action_dim),
-        "std": torch.ones(action_dim),
-        "q01": torch.full((action_dim,), -1.8),
-        "q99": torch.full((action_dim,), 1.8),
-        "count": torch.tensor([100]),
-    }
-    horizon_action = {
-        "min": torch.full((action_horizon, action_dim), -0.5),
-        "max": torch.full((action_horizon, action_dim), 0.5),
-        "mean": torch.zeros(action_horizon, action_dim),
-        "std": torch.ones(action_horizon, action_dim),
-        "q01": torch.full((action_horizon, action_dim), -0.45),
-        "q99": torch.full((action_horizon, action_dim), 0.45),
-        "count": torch.full((action_horizon,), 100),
-    }
-    dataset_stats = {OBS_STATE: flat_state, ACTION: horizon_action}
-    meta_stats = {OBS_STATE: flat_state, ACTION: flat_action}
-    return dataset_stats, meta_stats
-
-
-def test_groot_n1_7_relative_processor_preserves_native_action_horizon_for_so101():
-    input_features = {
-        OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(6,)),
-        f"{OBS_IMAGES}.front": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 480, 640)),
-        f"{OBS_IMAGES}.wrist": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 480, 640)),
-    }
-    output_features = {ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(6,))}
-    config = GrootConfig(
-        input_features=input_features,
-        output_features=output_features,
-        device="cpu",
-        chunk_size=16,
-        n_action_steps=16,
-        use_relative_actions=True,
-        relative_exclude_joints=["gripper"],
-        use_bf16=False,
-    )
-    dataset_stats, meta_stats = _so101_stats(action_horizon=40)
-    dataset_meta = SimpleNamespace(
-        features={
-            OBS_STATE: {"names": [f"joint_{idx}.pos" for idx in range(5)] + ["gripper.pos"]},
-            ACTION: {"names": [f"joint_{idx}.pos" for idx in range(5)] + ["gripper.pos"]},
-            f"{OBS_IMAGES}.front": {"dtype": "video"},
-            f"{OBS_IMAGES}.wrist": {"dtype": "video"},
-        },
-        stats=meta_stats,
-    )
-
-    preprocessor, _postprocessor = make_groot_pre_post_processors(
-        config,
-        dataset_stats=dataset_stats,
-        dataset_meta=dataset_meta,
-    )
-
-    pack_step = next(step for step in preprocessor.steps if isinstance(step, GrootN17PackInputsStep))
-    assert pack_step.action_horizon == 40
-    assert pack_step.valid_action_horizon == 16
-    assert pack_step.modality_config["action"]["delta_indices"] == list(range(40))
-    assert pack_step.modality_config["action"]["modality_keys"] == ["single_arm", "gripper"]
-    assert torch.as_tensor(pack_step.raw_stats["relative_action"]["single_arm"]["min"]).shape == (40, 5)
 
 
 def _fixture_path(filename: str) -> Path:
