@@ -74,7 +74,6 @@ from lerobot.utils.constants import (
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
-from lerobot.utils.device_utils import get_safe_torch_device
 
 from .configuration_groot import (
     GROOT_ACTION_DECODE_TRANSFORM_LIBERO,
@@ -114,6 +113,8 @@ N1_7_EMBODIMENT_MAPPING = {
     "libero_sim": 2,
     "new_embodiment": 10,
 }
+
+_GROOT_N1_7_ABSOLUTE_ACTION_STATS = "__groot_n1_7_absolute_action_stats"
 
 
 @dataclass
@@ -704,6 +705,36 @@ def _compute_horizon_relative_action_stats(
     return computed
 
 
+def _vector_rows(value: Any, *, key: str) -> np.ndarray:
+    tensor = _to_float_tensor(value, key=key)
+    if tensor.ndim == 1:
+        tensor = tensor.unsqueeze(0)
+    elif tensor.ndim >= 2:
+        tensor = tensor.reshape(-1, tensor.shape[-1])
+    else:
+        raise ValueError(f"Cannot compute exact GR00T statistics for scalar '{key}'.")
+    return tensor.numpy().astype(np.float32, copy=False)
+
+
+def _compute_exact_vector_stats(rows: list[np.ndarray]) -> dict[str, np.ndarray]:
+    if not rows:
+        raise ValueError("Cannot compute exact GR00T statistics without vectors.")
+    values = np.concatenate(rows, axis=0).astype(np.float32, copy=False)
+    if values.shape[0] < 2:
+        raise ValueError("Cannot compute exact GR00T statistics from fewer than 2 vectors.")
+
+    stats = {
+        "min": np.min(values, axis=0),
+        "max": np.max(values, axis=0),
+        "mean": np.mean(values, axis=0),
+        "std": np.std(values, axis=0),
+        "count": np.asarray([values.shape[0]], dtype=np.int64),
+    }
+    for key, quantile in (("q01", 0.01), ("q10", 0.10), ("q50", 0.50), ("q90", 0.90), ("q99", 0.99)):
+        stats[key] = np.quantile(values, quantile, axis=0).astype(np.float32)
+    return stats
+
+
 def _iter_action_state_training_samples(dataset: Any):
     ensure_reader = getattr(dataset, "_ensure_reader", None)
     if callable(ensure_reader):
@@ -713,8 +744,10 @@ def _iter_action_state_training_samples(dataset: Any):
         delta_indices = getattr(reader, "delta_indices", None)
         for idx in range(len(dataset)):
             item = reader.hf_dataset[idx]
-            action = item.get(ACTION)
-            state = item.get(OBS_STATE)
+            raw_action = item.get(ACTION)
+            raw_state = item.get(OBS_STATE)
+            action = raw_action
+            state = raw_state
             pad_mask = None
             if delta_indices is not None and ACTION in delta_indices:
                 ep_idx = _as_int(item["episode_index"])
@@ -722,12 +755,14 @@ def _iter_action_state_training_samples(dataset: Any):
                 query_indices, padding = reader._get_query_indices(abs_idx, ep_idx)
                 action = reader._query_hf_dataset({ACTION: query_indices[ACTION]})[ACTION]
                 pad_mask = padding.get(f"{ACTION}_is_pad")
-            yield action, state, pad_mask
+            yield action, state, pad_mask, raw_action, raw_state
         return
 
     for idx in range(len(dataset)):
         item = dataset[idx]
-        yield item.get(ACTION), item.get(OBS_STATE), item.get(f"{ACTION}_is_pad")
+        action = item.get(ACTION)
+        state = item.get(OBS_STATE)
+        yield action, state, item.get(f"{ACTION}_is_pad"), action, state
 
 
 def _make_relative_action_training_stats(
@@ -755,11 +790,21 @@ def _make_relative_action_training_stats(
     )
     stats = deepcopy(getattr(getattr(dataset, "meta", None), "stats", {}) or {})
     chunks_by_horizon: list[list[np.ndarray]] | None = None
+    absolute_action_rows: list[np.ndarray] = []
+    state_rows: list[np.ndarray] = []
     num_vectors = 0
 
-    for action_value, state_value, pad_mask in _iter_action_state_training_samples(dataset):
+    for (
+        action_value,
+        state_value,
+        pad_mask,
+        raw_action_value,
+        raw_state_value,
+    ) in _iter_action_state_training_samples(dataset):
         action = _to_float_tensor(action_value, key=ACTION)
         state = _to_float_tensor(state_value, key=OBS_STATE)
+        absolute_action_rows.append(_vector_rows(raw_action_value, key=ACTION))
+        state_rows.append(_vector_rows(raw_state_value, key=OBS_STATE))
         state_batch = _state_reference_batch(state)
         action_batch = _action_training_batch(action, state_batch)
         if action_batch.shape[0] != state_batch.shape[0]:
@@ -796,6 +841,8 @@ def _make_relative_action_training_stats(
             "Cannot compute relative action statistics from fewer than 2 unpadded action vectors."
         )
 
+    stats[OBS_STATE] = _compute_exact_vector_stats(state_rows)
+    stats[_GROOT_N1_7_ABSOLUTE_ACTION_STATS] = _compute_exact_vector_stats(absolute_action_rows)
     stats[ACTION] = _compute_horizon_relative_action_stats(chunks_by_horizon or [])
     return stats
 
@@ -978,12 +1025,14 @@ def _build_n1_7_relative_action_processor_assets(
         return None
 
     meta_stats = getattr(dataset_meta, "stats", None) or {}
-    state_stats = (meta_stats.get(OBS_STATE) if isinstance(meta_stats, dict) else None) or dataset_stats.get(
-        OBS_STATE, {}
+    state_stats = dataset_stats.get(OBS_STATE, {}) or (
+        meta_stats.get(OBS_STATE) if isinstance(meta_stats, dict) else None
     )
     absolute_action_stats = (
-        meta_stats.get(ACTION) if isinstance(meta_stats, dict) else None
-    ) or dataset_stats.get(ACTION, {})
+        dataset_stats.get(_GROOT_N1_7_ABSOLUTE_ACTION_STATS, {})
+        or (meta_stats.get(ACTION) if isinstance(meta_stats, dict) else None)
+        or dataset_stats.get(ACTION, {})
+    )
     relative_action_stats = dataset_stats.get(ACTION, {})
     if not state_stats or not absolute_action_stats or not relative_action_stats:
         return None
@@ -1958,11 +2007,11 @@ class GrootN17VLMEncodeStep(ProcessorStep):
     an image item in the same chat message so the resulting image tokens match
     the temporal VLM packing used by Isaac-GR00T.
 
-    Images are handed to the torchvision-backed Qwen3-VL processor as ``(C, H, W)``
-    uint8 tensors (no per-frame PIL roundtrip), and, when ``device`` resolves to a
-    CUDA device, the resize/rescale/normalize/patchify run there. This keeps the
-    output bit-identical on CPU and moves the dominant preprocessing cost off
-    the critical path on GPU.
+    Image geometry and normalization intentionally run on CPU using the operation
+    order from Transformers 4. Qwen receives pre-normalized tensors so Transformers
+    5 cannot fuse rescaling and normalization or introduce CUDA resize differences.
+    This keeps the visual tokens bit-exact with the native Isaac-GR00T stack while
+    the model itself remains on its configured device.
     """
 
     model_name: str = GROOT_N1_7_BACKBONE_MODEL
@@ -1981,18 +2030,29 @@ class GrootN17VLMEncodeStep(ProcessorStep):
             self._proc = _build_n1_7_processor(self.model_name)
         return self._proc
 
+    def _legacy_normalize_image(self, image: Any) -> np.ndarray:
+        image_np = image.detach().cpu().numpy() if torch.is_tensor(image) else np.asarray(image)
+
+        image_processor = self.proc.image_processor
+        scale = image_processor.rescale_factor
+        image_np = image_np.astype(np.float64) * scale
+        image_np = image_np.astype(np.float32)
+
+        mean = np.asarray(image_processor.image_mean, dtype=image_np.dtype)
+        std = np.asarray(image_processor.image_std, dtype=image_np.dtype)
+        if image_np.shape[0] == len(mean):
+            mean = mean[:, None, None]
+            std = std[:, None, None]
+        elif image_np.shape[-1] == len(mean):
+            mean = mean[None, None, :]
+            std = std[None, None, :]
+        else:
+            raise ValueError(f"Cannot infer channel dimension for image shape {image_np.shape}.")
+        return (image_np - mean) / std
+
     def _target_device(self) -> torch.device | None:
-        # The albumentations path is cv2/numpy only, so it cannot run on GPU.
-        if self.device is None or self.use_albumentations:
-            return None
-        try:
-            return get_safe_torch_device(self.device)
-        except (AssertionError, RuntimeError):
-            # A device serialized at train time (e.g. "cuda") may be unavailable
-            # when the processor is reloaded elsewhere (e.g. CPU-only eval), and
-            # this step is not in the standard device-override set. Fall back to
-            # the CPU path, which is bit-identical, instead of crashing.
-            return None
+        # Native N1.7 preprocesses images on CPU with Transformers 4.
+        return None
 
     def _build_sample_images(
         self, video: Any, batch_size: int, target_device: torch.device | None
@@ -2062,6 +2122,10 @@ class GrootN17VLMEncodeStep(ProcessorStep):
 
         target_device = self._target_device()
         sample_images = self._build_sample_images(video, batch_size, target_device)
+        if not self.use_albumentations:
+            sample_images = [
+                [self._legacy_normalize_image(image) for image in frames] for frames in sample_images
+            ]
 
         texts: list[str] = []
         images: list[Any] = []
@@ -2091,8 +2155,13 @@ class GrootN17VLMEncodeStep(ProcessorStep):
             "return_tensors": "pt",
             "padding": True,
         }
-        if target_device is not None:
-            proc_kwargs["device"] = str(target_device)
+        if not self.use_albumentations:
+            proc_kwargs.update(
+                {
+                    "do_rescale": False,
+                    "do_normalize": False,
+                }
+            )
         encoded = self.proc(**proc_kwargs)
         for key, value in encoded.items():
             comp[key] = value
@@ -2212,11 +2281,10 @@ class GrootN17ActionDecodeStep(ProcessorStep):
     most recent preprocess call. Engines that decode the whole chunk right
     after prediction (RTC, async policy server) therefore use the
     prediction-time state, matching Isaac-GR00T. The sync per-step queue path
-    instead decodes each popped (B, D) action against the latest observation:
-    the reference can be newer than the observation the chunk was predicted
-    from, and per-timestep relative stats are applied as if the popped action
-    were chunk step 0. Fixing that would require carrying the reference state
-    and chunk index alongside each queued action through the postprocessor.
+    must not decode cached raw relative future actions against newer
+    observations. GR00T's relative-action ``select_action`` path replans every
+    call and returns only the first horizon step, so a 2-D action is safe to
+    decode as a singleton step-0 chunk.
     """
 
     env_action_dim: int = 0
@@ -2243,18 +2311,19 @@ class GrootN17ActionDecodeStep(ProcessorStep):
             return transition
 
         action_np = action.detach().cpu().float().numpy()
-        if self.use_relative_action and action_np.ndim != 3:
-            raise NotImplementedError(
-                "GrootN17ActionDecodeStep cannot decode native relative actions one step at a time. "
-                "Decode the full action chunk returned by predict_action_chunk while the matching "
-                "GrootN17PackInputsStep state is still cached, then queue the decoded absolute actions."
-            )
-        # The sync action queue postprocesses popped actions as (B, D); decode
-        # them as single-step (B, 1, D) chunks and squeeze the horizon back at
-        # the end so both ranks share the chunk decode logic below.
+        # GR00T relative select_action replans each call and returns only the
+        # first raw horizon step. Decode that (B, D) action as a singleton
+        # (B, 1, D) chunk against the current cached raw state. Cached future
+        # raw relative actions are still unsafe and must not flow through this
+        # path.
         squeeze_horizon = action_np.ndim == 2
         if squeeze_horizon:
             action_np = action_np[:, None, :]
+        elif self.use_relative_action and action_np.ndim != 3:
+            raise NotImplementedError(
+                "GrootN17ActionDecodeStep can decode native relative actions only as a full "
+                "(B, T, D) chunk or as the singleton (B, D) step-0 output from select_action."
+            )
         valid_horizon = _n1_7_decode_valid_horizon(action_config, action_np)
         if valid_horizon is not None:
             action_np = action_np[:, :valid_horizon]

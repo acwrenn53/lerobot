@@ -163,7 +163,6 @@ def main():
     # noise vs the LeRobot env (which has no flash_attn and runs SDPA).
     cfg = AutoConfig.from_pretrained(args.ckpt, trust_remote_code=True)
     cfg.use_flash_attention = False
-    cfg.load_bf16 = False
     fair_model = AutoModel.from_pretrained(args.ckpt, config=cfg, trust_remote_code=True)
     fair_model.to(device=args.device, dtype=torch.float32)
     fair_model.eval()

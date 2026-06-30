@@ -189,6 +189,47 @@ def test_n1_7_backbone_accepts_transformers_5_layout_and_forwards_mm_token_type_
     assert output["backbone_features"].shape == (1, 4, 4)
 
 
+def test_n1_7_qwen_backbone_forces_bf16_weight_load(monkeypatch):
+    import lerobot.policies.groot.groot_n1_7 as groot_n1_7
+
+    captured_kwargs = {}
+
+    class FakeLanguageModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([nn.Linear(1, 1)])
+
+    class FakeInnerModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.language_model = FakeLanguageModel()
+            self.visual = nn.Linear(1, 1)
+
+    class FakeQwen3VLForConditionalGeneration(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = FakeInnerModel()
+
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            captured_kwargs.update(kwargs)
+            return cls()
+
+        def eval(self):
+            super().eval()
+            return self
+
+    monkeypatch.setattr(groot_n1_7, "Qwen3VLForConditionalGeneration", FakeQwen3VLForConditionalGeneration)
+
+    groot_n1_7.Qwen3Backbone(
+        model_name="nvidia/Cosmos-Reason2-2B",
+        select_layer=1,
+        use_flash_attention=False,
+    )
+
+    assert captured_kwargs["torch_dtype"] is torch.bfloat16
+
+
 def test_n1_7_backbone_preserves_missing_qwen_optional_dependency_error(monkeypatch):
     pytest.importorskip("transformers")
 
@@ -906,6 +947,119 @@ def test_groot_n1_7_pack_inputs_normalizes_state_with_q01_q99_clips_and_pads():
     torch.testing.assert_close(output[TransitionKey.OBSERVATION]["state"], expected)
 
 
+def test_groot_n1_7_pack_inputs_clips_model_state_but_caches_raw_relative_reference():
+    raw_stats = {
+        "state": {
+            "single_arm": _stats([-50.0] * 5),
+            "gripper": _stats([0.0]),
+        }
+    }
+    step = GrootN17PackInputsStep(
+        max_state_dim=6,
+        normalize_min_max=True,
+        clip_outliers=True,
+        stats={
+            OBS_STATE: {
+                "min": [-50.0] * 5 + [0.0],
+                "max": [50.0] * 5 + [100.0],
+            }
+        },
+        raw_stats=raw_stats,
+        modality_config={"state": {"modality_keys": ["single_arm", "gripper"]}},
+    )
+    raw_state = torch.tensor([[150.0, -150.0, 0.0, 0.0, 0.0, 50.0]])
+
+    output = step(
+        {
+            TransitionKey.OBSERVATION: {OBS_STATE: raw_state},
+            TransitionKey.COMPLEMENTARY_DATA: {"task": ["Move"]},
+        }
+    )
+
+    torch.testing.assert_close(
+        output[TransitionKey.OBSERVATION]["state"][0, 0, :6],
+        torch.tensor([1.0, -1.0, 0.0, 0.0, 0.0, 0.0]),
+    )
+    cached_state = step.get_cached_raw_state()
+    assert cached_state is not None
+    np.testing.assert_array_equal(cached_state["single_arm"], raw_state[:, :5].numpy())
+    np.testing.assert_array_equal(cached_state["gripper"], raw_state[:, 5:].numpy())
+
+
+def test_groot_n1_7_relative_decode_can_exceed_checkpoint_absolute_action_range():
+    arm_action_stats = {
+        "min": [-100.0] * 5,
+        "max": [100.0] * 5,
+        "mean": [0.0] * 5,
+        "std": [1.0] * 5,
+        "q01": [-99.0] * 5,
+        "q99": [99.0] * 5,
+    }
+    gripper_stats = {
+        "min": [0.0],
+        "max": [100.0],
+        "mean": [50.0],
+        "std": [1.0],
+        "q01": [1.0],
+        "q99": [99.0],
+    }
+    relative_arm_stats = {
+        "min": [-20.0] * 5,
+        "max": [20.0] * 5,
+        "mean": [0.0] * 5,
+        "std": [1.0] * 5,
+        "q01": [-19.0] * 5,
+        "q99": [19.0] * 5,
+    }
+    raw_stats = {
+        "state": {
+            "single_arm": _stats([-50.0] * 5),
+            "gripper": _stats([0.0]),
+        },
+        "action": {
+            "single_arm": arm_action_stats,
+            "gripper": gripper_stats,
+        },
+        "relative_action": {"single_arm": relative_arm_stats},
+    }
+    modality_config = {
+        "state": {"modality_keys": ["single_arm", "gripper"]},
+        "action": {
+            "delta_indices": [0],
+            "modality_keys": ["single_arm", "gripper"],
+            "action_configs": [
+                {"rep": "RELATIVE", "type": "NON_EEF", "format": "DEFAULT", "state_key": None},
+                {"rep": "ABSOLUTE", "type": "NON_EEF", "format": "DEFAULT", "state_key": None},
+            ],
+        },
+    }
+    pack_step = GrootN17PackInputsStep(
+        normalize_min_max=False,
+        raw_stats=raw_stats,
+        modality_config=modality_config,
+    )
+    pack_step(
+        {
+            TransitionKey.OBSERVATION: {OBS_STATE: torch.tensor([[95.0, 0.0, 0.0, 0.0, 0.0, 50.0]])},
+            TransitionKey.COMPLEMENTARY_DATA: {},
+        }
+    )
+    decode_step = GrootN17ActionDecodeStep(
+        env_action_dim=6,
+        raw_stats=raw_stats,
+        modality_config=modality_config,
+        use_relative_action=True,
+        pack_step=pack_step,
+    )
+
+    decoded = decode_step({TransitionKey.ACTION: torch.tensor([[[1.0, 0.0, 0.0, 0.0, 0.0, 0.0]]])})[
+        TransitionKey.ACTION
+    ]
+
+    assert decoded[0, 0, 0].item() == pytest.approx(115.0)
+    assert decoded[0, 0, 0].item() > arm_action_stats["max"][0]
+
+
 def test_groot_n1_7_libero_open_gripper_state_normalizes_near_core_oracle():
     step = GrootN17PackInputsStep(
         action_horizon=40,
@@ -1387,7 +1541,7 @@ def test_groot_n1_7_action_decode_truncates_to_valid_horizon_for_relative_stats(
     torch.testing.assert_close(decoded[..., 5], torch.full((1, 16), 5.0))
 
 
-def test_groot_n1_7_action_decode_rejects_stepwise_native_relative_actions():
+def test_groot_n1_7_action_decode_accepts_singleton_select_action_relative_step():
     raw_stats = {
         "state": {
             "single_arm": _stats([0.0] * 5),
@@ -1420,7 +1574,7 @@ def test_groot_n1_7_action_decode_rejects_stepwise_native_relative_actions():
     )
     pack_step(
         {
-            TransitionKey.OBSERVATION: {OBS_STATE: torch.zeros(1, 6)},
+            TransitionKey.OBSERVATION: {OBS_STATE: torch.tensor([[1.0, 2.0, 3.0, 4.0, 5.0, 9.0]])},
             TransitionKey.COMPLEMENTARY_DATA: {},
         }
     )
@@ -1432,8 +1586,12 @@ def test_groot_n1_7_action_decode_rejects_stepwise_native_relative_actions():
         pack_step=pack_step,
     )
 
-    with pytest.raises(NotImplementedError, match="cannot decode native relative actions one step at a time"):
-        decode_step({TransitionKey.ACTION: torch.zeros(1, 6)})
+    output = decode_step({TransitionKey.ACTION: torch.zeros(1, 6)})
+
+    torch.testing.assert_close(
+        output[TransitionKey.ACTION],
+        torch.tensor([[51.0, 52.0, 53.0, 54.0, 55.0, 50.0]]),
+    )
 
 
 def test_groot_n1_7_action_decode_requires_gripper_key_for_libero_transform():
@@ -1731,7 +1889,9 @@ def test_groot_n1_7_vlm_encode_uses_per_sample_language():
             self.rendered_texts.append(text)
             return f"rendered:{text}"
 
-        def __call__(self, text, images, return_tensors, padding):
+        def __call__(self, text, images, return_tensors, padding, do_rescale, do_normalize):
+            assert do_rescale is False
+            assert do_normalize is False
             self.encoded_texts = text
             return {
                 "input_ids": torch.arange(len(text)).view(len(text), 1),
@@ -1741,6 +1901,7 @@ def test_groot_n1_7_vlm_encode_uses_per_sample_language():
     fake_proc = FakeProcessor()
     step = GrootN17VLMEncodeStep()
     step._proc = fake_proc
+    step._legacy_normalize_image = lambda image: image
     transition = {
         TransitionKey.OBSERVATION: {
             "video": np.zeros((2, 1, 1, 2, 2, 3), dtype=np.uint8),
@@ -1783,7 +1944,9 @@ def test_groot_n1_7_vlm_encode_packs_images_time_major_then_camera_order():
             self.conversation_texts.append(text)
             return f"rendered:{text}"
 
-        def __call__(self, text, images, return_tensors, padding):
+        def __call__(self, text, images, return_tensors, padding, do_rescale, do_normalize):
+            assert do_rescale is False
+            assert do_normalize is False
             assert return_tensors == "pt"
             assert padding is True
             self.encoded_texts = text
@@ -1798,6 +1961,7 @@ def test_groot_n1_7_vlm_encode_packs_images_time_major_then_camera_order():
     fake_proc = FakeProcessor()
     step = GrootN17VLMEncodeStep()
     step._proc = fake_proc
+    step._legacy_normalize_image = lambda image: image
     video = np.zeros((2, 2, 2, 2, 2, 3), dtype=np.uint8)
     image_id = 1
     for batch_idx in range(2):
@@ -1918,7 +2082,9 @@ def test_groot_n1_7_vlm_encode_transforms_non_square_two_camera_sample_like_core
             assert [item["type"] for item in content] == ["image", "image", "text"]
             return content[-1]["text"]
 
-        def __call__(self, text, images, return_tensors, padding):
+        def __call__(self, text, images, return_tensors, padding, **kwargs):
+            assert "do_rescale" not in kwargs
+            assert "do_normalize" not in kwargs
             self.images = images
             return {
                 "input_ids": torch.ones(len(text), 1, dtype=torch.long),
@@ -1936,6 +2102,7 @@ def test_groot_n1_7_vlm_encode_transforms_non_square_two_camera_sample_like_core
         use_albumentations=True,
     )
     step._proc = fake_proc
+    step._legacy_normalize_image = lambda image: image
 
     step(
         {
@@ -2182,8 +2349,8 @@ def test_groot_n1_7_relative_action_training_processors_save_native_grouped_stat
         preserve_action_horizon=True,
     )
     expected_relative_action_stats = {
-        "min": torch.tensor([-2.0, -3.0, -4.0, -5.0, -6.0, 1.0, 2.0, 3.0, 4.0, 5.0, 0.0]),
-        "max": torch.tensor([-1.0, -2.0, -3.0, -4.0, -5.0, 2.0, 3.0, 4.0, 5.0, 6.0, 100.0]),
+        "min": torch.tensor([-2.0, -3.0, -4.0, -5.0, -6.0, 1.0, 2.0, 3.0, 4.0, 5.0, 0.75]),
+        "max": torch.tensor([-1.0, -2.0, -3.0, -4.0, -5.0, 2.0, 3.0, 4.0, 5.0, 6.0, 99.25]),
     }
 
     preprocessor, postprocessor = make_groot_pre_post_processors(
@@ -2482,8 +2649,8 @@ def test_groot_n1_7_generated_relative_stats_match_oss_gr00t_reference_numbers()
         torch.as_tensor(pack_step.raw_stats["relative_action"]["single_arm"]["q99"]),
         oss_arm_q99,
     )
-    assert pack_step.stats[ACTION]["min"] == pytest.approx([*oss_arm_min.flatten().tolist(), 20.0])
-    assert pack_step.stats[ACTION]["max"] == pytest.approx([*oss_arm_max.flatten().tolist(), 90.0])
+    assert pack_step.stats[ACTION]["min"] == pytest.approx([*oss_arm_min.flatten().tolist(), 20.5])
+    assert pack_step.stats[ACTION]["max"] == pytest.approx([*oss_arm_max.flatten().tolist(), 89.5])
 
     packed = pack_step(
         {
@@ -2495,14 +2662,17 @@ def test_groot_n1_7_generated_relative_stats_match_oss_gr00t_reference_numbers()
     expected_normalized = torch.tensor(
         [
             [1.0, 0.0, 0.0, 0.0, 0.0, -1.0],
-            [1.0, 0.0, 0.0, 0.0, 0.0, 5.0 / 7.0],
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.7246376811594203],
             [1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
         ]
     )
     torch.testing.assert_close(packed[TransitionKey.ACTION][0, :3, :6], expected_normalized)
 
     decoded = decode_step({TransitionKey.ACTION: packed[TransitionKey.ACTION]})
-    torch.testing.assert_close(decoded[TransitionKey.ACTION], action_a.unsqueeze(0), atol=1e-5, rtol=1e-5)
+    expected_decoded = action_a.unsqueeze(0).clone()
+    expected_decoded[0, 0, 5] = 20.5
+    expected_decoded[0, 2, 5] = 89.5
+    torch.testing.assert_close(decoded[TransitionKey.ACTION], expected_decoded, atol=1e-5, rtol=1e-5)
 
 
 def test_groot_n1_7_relative_action_stats_skip_padded_tail_chunks():
@@ -2625,12 +2795,30 @@ def test_groot_n1_7_libero_execution_horizon_uses_core_eight_action_cadence(tmp_
     assert infer_groot_n1_7_action_execution_horizon(model_path, "libero_sim") == 8
 
 
-def test_groot_select_action_rejects_relative_action_policies():
+def test_groot_select_action_relative_actions_replan_and_return_first_step():
     policy = object.__new__(GrootPolicy)
     object.__setattr__(policy, "config", SimpleNamespace(use_relative_actions=True))
+    object.__setattr__(policy, "_action_queue", [torch.full((1, 2), 99.0)])
+    object.__setattr__(policy, "eval", lambda: None)
+    chunks = [
+        torch.tensor([[[1.0, 2.0], [3.0, 4.0]]]),
+        torch.tensor([[[5.0, 6.0], [7.0, 8.0]]]),
+    ]
+    calls = []
 
-    with pytest.raises(NotImplementedError, match="select_action does not support relative-action policies"):
-        policy.select_action({})
+    def predict_action_chunk(batch):
+        calls.append(batch)
+        return chunks[len(calls) - 1]
+
+    object.__setattr__(policy, "predict_action_chunk", predict_action_chunk)
+
+    first = policy.select_action({"step": 0})
+    second = policy.select_action({"step": 1})
+
+    torch.testing.assert_close(first, torch.tensor([[1.0, 2.0]]))
+    torch.testing.assert_close(second, torch.tensor([[5.0, 6.0]]))
+    assert calls == [{"step": 0}, {"step": 1}]
+    assert policy._action_queue == []
 
 
 def test_groot_n1_7_select_action_uses_checkpoint_valid_horizon(tmp_path, monkeypatch):
