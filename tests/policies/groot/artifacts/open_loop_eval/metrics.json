@@ -1,0 +1,56 @@
+{
+  "dataset_repo_id": "sreetz-nv/so101_teleop_vials_rack_left",
+  "model_path": "/home/nvidia/.cache/huggingface/hub/models--sreetz-nv--grootn17-finetune_sreetz-so101_teleop_vials_rack_left/snapshots/c98358b4006eaf50d4b4ee014ed4848ffed57f2d",
+  "embodiment_tag": "new_embodiment",
+  "lang_instruction": "Pick up the vials and put them in the yellow rack",
+  "action_horizon": 16,
+  "steps": 200,
+  "view_map": {
+    "external_D455": "front",
+    "ego": "wrist"
+  },
+  "seed": 42,
+  "trajectories": {
+    "0": {
+      "mse": 4.1957502365112305,
+      "mae": 1.0692812204360962,
+      "per_dim_mse": [
+        1.426712989807129,
+        8.004624366760254,
+        5.441194534301758,
+        3.9593563079833984,
+        0.08910379558801651,
+        6.25350284576416
+      ],
+      "plot": "/home/nvidia/lerobot/tests/policies/groot/artifacts/open_loop_eval/traj_0.png"
+    },
+    "1": {
+      "mse": 2.663764238357544,
+      "mae": 0.9399188160896301,
+      "per_dim_mse": [
+        0.6466969847679138,
+        3.802689552307129,
+        2.1131653785705566,
+        4.449763298034668,
+        0.24221265316009521,
+        4.7280592918396
+      ],
+      "plot": "/home/nvidia/lerobot/tests/policies/groot/artifacts/open_loop_eval/traj_1.png"
+    },
+    "2": {
+      "mse": 3.8914432525634766,
+      "mae": 0.9569722414016724,
+      "per_dim_mse": [
+        0.8509914875030518,
+        12.590860366821289,
+        2.460860252380371,
+        3.7634427547454834,
+        0.06252258270978928,
+        3.6199886798858643
+      ],
+      "plot": "/home/nvidia/lerobot/tests/policies/groot/artifacts/open_loop_eval/traj_2.png"
+    }
+  },
+  "avg_mse": 3.5836525758107505,
+  "avg_mae": 0.9887240926424662
+}
