@@ -308,6 +308,13 @@ class GrootConfig(PreTrainedConfig):
     # the entire LLM.
     tune_top_llm_layers: int = 0
 
+    # Probability of zeroing the encoded state features during training (regularization that forces
+    # the policy to rely on vision instead of proprioception). None keeps the checkpoint/model value
+    # (GR00T N1.7 default: 0.2). Isaac-GR00T fine-tuning uses a much higher value (0.8); raise this
+    # (e.g. 0.8) when fine-tuning embodiments whose state nearly determines the action (e.g. small
+    # relative-action joint deltas), where a low value lets the policy ignore the cameras and stall.
+    state_dropout_prob: float | None = None
+
     # Inference-time knob: Number of flow-matching denoising steps used to decode an action chunk.
     # Trades inference latency for action quality.
     # None keeps the checkpoint value (GR00T N1.7 default: 4).
@@ -475,13 +482,23 @@ class GrootConfig(PreTrainedConfig):
             betas=self.optimizer_betas,
             eps=self.optimizer_eps,
             weight_decay=self.optimizer_weight_decay,
+            # Match Isaac-GR00T fine-tuning (max_grad_norm=1.0). The LeRobot default of 10.0
+            # lets the flow-matching action-head gradients spike and can destabilize training
+            # (observed as fp32 NaNs / divergence on single-batch stress tests).
+            grad_clip_norm=1.0,
         )
 
     def get_scheduler_preset(self) -> CosineDecayWithWarmupSchedulerConfig:
-        """Return scheduler configuration."""
+        """Return scheduler configuration.
+
+        Decay/warmup are tied to ``max_steps`` (the GR00T config's intended training horizon)
+        rather than a hard-coded 10k. Set ``--policy.max_steps`` equal to the trainer's
+        ``--steps`` so the cosine schedule decays across the whole run instead of flooring early
+        (the scheduler still auto-scales down if the actual run is shorter than ``max_steps``).
+        """
         return CosineDecayWithWarmupSchedulerConfig(
-            num_warmup_steps=int(10000 * self.warmup_ratio),  # 5% warmup by default
-            num_decay_steps=10000,  # Adjust based on training steps
+            num_warmup_steps=int(self.max_steps * self.warmup_ratio),
+            num_decay_steps=self.max_steps,
             peak_lr=self.optimizer_lr,
             decay_lr=self.optimizer_lr * 0.1,
         )

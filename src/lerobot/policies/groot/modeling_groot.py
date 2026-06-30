@@ -95,6 +95,9 @@ class GrootPolicy(PreTrainedPolicy):
             model_kwargs["num_inference_timesteps"] = self.config.num_inference_timesteps
         if self.config.rtc_ramp_rate is not None:
             model_kwargs["rtc_ramp_rate"] = self.config.rtc_ramp_rate
+        # Forwarded as a GR00TN17Config override; consumed by the action head at init.
+        if self.config.state_dropout_prob is not None:
+            model_kwargs["state_dropout_prob"] = self.config.state_dropout_prob
 
         return GR00TN17.from_pretrained(
             **model_kwargs,
