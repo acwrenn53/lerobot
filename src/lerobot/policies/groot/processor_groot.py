@@ -20,13 +20,14 @@ from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import cv2
 import numpy as np
 import torch
 import torchvision.transforms.v2.functional as tv_functional
 from einops import rearrange
 from torchvision.transforms import InterpolationMode
 
-from lerobot.utils.import_utils import _transformers_available, require_package
+from lerobot.utils.import_utils import _datasets_available, _transformers_available, require_package
 
 if TYPE_CHECKING or _transformers_available:
     from transformers import (
@@ -42,6 +43,11 @@ else:
     Qwen2VLImageProcessor = None
     Qwen3VLProcessor = None
     Qwen3VLVideoProcessor = None
+
+if TYPE_CHECKING or _datasets_available:
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+else:
+    LeRobotDataset = None
 
 from lerobot.processor import (
     AbsoluteActionsProcessorStep,
@@ -138,6 +144,7 @@ class _GrootN17CheckpointProcessorAssets:
     shortest_image_edge: int | None
     crop_fraction: float | None
     use_albumentations: bool
+    letter_box_transform: bool
 
 
 @dataclass(frozen=True)
@@ -194,6 +201,9 @@ def _load_n1_7_checkpoint_processor_assets(config: GrootConfig) -> _GrootN17Chec
     use_albumentations = processor_kwargs.get("use_albumentations", False)
     if not isinstance(use_albumentations, bool):
         use_albumentations = False
+    letter_box_transform = processor_kwargs.get("letter_box_transform", False)
+    if not isinstance(letter_box_transform, bool):
+        letter_box_transform = False
 
     valid_action_horizon = _load_n1_7_checkpoint_action_horizon(processor_kwargs, config.embodiment_tag)
     video_horizon = _load_n1_7_checkpoint_video_horizon(processor_kwargs, config.embodiment_tag)
@@ -220,6 +230,7 @@ def _load_n1_7_checkpoint_processor_assets(config: GrootConfig) -> _GrootN17Chec
         shortest_image_edge=as_optional_int(processor_kwargs.get("shortest_image_edge")),
         crop_fraction=as_optional_float(processor_kwargs.get("crop_fraction")),
         use_albumentations=use_albumentations,
+        letter_box_transform=letter_box_transform,
     )
 
 
@@ -811,7 +822,7 @@ def _make_relative_action_training_stats_from_dataset_meta(
     if dataset_meta is None or repo_id is None or root is None or fps is None:
         return None
 
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    require_package("datasets", extra="groot")
 
     horizon = action_horizon or len(config.action_delta_indices)
     delta_timestamps = {ACTION: [index / fps for index in range(horizon)]}
@@ -1059,6 +1070,7 @@ def _build_n1_7_relative_action_processor_assets(
         shortest_image_edge=base_assets.shortest_image_edge if base_assets is not None else None,
         crop_fraction=base_assets.crop_fraction if base_assets is not None else None,
         use_albumentations=base_assets.use_albumentations if base_assets is not None else False,
+        letter_box_transform=base_assets.letter_box_transform if base_assets is not None else False,
     )
     _validate_n1_7_relative_action_processor_assets(config, assets, groups)
     return assets
@@ -1241,6 +1253,7 @@ def make_groot_pre_post_processors(
         shortest_image_edge = None
         crop_fraction = None
     use_albumentations = checkpoint_assets.use_albumentations if checkpoint_assets is not None else False
+    letter_box_transform = checkpoint_assets.letter_box_transform if checkpoint_assets is not None else False
 
     input_steps: list[ProcessorStep] = [
         RenameObservationsProcessorStep(rename_map={}),
@@ -1253,6 +1266,7 @@ def make_groot_pre_post_processors(
             shortest_image_edge=shortest_image_edge,
             crop_fraction=crop_fraction,
             use_albumentations=use_albumentations,
+            letter_box_transform=letter_box_transform,
             device=config.device,
         ),
         DeviceProcessorStep(device=config.device),
@@ -1262,6 +1276,13 @@ def make_groot_pre_post_processors(
     )
     relative_step: RelativeActionsProcessorStep | None = None
     if config.use_relative_actions and not uses_native_relative_actions:
+        logging.warning(
+            "GR00T relative actions are using the generic RelativeActionsProcessorStep fallback because "
+            "the checkpoint already carries non-relative statistics. Relative deltas will be normalized "
+            "with absolute action stats rather than Isaac-GR00T's per-horizon relative stats. For "
+            "OSS-faithful relative normalization, build from a checkpoint without baked-in stats (or "
+            "pass dataset_meta) so native relative stats are computed."
+        )
         relative_step = RelativeActionsProcessorStep(
             enabled=True,
             exclude_joints=list(config.relative_exclude_joints or []),
@@ -1370,6 +1391,7 @@ def _transform_n1_7_image_for_vlm_albumentations(
     image_target_size: list[int] | None,
     shortest_image_edge: int | None,
     crop_fraction: float | None,
+    letter_box_transform: bool = False,
 ) -> np.ndarray:
     """cv2/INTER_AREA eval transform mirroring Isaac-GR00T's albumentations preprocessing.
 
@@ -1385,13 +1407,6 @@ def _transform_n1_7_image_for_vlm_albumentations(
 
     target_h, target_w = image_target_size
 
-    try:
-        import cv2
-    except ImportError as exc:
-        raise ImportError(
-            "GR00T N1.7 checkpoints with use_albumentations=True require opencv-python-headless."
-        ) from exc
-
     image_np = np.asarray(image)
     if image_np.ndim == 2:
         image_np = np.repeat(image_np[:, :, None], 3, axis=2)
@@ -1400,6 +1415,18 @@ def _transform_n1_7_image_for_vlm_albumentations(
 
     if not image_np.flags.c_contiguous:
         image_np = np.ascontiguousarray(image_np)
+
+    if letter_box_transform:
+        height, width = image_np.shape[:2]
+        if height != width:
+            square_edge = max(height, width)
+            pad_h = square_edge - height
+            pad_w = square_edge - width
+            top = pad_h // 2
+            bottom = pad_h - top
+            left = pad_w // 2
+            right = pad_w - left
+            image_np = cv2.copyMakeBorder(image_np, top, bottom, left, right, cv2.BORDER_CONSTANT, value=0)
 
     resize_edge = shortest_image_edge or target_h
 
@@ -1439,9 +1466,12 @@ def _transform_n1_7_image_for_vlm_torch(
     image_target_size: list[int] | None,
     shortest_image_edge: int | None,
     crop_fraction: float | None,
+    letter_box_transform: bool = False,
 ) -> torch.Tensor:
-    """Default (non-albumentations) N1.7 image transform: pad-to-square, resize to
-    ``shortest_image_edge``, center-crop by ``crop_fraction``, resize to ``image_target_size``.
+    """Default (non-albumentations) N1.7 image transform.
+
+    Optionally pads to square, then resizes to ``shortest_image_edge``, center-crops
+    by ``crop_fraction``, and resizes to ``image_target_size``.
 
     Operates on a ``(C, H, W)`` uint8 tensor and keeps the result on the input
     tensor's device so the resize/crop run on GPU when the tensor is. Bicubic
@@ -1456,13 +1486,14 @@ def _transform_n1_7_image_for_vlm_torch(
     target_h, target_w = image_target_size
     _, height, width = image.shape
 
-    square_edge = max(height, width)
-    if height != width:
-        left = (square_edge - width) // 2
-        top = (square_edge - height) // 2
-        image = tv_functional.pad(
-            image, [left, top, square_edge - width - left, square_edge - height - top], fill=0
-        )
+    if letter_box_transform:
+        square_edge = max(height, width)
+        if height != width:
+            left = (square_edge - width) // 2
+            top = (square_edge - height) // 2
+            image = tv_functional.pad(
+                image, [left, top, square_edge - width - left, square_edge - height - top], fill=0
+            )
 
     resize_edge = shortest_image_edge or target_h
     image = tv_functional.resize(
@@ -1726,6 +1757,25 @@ class GrootN17PackInputsStep(ProcessorStep):
             return None
         return torch.cat(normalized_groups, dim=-1)
 
+    def _uses_relative_action_groups(self) -> bool:
+        """True when the action modality declares at least one relative group.
+
+        Relative groups normalize with per-chunk-timestep (2D) ``relative_action`` stats, which the
+        flat ``_min_max_norm`` fallback cannot honor, so a relative config that fails grouped
+        normalization must fail loudly rather than silently wrongly scale every timestep.
+        """
+        if not isinstance(self.modality_config, dict):
+            return False
+        action_config = self.modality_config.get("action", {})
+        if not isinstance(action_config, dict):
+            return False
+        action_configs = action_config.get("action_configs", [])
+        if not isinstance(action_configs, list):
+            return False
+        return any(
+            isinstance(cfg, dict) and config_value(cfg.get("rep")) == "relative" for cfg in action_configs
+        )
+
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         obs = transition.get(TransitionKey.OBSERVATION, {}) or {}
         comp = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}) or {}
@@ -1843,6 +1893,15 @@ class GrootN17PackInputsStep(ProcessorStep):
                 normalized_action = self._normalize_action_groups_for_training(action)
                 if normalized_action is not None:
                     action = normalized_action
+                elif self._uses_relative_action_groups():
+                    raise ValueError(
+                        "GrootN17PackInputsStep could not apply native grouped normalization to a "
+                        "relative-action chunk: the action layout or horizon does not match the "
+                        f"checkpoint relative_action stats (action shape {tuple(action.shape)}). The flat "
+                        "min/max fallback cannot honor per-chunk-timestep relative stats, so refusing to "
+                        "silently wrongly normalize. Recompute the relative action stats so their horizon and "
+                        "dimensions match the action chunk."
+                    )
                 else:
                     flat = _min_max_norm(action.reshape(bsz * horizon, dim), ACTION)
                     action = flat.view(bsz, horizon, dim)
@@ -1979,6 +2038,7 @@ class GrootN17VLMEncodeStep(ProcessorStep):
     shortest_image_edge: int | None = None
     crop_fraction: float | None = None
     use_albumentations: bool = False
+    letter_box_transform: bool = False
     device: str | None = None
     _proc: ProcessorMixin | None = field(default=None, init=False, repr=False)
 
@@ -2020,6 +2080,7 @@ class GrootN17VLMEncodeStep(ProcessorStep):
                         image_target_size=self.image_target_size,
                         shortest_image_edge=self.shortest_image_edge,
                         crop_fraction=self.crop_fraction,
+                        letter_box_transform=self.letter_box_transform,
                     )
                     for timestep in range(video_np.shape[1])
                     for view_idx in range(video_np.shape[2])
@@ -2044,6 +2105,7 @@ class GrootN17VLMEncodeStep(ProcessorStep):
                         image_target_size=self.image_target_size,
                         shortest_image_edge=self.shortest_image_edge,
                         crop_fraction=self.crop_fraction,
+                        letter_box_transform=self.letter_box_transform,
                     )
                     for timestep in range(sample.shape[0])
                     for view_idx in range(sample.shape[1])
@@ -2117,6 +2179,7 @@ class GrootN17VLMEncodeStep(ProcessorStep):
             "shortest_image_edge": self.shortest_image_edge,
             "crop_fraction": self.crop_fraction,
             "use_albumentations": self.use_albumentations,
+            "letter_box_transform": self.letter_box_transform,
             "device": self.device,
         }
 

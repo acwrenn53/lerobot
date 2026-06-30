@@ -30,10 +30,12 @@ from lerobot.configs import FeatureType, PolicyFeature
 from lerobot.policies.factory import make_policy_config, make_pre_post_processors
 from lerobot.policies.groot.configuration_groot import (
     GROOT_ACTION_DECODE_TRANSFORM_LIBERO,
+    GROOT_N1_7,
     GROOT_N1_7_BASE_MODEL,
     GrootConfig,
     infer_groot_n1_7_action_execution_horizon,
     infer_groot_n1_7_action_horizon,
+    normalize_groot_model_version,
 )
 from lerobot.policies.groot.modeling_groot import GrootPolicy
 from lerobot.policies.groot.processor_groot import (
@@ -43,6 +45,7 @@ from lerobot.policies.groot.processor_groot import (
     GrootN17VLMEncodeStep,
     _make_relative_action_training_stats,
     _transform_n1_7_image_for_vlm_albumentations,
+    _transform_n1_7_image_for_vlm_torch,
     make_groot_pre_post_processors,
 )
 from lerobot.processor import (
@@ -92,6 +95,8 @@ def _raw_n1_7_libero_config(model_path) -> GrootConfig:
 
 
 def test_n1_7_backbone_accepts_transformers_5_layout_and_forwards_mm_token_type_ids(monkeypatch):
+    pytest.importorskip("transformers")
+
     from transformers.feature_extraction_utils import BatchFeature
 
     import lerobot.policies.groot.groot_n1_7 as groot_n1_7
@@ -185,6 +190,8 @@ def test_n1_7_backbone_accepts_transformers_5_layout_and_forwards_mm_token_type_
 
 
 def test_n1_7_backbone_preserves_missing_qwen_optional_dependency_error(monkeypatch):
+    pytest.importorskip("transformers")
+
     import lerobot.policies.groot.groot_n1_7 as groot_n1_7
 
     monkeypatch.setattr(
@@ -230,6 +237,7 @@ def _write_raw_n1_7_libero_checkpoint(path):
                     "shortest_image_edge": 256,
                     "crop_fraction": 0.95,
                     "use_albumentations": True,
+                    "letter_box_transform": False,
                     "max_action_horizon": 40,
                     "max_state_dim": 132,
                     "max_action_dim": 132,
@@ -350,6 +358,18 @@ def test_groot_defaults_use_n1_7():
     assert len(config.action_delta_indices) == 40
 
 
+@pytest.mark.parametrize("legacy_version", ["n1.5", "n1_5", "n15", "1.5"])
+def test_groot_normalize_model_version_rejects_n1_5_aliases(legacy_version):
+    # model_version is no longer a GrootConfig field, but normalize_groot_model_version is still
+    # live (e.g. via infer_groot_model_version) and must keep rejecting N1.5 with removal guidance.
+    with pytest.raises(ValueError, match="Unsupported GR00T model_version"):
+        normalize_groot_model_version(legacy_version)
+
+
+def test_groot_normalize_model_version_accepts_n1_7():
+    assert normalize_groot_model_version(GROOT_N1_7) == GROOT_N1_7
+
+
 def test_groot_n1_7_accepts_named_action_decode_transform():
     config = GrootConfig(
         action_decode_transform="libero",
@@ -393,6 +413,8 @@ def test_groot_predict_action_chunk_accepts_rtc_kwargs():
 
 
 def test_groot_predict_action_chunk_forwards_n1_7_rtc_prefix(monkeypatch):
+    pytest.importorskip("transformers")
+
     from lerobot.policies.groot.groot_n1_7 import GR00TN17
 
     dummy_model = _DummyGrootModel()
@@ -422,6 +444,8 @@ def test_groot_predict_action_chunk_forwards_n1_7_rtc_prefix(monkeypatch):
 
 
 def test_groot_predict_action_chunk_strips_padded_n1_7_rtc_prefix(monkeypatch):
+    pytest.importorskip("transformers")
+
     from lerobot.policies.groot.groot_n1_7 import GR00TN17
 
     dummy_model = _DummyGrootModel()
@@ -455,6 +479,8 @@ def test_groot_predict_action_chunk_strips_padded_n1_7_rtc_prefix(monkeypatch):
 
 
 def test_groot_n1_7_predict_action_chunk_truncates_to_checkpoint_valid_horizon(tmp_path, monkeypatch):
+    pytest.importorskip("transformers")
+
     from lerobot.policies.groot.groot_n1_7 import GR00TN17
 
     model_path = tmp_path / "libero_spatial"
@@ -508,6 +534,8 @@ def test_groot_from_pretrained_rejects_mismatched_caller_config(tmp_path):
 
 
 def test_groot_from_pretrained_keeps_matching_caller_config(tmp_path, monkeypatch):
+    pytest.importorskip("transformers")
+
     from lerobot.policies.groot.groot_n1_7 import GR00TN17
 
     model_path = tmp_path / "GR00T-N1.7-local"
@@ -522,6 +550,8 @@ def test_groot_from_pretrained_keeps_matching_caller_config(tmp_path, monkeypatc
 
 
 def test_groot_from_pretrained_infers_n1_7_from_ambiguous_local_config(tmp_path, monkeypatch):
+    pytest.importorskip("transformers")
+
     from lerobot.policies.groot.groot_n1_7 import GR00TN17
 
     model_path = tmp_path / "local-checkpoint"
@@ -572,6 +602,7 @@ def test_raw_n1_7_libero_checkpoint_processors_use_checkpoint_assets(tmp_path):
     assert vlm_encode.shortest_image_edge == 256
     assert vlm_encode.crop_fraction == 0.95
     assert vlm_encode.use_albumentations is True
+    assert vlm_encode.letter_box_transform is False
     assert decode_actions.raw_stats["action"]["gripper"]["q99"] == [115.0]
     assert decode_actions.env_action_dim == 7
     assert decode_actions.use_percentiles is True
@@ -645,6 +676,7 @@ def test_groot_n1_7_saved_processors_round_trip_checkpoint_specific_fields(tmp_p
         config_filename="policy_postprocessor.json",
     )
     pack_inputs = next(step for step in loaded_preprocessor.steps if isinstance(step, GrootN17PackInputsStep))
+    vlm_encode = next(step for step in loaded_preprocessor.steps if isinstance(step, GrootN17VLMEncodeStep))
     decode_actions = next(
         step for step in loaded_postprocessor.steps if isinstance(step, GrootN17ActionDecodeStep)
     )
@@ -653,6 +685,7 @@ def test_groot_n1_7_saved_processors_round_trip_checkpoint_specific_fields(tmp_p
     assert pack_inputs.action_horizon == 40
     assert pack_inputs.video_modality_keys == ["image", "wrist_image"]
     assert pack_inputs.clip_outliers is True
+    assert vlm_encode.letter_box_transform is False
     torch.testing.assert_close(
         pack_inputs.stats[OBS_STATE]["min"],
         torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
@@ -995,6 +1028,42 @@ def test_groot_n1_7_pack_inputs_normalizes_action_chunk_per_dimension_before_pad
     assert action_mask[0, :3, :3].sum().item() == 9
     assert action_mask[0, 3:].sum().item() == 0
     assert action_mask[0, :, 3:].sum().item() == 0
+
+
+def test_groot_n1_7_pack_inputs_raises_when_relative_groups_cannot_normalize():
+    # Relative groups carry per-chunk-timestep stats; if the action horizon exceeds the available
+    # stat rows, grouped normalization cannot apply and the flat fallback would silently wrongly scale.
+    step = GrootN17PackInputsStep(
+        action_horizon=3,
+        valid_action_horizon=3,
+        max_state_dim=2,
+        max_action_dim=2,
+        normalize_min_max=True,
+        raw_stats={
+            "state": {"single_arm": {"min": [0.0, 0.0], "max": [1.0, 1.0]}},
+            "action": {"single_arm": {"min": [0.0, 0.0], "max": [1.0, 1.0]}},
+            # only one horizon row, but the action chunk has horizon 3
+            "relative_action": {"single_arm": {"min": [[-1.0, -1.0]], "max": [[1.0, 1.0]]}},
+        },
+        modality_config={
+            "state": {"modality_keys": ["single_arm"]},
+            "action": {
+                "modality_keys": ["single_arm"],
+                "action_configs": [
+                    {"rep": "RELATIVE", "type": "NON_EEF", "format": "DEFAULT", "state_key": None}
+                ],
+                "delta_indices": [0, 1, 2],
+            },
+        },
+    )
+    transition = {
+        TransitionKey.OBSERVATION: {OBS_STATE: torch.zeros(1, 2)},
+        TransitionKey.ACTION: torch.zeros(1, 3, 2),
+        TransitionKey.COMPLEMENTARY_DATA: {"task": ["Move"]},
+    }
+
+    with pytest.raises(ValueError, match="could not apply native grouped normalization"):
+        step(transition)
 
 
 def test_groot_n1_7_pack_inputs_trains_native_relative_groups_with_absolute_gripper():
@@ -1785,6 +1854,58 @@ def test_groot_n1_7_vlm_image_transform_matches_albumentations_eval_path():
     np.testing.assert_array_equal(np.asarray(transformed), expected)
 
 
+def test_groot_n1_7_albumentations_letterbox_is_opt_in():
+    pytest.importorskip("cv2", exc_type=ImportError)
+
+    image = np.full((3, 5, 3), 255, dtype=np.uint8)
+
+    default = _transform_n1_7_image_for_vlm_albumentations(
+        image,
+        image_crop_size=None,
+        image_target_size=[10, 10],
+        shortest_image_edge=10,
+        crop_fraction=None,
+    )
+    letterboxed = _transform_n1_7_image_for_vlm_albumentations(
+        image,
+        image_crop_size=None,
+        image_target_size=[10, 10],
+        shortest_image_edge=10,
+        crop_fraction=None,
+        letter_box_transform=True,
+    )
+
+    assert default.shape == (10, 17, 3)
+    assert default.min() == 255
+    assert letterboxed.shape == (10, 10, 3)
+    assert letterboxed.min() < 255
+
+
+def test_groot_n1_7_torch_letterbox_is_opt_in():
+    image = torch.full((3, 3, 5), 255, dtype=torch.uint8)
+
+    default = _transform_n1_7_image_for_vlm_torch(
+        image,
+        image_crop_size=None,
+        image_target_size=[10, 10],
+        shortest_image_edge=10,
+        crop_fraction=None,
+    )
+    letterboxed = _transform_n1_7_image_for_vlm_torch(
+        image,
+        image_crop_size=None,
+        image_target_size=[10, 10],
+        shortest_image_edge=10,
+        crop_fraction=None,
+        letter_box_transform=True,
+    )
+
+    assert tuple(default.shape) == (3, 10, 10)
+    assert int(default.min()) == 255
+    assert tuple(letterboxed.shape) == (3, 10, 10)
+    assert int(letterboxed.min()) < 255
+
+
 def test_groot_n1_7_vlm_encode_transforms_non_square_two_camera_sample_like_core_albumentations():
     cv2 = pytest.importorskip("cv2", exc_type=ImportError)
 
@@ -1855,6 +1976,7 @@ def test_groot_n1_7_vlm_encode_config_round_trips_model_name():
         shortest_image_edge=256,
         crop_fraction=0.95,
         use_albumentations=True,
+        letter_box_transform=True,
     )
 
     restored = GrootN17VLMEncodeStep(**step.get_config())
@@ -1865,6 +1987,7 @@ def test_groot_n1_7_vlm_encode_config_round_trips_model_name():
     assert restored.shortest_image_edge == 256
     assert restored.crop_fraction == 0.95
     assert restored.use_albumentations is True
+    assert restored.letter_box_transform is True
 
 
 def test_groot_n1_7_processor_uses_qwen_component_assets(monkeypatch):
@@ -2116,6 +2239,8 @@ def test_groot_n1_7_relative_action_training_processors_save_native_grouped_stat
 
 
 def test_groot_n1_7_relative_action_processors_compute_stats_from_runtime_dataset_meta(monkeypatch, tmp_path):
+    pytest.importorskip("datasets")
+
     input_features, output_features = _groot_features(state_dim=6, action_dim=6)
     action_names = [
         "shoulder_pan.pos",
@@ -2192,7 +2317,7 @@ def test_groot_n1_7_relative_action_processors_compute_stats_from_runtime_datase
         assert kwargs["delta_timestamps"][ACTION] == [0.0, 1 / runtime_meta.fps]
         return _RelativeStatsDataset()
 
-    monkeypatch.setattr("lerobot.datasets.lerobot_dataset.LeRobotDataset", _fake_lerobot_dataset)
+    monkeypatch.setattr("lerobot.policies.groot.processor_groot.LeRobotDataset", _fake_lerobot_dataset)
     config._runtime_dataset_meta = runtime_meta
 
     preprocessor, postprocessor = make_groot_pre_post_processors(config, dataset_stats=absolute_dataset_stats)
@@ -2430,6 +2555,8 @@ def test_groot_n1_7_relative_action_stats_skip_padded_tail_chunks():
 
 
 def test_groot_policy_selects_n1_7_model_class(monkeypatch):
+    pytest.importorskip("transformers")
+
     from lerobot.policies.groot.groot_n1_7 import GR00TN17
 
     called = {}
@@ -2447,6 +2574,8 @@ def test_groot_policy_selects_n1_7_model_class(monkeypatch):
 
 
 def test_groot_policy_forwards_n1_7_qwen_inputs(monkeypatch):
+    pytest.importorskip("transformers")
+
     from lerobot.policies.groot.groot_n1_7 import GR00TN17
 
     dummy_model = _DummyGrootModel()
@@ -2505,6 +2634,8 @@ def test_groot_select_action_rejects_relative_action_policies():
 
 
 def test_groot_n1_7_select_action_uses_checkpoint_valid_horizon(tmp_path, monkeypatch):
+    pytest.importorskip("transformers")
+
     from lerobot.policies.groot.groot_n1_7 import GR00TN17
 
     model_path = tmp_path / "libero_spatial"
@@ -2697,6 +2828,8 @@ def test_qwen3_backbone_can_initialize_from_config_without_downloading_weights(m
 
 
 def test_gr00t_n1_7_from_pretrained_defers_backbone_weight_loading(monkeypatch, tmp_path):
+    pytest.importorskip("transformers")
+
     from huggingface_hub.errors import HFValidationError
 
     import lerobot.policies.groot.groot_n1_7 as groot_n1_7
