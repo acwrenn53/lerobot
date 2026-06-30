@@ -1,0 +1,56 @@
+{
+  "dataset_repo_id": "izuluaga/two-ingredient-sandwich",
+  "model_path": "awrenn53/groot-two-ingredient-sandwich-lerobot",
+  "checkpoint_format": "lerobot_groot_pretrained_model",
+  "lang_instruction": "complete the ham lettuce sandwich",
+  "action_horizon": 16,
+  "steps": 200,
+  "view_map": {
+    "front": "front",
+    "wrist": "wrist"
+  },
+  "seed": 42,
+  "trajectories": {
+    "0": {
+      "mse": 17.803495407104492,
+      "mae": 1.5197725296020508,
+      "per_dim_mse": [
+        0.8824464678764343,
+        45.921714782714844,
+        54.867435455322266,
+        1.3045761585235596,
+        3.511453151702881,
+        0.3333563506603241
+      ],
+      "plot": "tests/policies/groot/artifacts/open_loop_eval_lerobot_ckpt/traj_0.png"
+    },
+    "1": {
+      "mse": 10.019686698913574,
+      "mae": 1.742896318435669,
+      "per_dim_mse": [
+        1.6141068935394287,
+        22.41781997680664,
+        20.533409118652344,
+        4.094640731811523,
+        1.3368046283721924,
+        10.121345520019531
+      ],
+      "plot": "tests/policies/groot/artifacts/open_loop_eval_lerobot_ckpt/traj_1.png"
+    },
+    "2": {
+      "mse": 7.409728050231934,
+      "mae": 1.530023217201233,
+      "per_dim_mse": [
+        5.355242729187012,
+        15.800868034362793,
+        15.730705261230469,
+        3.077742576599121,
+        2.9405460357666016,
+        1.5532668828964233
+      ],
+      "plot": "tests/policies/groot/artifacts/open_loop_eval_lerobot_ckpt/traj_2.png"
+    }
+  },
+  "avg_mse": 11.744303385416666,
+  "avg_mae": 1.5975640217463176
+}
