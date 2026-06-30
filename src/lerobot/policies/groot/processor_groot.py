@@ -2217,11 +2217,10 @@ class GrootN17ActionDecodeStep(ProcessorStep):
     most recent preprocess call. Engines that decode the whole chunk right
     after prediction (RTC, async policy server) therefore use the
     prediction-time state, matching Isaac-GR00T. The sync per-step queue path
-    instead decodes each popped (B, D) action against the latest observation:
-    the reference can be newer than the observation the chunk was predicted
-    from, and per-timestep relative stats are applied as if the popped action
-    were chunk step 0. Fixing that would require carrying the reference state
-    and chunk index alongside each queued action through the postprocessor.
+    must not decode cached raw relative future actions against newer
+    observations. GR00T's relative-action ``select_action`` path replans every
+    call and returns only the first horizon step, so a 2-D action is safe to
+    decode as a singleton step-0 chunk.
     """
 
     env_action_dim: int = 0
@@ -2248,18 +2247,19 @@ class GrootN17ActionDecodeStep(ProcessorStep):
             return transition
 
         action_np = action.detach().cpu().float().numpy()
-        if self.use_relative_action and action_np.ndim != 3:
-            raise NotImplementedError(
-                "GrootN17ActionDecodeStep cannot decode native relative actions one step at a time. "
-                "Decode the full action chunk returned by predict_action_chunk while the matching "
-                "GrootN17PackInputsStep state is still cached, then queue the decoded absolute actions."
-            )
-        # The sync action queue postprocesses popped actions as (B, D); decode
-        # them as single-step (B, 1, D) chunks and squeeze the horizon back at
-        # the end so both ranks share the chunk decode logic below.
+        # GR00T relative select_action replans each call and returns only the
+        # first raw horizon step. Decode that (B, D) action as a singleton
+        # (B, 1, D) chunk against the current cached raw state. Cached future
+        # raw relative actions are still unsafe and must not flow through this
+        # path.
         squeeze_horizon = action_np.ndim == 2
         if squeeze_horizon:
             action_np = action_np[:, None, :]
+        elif self.use_relative_action and action_np.ndim != 3:
+            raise NotImplementedError(
+                "GrootN17ActionDecodeStep can decode native relative actions only as a full "
+                "(B, T, D) chunk or as the singleton (B, D) step-0 output from select_action."
+            )
         valid_horizon = _n1_7_decode_valid_horizon(action_config, action_np)
         if valid_horizon is not None:
             action_np = action_np[:, :valid_horizon]

@@ -1472,7 +1472,7 @@ def test_groot_n1_7_action_decode_truncates_to_valid_horizon_for_relative_stats(
     torch.testing.assert_close(decoded[..., 5], torch.full((1, 16), 5.0))
 
 
-def test_groot_n1_7_action_decode_rejects_stepwise_native_relative_actions():
+def test_groot_n1_7_action_decode_accepts_singleton_select_action_relative_step():
     raw_stats = {
         "state": {
             "single_arm": _stats([0.0] * 5),
@@ -1505,7 +1505,7 @@ def test_groot_n1_7_action_decode_rejects_stepwise_native_relative_actions():
     )
     pack_step(
         {
-            TransitionKey.OBSERVATION: {OBS_STATE: torch.zeros(1, 6)},
+            TransitionKey.OBSERVATION: {OBS_STATE: torch.tensor([[1.0, 2.0, 3.0, 4.0, 5.0, 9.0]])},
             TransitionKey.COMPLEMENTARY_DATA: {},
         }
     )
@@ -1517,8 +1517,12 @@ def test_groot_n1_7_action_decode_rejects_stepwise_native_relative_actions():
         pack_step=pack_step,
     )
 
-    with pytest.raises(NotImplementedError, match="cannot decode native relative actions one step at a time"):
-        decode_step({TransitionKey.ACTION: torch.zeros(1, 6)})
+    output = decode_step({TransitionKey.ACTION: torch.zeros(1, 6)})
+
+    torch.testing.assert_close(
+        output[TransitionKey.ACTION],
+        torch.tensor([[51.0, 52.0, 53.0, 54.0, 55.0, 50.0]]),
+    )
 
 
 def test_groot_n1_7_action_decode_requires_gripper_key_for_libero_transform():
@@ -2662,12 +2666,30 @@ def test_groot_n1_7_libero_execution_horizon_uses_core_eight_action_cadence(tmp_
     assert infer_groot_n1_7_action_execution_horizon(model_path, "libero_sim") == 8
 
 
-def test_groot_select_action_rejects_relative_action_policies():
+def test_groot_select_action_relative_actions_replan_and_return_first_step():
     policy = object.__new__(GrootPolicy)
     object.__setattr__(policy, "config", SimpleNamespace(use_relative_actions=True))
+    object.__setattr__(policy, "_action_queue", [torch.full((1, 2), 99.0)])
+    object.__setattr__(policy, "eval", lambda: None)
+    chunks = [
+        torch.tensor([[[1.0, 2.0], [3.0, 4.0]]]),
+        torch.tensor([[[5.0, 6.0], [7.0, 8.0]]]),
+    ]
+    calls = []
 
-    with pytest.raises(NotImplementedError, match="select_action does not support relative-action policies"):
-        policy.select_action({})
+    def predict_action_chunk(batch):
+        calls.append(batch)
+        return chunks[len(calls) - 1]
+
+    object.__setattr__(policy, "predict_action_chunk", predict_action_chunk)
+
+    first = policy.select_action({"step": 0})
+    second = policy.select_action({"step": 1})
+
+    torch.testing.assert_close(first, torch.tensor([[1.0, 2.0]]))
+    torch.testing.assert_close(second, torch.tensor([[5.0, 6.0]]))
+    assert calls == [{"step": 0}, {"step": 1}]
+    assert policy._action_queue == []
 
 
 def test_groot_n1_7_select_action_uses_checkpoint_valid_horizon(tmp_path, monkeypatch):
