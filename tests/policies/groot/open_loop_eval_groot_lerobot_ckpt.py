@@ -194,20 +194,31 @@ def evaluate_single_trajectory(
     lang_instruction: str,
     steps: int,
     action_horizon: int,
+    execution_horizon: int,
     save_plot_path: str,
 ) -> tuple[float, float, np.ndarray]:
-    """Open-loop eval for one trajectory; returns (mse, mae, per_dim_mse)."""
+    """Open-loop eval for one trajectory; returns (mse, mae, per_dim_mse).
+
+    ``action_horizon`` is the chunk length the policy predicts per inference
+    (the policy ``n_action_steps``). ``execution_horizon`` is how many actions
+    are consumed from each predicted chunk before re-inferring -- the open-loop
+    analogue of ``lerobot-rollout --inference.rtc.execution_horizon``. When the
+    two are equal this reduces to plain chunk-stepping.
+    """
     from lerobot.utils.constants import ACTION, OBS_STATE
 
     from_idx, to_idx = _episode_frame_range(dataset, traj_id)
     traj_length = to_idx - from_idx
     actual_steps = min(steps, traj_length)
     logger.info(
-        "Trajectory %d: using %d steps (requested %d, length %d)",
+        "Trajectory %d: using %d steps (requested %d, length %d), "
+        "chunk=%d exec_horizon=%d",
         traj_id,
         actual_steps,
         steps,
         traj_length,
+        action_horizon,
+        execution_horizon,
     )
 
     gt_state = []
@@ -221,7 +232,7 @@ def evaluate_single_trajectory(
 
     pred_action_across_time: list[np.ndarray] = []
 
-    for step_count in range(0, actual_steps, action_horizon):
+    for step_count in range(0, actual_steps, execution_horizon):
         frame = dataset[from_idx + step_count]
         logger.info("inferencing at step: %d", step_count)
 
@@ -244,7 +255,9 @@ def evaluate_single_trajectory(
         chunk = postprocessor(chunk)
         chunk_np = chunk.detach().cpu().float().numpy()[0]  # (horizon, action_dim)
 
-        for j in range(action_horizon):
+        # Consume only the first ``execution_horizon`` actions of the chunk,
+        # then re-infer (mirrors rollout execution_horizon semantics).
+        for j in range(execution_horizon):
             if j < chunk_np.shape[0]:
                 pred_action_across_time.append(chunk_np[j])
 
@@ -266,7 +279,7 @@ def evaluate_single_trajectory(
         traj_id=traj_id,
         state_keys=state_keys,
         action_keys=action_keys,
-        action_horizon=action_horizon,
+        action_horizon=execution_horizon,
         save_plot_path=save_plot_path,
     )
     return mse, mae, per_dim_mse
@@ -335,7 +348,22 @@ def main() -> None:
         help="Fallback instruction if the dataset frame has no task string.",
     )
     parser.add_argument("--traj-ids", type=int, nargs="+", default=[0, 1, 2])
-    parser.add_argument("--action-horizon", type=int, default=16)
+    parser.add_argument(
+        "--action-horizon",
+        type=int,
+        default=16,
+        help="Chunk length the policy predicts per inference (policy n_action_steps).",
+    )
+    parser.add_argument(
+        "--execution-horizon",
+        type=int,
+        default=None,
+        help=(
+            "Actions consumed from each chunk before re-inferring "
+            "(open-loop analogue of rollout --inference.rtc.execution_horizon). "
+            "Defaults to --action-horizon (plain chunk-stepping)."
+        ),
+    )
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument(
         "--view-map",
@@ -358,6 +386,8 @@ def main() -> None:
     )
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+    if args.execution_horizon is None:
+        args.execution_horizon = args.action_horizon
 
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -385,6 +415,7 @@ def main() -> None:
         "checkpoint_format": "lerobot_groot_pretrained_model",
         "lang_instruction": args.lang_instruction,
         "action_horizon": args.action_horizon,
+        "execution_horizon": args.execution_horizon,
         "steps": args.steps,
         "view_map": view_map,
         "seed": args.seed,
@@ -408,6 +439,7 @@ def main() -> None:
             lang_instruction=args.lang_instruction,
             steps=args.steps,
             action_horizon=args.action_horizon,
+            execution_horizon=args.execution_horizon,
             save_plot_path=plot_path,
         )
         results["trajectories"][str(traj_id)] = {

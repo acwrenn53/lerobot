@@ -1,0 +1,57 @@
+{
+  "dataset_repo_id": "izuluaga/two-ingredient-sandwich",
+  "model_path": "awrenn53/groot-two-ingredient-sandwich-lerobot",
+  "checkpoint_format": "lerobot_groot_pretrained_model",
+  "lang_instruction": "complete the beef olives sandwich",
+  "action_horizon": 8,
+  "execution_horizon": 8,
+  "steps": 200,
+  "view_map": {
+    "front": "front",
+    "wrist": "wrist"
+  },
+  "seed": 42,
+  "trajectories": {
+    "25": {
+      "mse": 7.604531288146973,
+      "mae": 1.3635988235473633,
+      "per_dim_mse": [
+        2.2609360218048096,
+        21.328771591186523,
+        14.965812683105469,
+        1.2907894849777222,
+        2.8513617515563965,
+        2.9295074939727783
+      ],
+      "plot": "tests/policies/groot/artifacts/open_loop_eval_lerobot_ckpt_beef_h8/traj_25.png"
+    },
+    "26": {
+      "mse": 6.0691399574279785,
+      "mae": 1.3486104011535645,
+      "per_dim_mse": [
+        0.9698388576507568,
+        12.972129821777344,
+        14.160168647766113,
+        2.813741445541382,
+        1.845900535583496,
+        3.6530611515045166
+      ],
+      "plot": "tests/policies/groot/artifacts/open_loop_eval_lerobot_ckpt_beef_h8/traj_26.png"
+    },
+    "27": {
+      "mse": 5.314289569854736,
+      "mae": 1.350846767425537,
+      "per_dim_mse": [
+        1.025232195854187,
+        12.979961395263672,
+        9.028655052185059,
+        3.2763803005218506,
+        3.853787422180176,
+        1.7217215299606323
+      ],
+      "plot": "tests/policies/groot/artifacts/open_loop_eval_lerobot_ckpt_beef_h8/traj_27.png"
+    }
+  },
+  "avg_mse": 6.3293202718098955,
+  "avg_mae": 1.3543519973754883
+}
