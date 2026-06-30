@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import logging
 from copy import copy, deepcopy
 from dataclasses import dataclass, field, fields, is_dataclass
@@ -2028,8 +2029,14 @@ class GrootN17VLMEncodeStep(ProcessorStep):
             "return_tensors": "pt",
             "padding": True,
         }
-        if target_device is not None:
-            proc_kwargs["device"] = str(target_device)
+        image_preprocess = getattr(getattr(self.proc, "image_processor", None), "preprocess", None)
+        if target_device is not None and image_preprocess is not None:
+            try:
+                accepts_device = "device" in inspect.signature(image_preprocess).parameters
+            except (TypeError, ValueError):
+                accepts_device = False
+            if accepts_device:
+                proc_kwargs["device"] = str(target_device)
         encoded = self.proc(**proc_kwargs)
         for key, value in encoded.items():
             comp[key] = value
