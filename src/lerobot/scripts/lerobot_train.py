@@ -54,9 +54,10 @@ from lerobot.datasets.factory import make_train_eval_datasets
 from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
-from lerobot.processor import DeviceProcessorStep, PolicyProcessorPipeline
+from lerobot.processor import DeviceProcessorStep, PolicyProcessorPipeline, create_transition
 from lerobot.rewards import make_reward_pre_post_processors
 from lerobot.utils.collate import lerobot_collate_fn
+from lerobot.utils.constants import ACTION, DONE, INFO, OBS_PREFIX, REWARD, TRUNCATED
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
@@ -71,6 +72,7 @@ from lerobot.utils.utils import (
 from .lerobot_eval import eval_policy_all
 
 WANDB_MODEL_INPUT_IMAGES_KEY = "_wandb_model_input_images"
+_TRANSITION_BATCH_KEYS = {ACTION, REWARD, DONE, TRUNCATED, INFO}
 
 
 class _PreprocessingCollate:
@@ -117,6 +119,27 @@ def _env_flag_enabled(name: str, default: bool = True) -> bool:
     return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
+def _preprocessed_batch_to_transition(batch: dict[str, Any]):
+    if not isinstance(batch, dict):
+        raise ValueError(f"EnvTransition must be a dictionary. Got {type(batch).__name__}")
+
+    observation = {k: v for k, v in batch.items() if k.startswith(OBS_PREFIX)}
+    complementary_data = {
+        k: v
+        for k, v in batch.items()
+        if k not in _TRANSITION_BATCH_KEYS and not k.startswith(OBS_PREFIX)
+    }
+    return create_transition(
+        observation=observation if observation else None,
+        action=batch.get(ACTION),
+        reward=batch.get(REWARD, 0.0),
+        done=batch.get(DONE, False),
+        truncated=batch.get(TRUNCATED, False),
+        info=batch.get(INFO, {}),
+        complementary_data=complementary_data if complementary_data else None,
+    )
+
+
 def _split_groot_preprocessor_for_dataloader(
     preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     *,
@@ -150,7 +173,7 @@ def _split_groot_preprocessor_for_dataloader(
     main_preprocessor = PolicyProcessorPipeline[dict[str, Any], dict[str, Any]](
         steps=main_steps,
         name=f"{preprocessor.name}_main",
-        to_transition=preprocessor.to_transition,
+        to_transition=_preprocessed_batch_to_transition,
         to_output=preprocessor.to_output,
     )
     return worker_preprocessor, main_preprocessor
