@@ -19,6 +19,7 @@ from __future__ import annotations
 import abc
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import draccus
 
@@ -195,6 +196,18 @@ class DAggerStrategyConfig(RolloutStrategyConfig):
 
 
 @dataclass
+class DatasetObservationConfig:
+    """Read-only dataset source for policy observations during rollout tests."""
+
+    repo_id: str
+    root: Path | None = None
+    episode: int | None = None
+    start_index: int = 0
+    loop: bool = True
+    video_backend: str | None = None
+
+
+@dataclass
 class RolloutConfig:
     """Top-level configuration for the ``lerobot-rollout`` CLI.
 
@@ -218,6 +231,11 @@ class RolloutConfig:
 
     # Dataset (required for sentry, highlight, dagger; None for base)
     dataset: DatasetRecordConfig | None = None
+
+    # Optional read-only dataset observation source. When set, base rollout still reads
+    # live robot observations for action execution, but policy inference sees frames
+    # from this dataset instead of live cameras/state.
+    dataset_observation: DatasetObservationConfig | None = None
 
     # Runtime
     fps: float = 30.0
@@ -273,6 +291,8 @@ class RolloutConfig:
             raise ValueError(
                 "Base strategy does not record data. Use sentry, highlight, or dagger for recording."
             )
+        if self.dataset_observation is not None and not isinstance(self.strategy, BaseStrategyConfig):
+            raise ValueError("--dataset_observation.* is currently supported only with --strategy.type=base")
 
         # Sentry MUST use streaming encoding to avoid disk I/O blocking the control loop
         if (

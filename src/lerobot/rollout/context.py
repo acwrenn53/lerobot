@@ -135,6 +135,9 @@ class DatasetContext:
     """Dataset and feature bookkeeping."""
 
     dataset: LeRobotDataset | None
+    observation_dataset: LeRobotDataset | None = None
+    observation_frame_index: int = 0
+    observation_loop: bool = True
     dataset_features: dict = field(default_factory=dict)
     hw_features: dict = field(default_factory=dict)
     ordered_action_keys: list[str] = field(default_factory=list)
@@ -379,6 +382,35 @@ def build_rollout_context(
     if dataset is not None:
         logger.info("Dataset ready: %s (%d existing episodes)", dataset.repo_id, dataset.num_episodes)
 
+    observation_dataset = None
+    observation_frame_index = 0
+    observation_loop = True
+    if cfg.dataset_observation is not None:
+        obs_cfg = cfg.dataset_observation
+        logger.info("Setting up dataset observation source (repo_id=%s)...", obs_cfg.repo_id)
+        observation_dataset = LeRobotDataset(
+            obs_cfg.repo_id,
+            root=obs_cfg.root,
+            episodes=[obs_cfg.episode] if obs_cfg.episode is not None else None,
+            download_videos=True,
+            video_backend=obs_cfg.video_backend,
+            return_uint8=True,
+        )
+        observation_frame_index = obs_cfg.start_index
+        observation_loop = obs_cfg.loop
+        if observation_frame_index < 0 or observation_frame_index >= len(observation_dataset):
+            raise ValueError(
+                f"--dataset_observation.start_index={observation_frame_index} is outside dataset length "
+                f"{len(observation_dataset)}"
+            )
+        logger.info(
+            "Dataset observation source ready: %s (%d frames, start_index=%d, loop=%s)",
+            observation_dataset.repo_id,
+            len(observation_dataset),
+            observation_frame_index,
+            observation_loop,
+        )
+
     # --- 6. Policy pre/post processors (needs dataset stats if any) ---
     dataset_stats = None
     if dataset is not None:
@@ -449,6 +481,9 @@ def build_rollout_context(
         ),
         data=DatasetContext(
             dataset=dataset,
+            observation_dataset=observation_dataset,
+            observation_frame_index=observation_frame_index,
+            observation_loop=observation_loop,
             dataset_features=dataset_features,
             hw_features=hw_features,
             ordered_action_keys=ordered_action_keys,

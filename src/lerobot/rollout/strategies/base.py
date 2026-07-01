@@ -19,12 +19,64 @@ from __future__ import annotations
 import logging
 import time
 
+import numpy as np
+import torch
+
+from lerobot.utils.constants import OBS_IMAGES, OBS_STATE
 from lerobot.utils.robot_utils import precise_sleep
 
 from ..context import RolloutContext
 from .core import RolloutStrategy, send_next_action
 
 logger = logging.getLogger(__name__)
+
+
+def _to_numpy(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().numpy()
+    return np.asarray(value)
+
+
+def _dataset_sample_to_raw_observation(sample: dict, ctx: RolloutContext) -> dict:
+    """Convert a LeRobot dataset sample to the raw observation shape rollout expects."""
+
+    obs = {}
+    state = sample.get(OBS_STATE)
+    if state is not None:
+        state_np = _to_numpy(state).astype(np.float32).reshape(-1)
+        state_names = ctx.data.dataset_features.get(OBS_STATE, {}).get("names") or []
+        for name, value in zip(state_names, state_np, strict=False):
+            obs[name] = float(value)
+        obs[OBS_STATE] = state_np
+
+    for key, value in sample.items():
+        if not isinstance(key, str) or not key.startswith(f"{OBS_IMAGES}."):
+            continue
+        image = _to_numpy(value)
+        if image.ndim == 3 and image.shape[0] in (1, 3):
+            image = np.moveaxis(image, 0, -1)
+        obs[key.removeprefix(f"{OBS_IMAGES}.")] = image
+
+    if not obs:
+        raise ValueError("Dataset observation sample did not contain policy observation features.")
+    return obs
+
+
+def _next_dataset_observation(ctx: RolloutContext) -> dict | None:
+    dataset = ctx.data.observation_dataset
+    if dataset is None:
+        return None
+    if ctx.data.observation_frame_index >= len(dataset):
+        if not ctx.data.observation_loop:
+            ctx.runtime.shutdown_event.set()
+            return None
+        ctx.data.observation_frame_index = 0
+
+    frame_index = ctx.data.observation_frame_index
+    sample = dataset[frame_index]
+    ctx.data.observation_frame_index += 1
+    logger.debug("Using dataset observation frame %d from %s", frame_index, dataset.repo_id)
+    return _dataset_sample_to_raw_observation(sample, ctx)
 
 
 class BaseStrategy(RolloutStrategy):
@@ -60,7 +112,9 @@ class BaseStrategy(RolloutStrategy):
                 break
 
             obs = robot.get_observation()
-            obs_processed = self._process_observation_and_notify(ctx.processors, obs)
+            needs_policy_obs = self._cached_obs_processed is None or interpolator.needs_new_action()
+            policy_obs = (_next_dataset_observation(ctx) if needs_policy_obs else None) or obs
+            obs_processed = self._process_observation_and_notify(ctx.processors, policy_obs)
 
             if self._handle_warmup(cfg.use_torch_compile, loop_start, control_interval):
                 continue
