@@ -279,7 +279,7 @@ def rollout(
                 if not postprocessed_action_queue:
                     with torch.inference_mode():
                         action_chunk = policy.predict_action_chunk(observation)
-                        action_chunk = action_chunk[:, : policy.config.n_action_steps]
+                        action_chunk = action_chunk[:, : policy.get_action_queue_steps()]
                     action_chunk = postprocessor(action_chunk)
                     if (
                         action_chunk.ndim != 3

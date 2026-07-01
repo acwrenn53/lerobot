@@ -3011,6 +3011,7 @@ def test_groot_n1_7_select_action_uses_checkpoint_valid_horizon(tmp_path, monkey
     first_action = policy.select_action(batch)
 
     assert policy._action_queue_steps == 8
+    assert policy.get_action_queue_steps() == 8
     assert len(policy._action_queue) == 7
     torch.testing.assert_close(first_action[0, 0], torch.tensor(0.0))
 

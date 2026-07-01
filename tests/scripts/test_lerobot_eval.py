@@ -66,7 +66,11 @@ class _ChunkPolicy(nn.Module):
     def __init__(self):
         super().__init__()
         self.config = self.Config()
+        self.action_queue_steps = 3
         self.predict_calls = 0
+
+    def get_action_queue_steps(self):
+        return self.action_queue_steps
 
     def reset(self):
         return None
@@ -152,7 +156,7 @@ def test_rollout_replans_after_configured_action_steps(monkeypatch):
 
     env = gym.vector.SyncVectorEnv([_ThreeStepEnv])
     policy = _ChunkPolicy()
-    policy.config.n_action_steps = 2
+    policy.action_queue_steps = 2
     postprocessor = _ChunkPostprocessor()
 
     result = rollout(

@@ -105,7 +105,7 @@ class SyncInferenceEngine(InferenceEngine):
                     )
                     observation = self._preprocessor(observation)
                     action_chunk = self._policy.predict_action_chunk(observation)
-                    action_chunk = action_chunk[:, : self._policy.config.n_action_steps]
+                    action_chunk = action_chunk[:, : self._policy.get_action_queue_steps()]
                     action_chunk = self._postprocessor(action_chunk)
                     if action_chunk.ndim != 3 or action_chunk.shape[0] != 1 or action_chunk.shape[1] == 0:
                         raise ValueError(

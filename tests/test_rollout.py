@@ -261,13 +261,17 @@ def test_sync_inference_postprocesses_required_chunks_before_queueing_actions():
     class ChunkPolicy:
         class Config:
             use_amp = False
-            n_action_steps = 2
+            n_action_steps = 3
 
         config = Config()
 
         def __init__(self):
+            self.action_queue_steps = 2
             self.predict_calls = 0
             self.reset_calls = 0
+
+        def get_action_queue_steps(self):
+            return self.action_queue_steps
 
         def predict_action_chunk(self, _observation):
             self.predict_calls += 1

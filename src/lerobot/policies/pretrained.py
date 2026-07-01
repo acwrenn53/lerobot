@@ -290,6 +290,18 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         """
         raise NotImplementedError
 
+    def get_action_queue_steps(self) -> int:
+        """Return how many predicted actions to execute before replanning.
+
+        Policies whose execution cadence depends on checkpoint metadata may
+        override this method. The default matches the common ``select_action``
+        queue contract based on ``config.n_action_steps``.
+        """
+        action_queue_steps = int(getattr(self.config, "n_action_steps", 1))
+        if action_queue_steps < 1:
+            raise ValueError(f"n_action_steps must be positive, got {action_queue_steps}.")
+        return action_queue_steps
+
     @abc.abstractmethod
     def select_action(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:
         """Return one action to run in the environment (potentially in batch mode).

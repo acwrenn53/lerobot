@@ -302,6 +302,10 @@ class GrootPolicy(PreTrainedPolicy):
             horizons.append(execution_horizon)
         return min(horizons)
 
+    def get_action_queue_steps(self) -> int:
+        """Return the checkpoint-resolved number of actions executed per prediction."""
+        return self._action_queue_steps
+
     def _resolve_prediction_horizon(self, actions: Tensor) -> int:
         """Return the policy-facing action horizon for a native GR00T prediction."""
 
