@@ -233,6 +233,19 @@ def test_empty_pipeline():
     assert len(pipeline) == 0
 
 
+def test_pipeline_reports_when_a_step_requires_full_action_chunks():
+    class ChunkRequiredStep(MockStepWithoutOptionalMethods):
+        @property
+        def requires_full_action_chunk(self) -> bool:
+            return True
+
+    ordinary = DataProcessorPipeline([MockStepWithoutOptionalMethods()])
+    chunk_required = DataProcessorPipeline([MockStepWithoutOptionalMethods(), ChunkRequiredStep()])
+
+    assert ordinary.requires_full_action_chunk is False
+    assert chunk_required.requires_full_action_chunk is True
+
+
 def test_single_step_pipeline():
     """Test pipeline with a single step."""
     step = MockStep("test_step")

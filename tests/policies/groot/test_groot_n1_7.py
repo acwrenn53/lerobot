@@ -916,6 +916,7 @@ def test_converted_raw_n1_7_processors_load_without_legacy_action_unpack_overrid
 
     assert any(isinstance(step, GrootN17PackInputsStep) for step in loaded_preprocessor.steps)
     assert any(isinstance(step, GrootN17ActionDecodeStep) for step in loaded_postprocessor.steps)
+    assert loaded_postprocessor.requires_full_action_chunk is True
 
 
 def test_converted_raw_n1_7_absolute_action_processors_load_without_relative_steps(tmp_path):
@@ -1517,6 +1518,12 @@ def test_groot_n1_7_action_decode_applies_named_libero_transform_from_modality_k
         ]
     )
     torch.testing.assert_close(output[TransitionKey.ACTION], expected)
+
+
+@pytest.mark.parametrize("use_relative_action", [False, True])
+def test_groot_n1_7_action_decode_declares_full_chunk_requirement(use_relative_action):
+    step = GrootN17ActionDecodeStep(use_relative_action=use_relative_action)
+    assert step.requires_full_action_chunk is use_relative_action
 
 
 def test_groot_n1_7_action_decode_truncates_to_valid_horizon_for_relative_stats():

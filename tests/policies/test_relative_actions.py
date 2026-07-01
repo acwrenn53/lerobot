@@ -105,6 +105,11 @@ def test_exclude_joints_supports_partial_name_matching():
     assert step._build_mask(len(names)) == [True, False, True, False]
 
 
+def test_absolute_actions_declares_full_chunk_requirement_only_when_enabled():
+    assert AbsoluteActionsProcessorStep(enabled=False).requires_full_action_chunk is False
+    assert AbsoluteActionsProcessorStep(enabled=True).requires_full_action_chunk is True
+
+
 # Chunk-level relative stats test
 
 

@@ -361,22 +361,27 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         )
 
         """4. Apply postprocessor"""
-        # Apply postprocessor (handles unnormalization and device movement)
-        # Postprocessor expects (B, action_dim) per action, but we have (B, chunk_size, action_dim)
-        # So we process each action in the chunk individually
         start_postprocess = time.perf_counter()
-        _, chunk_size, _ = action_tensor.shape
-
-        # Process each action in the chunk
-        processed_actions = []
-        for i in range(chunk_size):
-            # Extract action at timestep i: (B, action_dim)
-            single_action = action_tensor[:, i, :]
-            processed_action = self.postprocessor(single_action)
-            processed_actions.append(processed_action)
-
-        # Stack back to (B, chunk_size, action_dim), then remove batch dim
-        action_tensor = torch.stack(processed_actions, dim=1).squeeze(0)
+        postprocessor = self.postprocessor
+        if postprocessor is None:
+            raise RuntimeError("PolicyServer postprocessor is not initialized.")
+        if getattr(postprocessor, "requires_full_action_chunk", False):
+            processed_chunk = postprocessor(action_tensor)
+            if processed_chunk.ndim != 3 or processed_chunk.shape[0] != 1 or processed_chunk.shape[1] == 0:
+                raise ValueError(
+                    "Chunk postprocessing in PolicyServer expects shape "
+                    f"(1, non-empty horizon, action_dim), got {tuple(processed_chunk.shape)}."
+                )
+            action_tensor = processed_chunk.squeeze(0)
+        else:
+            # Legacy postprocessors expect one (B, action_dim) action at a time.
+            _, chunk_size, _ = action_tensor.shape
+            processed_actions = []
+            for i in range(chunk_size):
+                single_action = action_tensor[:, i, :]
+                processed_action = postprocessor(single_action)
+                processed_actions.append(processed_action)
+            action_tensor = torch.stack(processed_actions, dim=1).squeeze(0)
         self.logger.debug(f"Postprocessed action shape: {action_tensor.shape}")
 
         action_tensor = action_tensor.detach().cpu()

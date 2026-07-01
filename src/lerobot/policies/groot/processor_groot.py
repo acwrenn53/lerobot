@@ -2338,14 +2338,12 @@ class GrootN17ActionDecodeStep(ProcessorStep):
     Relative-action decoding reads the reference state from the connected
     ``pack_step`` (re-linked after ``from_pretrained`` by
     ``_reconnect_groot_n1_7_pack_decode_steps``), i.e. the state seen by the
-    most recent preprocess call. Engines that decode the whole chunk right
-    after prediction (RTC, async policy server) therefore use the
-    prediction-time state, matching Isaac-GR00T. The sync per-step queue path
-    instead decodes each popped (B, D) action against the latest observation:
-    the reference can be newer than the observation the chunk was predicted
-    from, and per-timestep relative stats are applied as if the popped action
-    were chunk step 0. Fixing that would require carrying the reference state
-    and chunk index alongside each queued action through the postprocessor.
+    most recent preprocess call. Inference engines honor
+    ``requires_full_action_chunk`` by decoding the configured execution horizon
+    immediately, while the prediction-time state and per-horizon statistics are
+    aligned, and only then queue the resulting absolute actions for execution.
+    This matches Isaac-GR00T without re-anchoring queued actions to newer
+    observations.
     """
 
     env_action_dim: int = 0
@@ -2355,6 +2353,11 @@ class GrootN17ActionDecodeStep(ProcessorStep):
     use_relative_action: bool = False
     action_decode_transform: str | None = None
     pack_step: GrootN17PackInputsStep | None = field(default=None, repr=False)
+
+    @property
+    def requires_full_action_chunk(self) -> bool:
+        """Native relative decoding needs the prediction-time state and per-horizon statistics."""
+        return self.use_relative_action
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         action = transition.get(TransitionKey.ACTION)
