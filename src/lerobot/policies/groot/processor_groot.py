@@ -1037,13 +1037,13 @@ def _build_n1_7_relative_action_processor_assets(
         if base_assets is not None and base_assets.max_action_horizon is not None
         else N1_7_NATIVE_ACTION_HORIZON
     )
-    valid_action_horizon = min(config.chunk_size, config.n_action_steps, native_action_horizon)
+    valid_action_horizon = _n1_7_valid_action_horizon(config, native_action_horizon)
     modality_config: dict[str, Any] = {
         "state": {"modality_keys": [group.key for group in groups]},
         "action": {
             "modality_keys": [group.key for group in groups],
             "action_configs": action_configs,
-            "delta_indices": list(range(native_action_horizon)),
+            "delta_indices": list(range(valid_action_horizon)),
         },
     }
     video_modality_keys = (
@@ -1114,9 +1114,9 @@ def _validate_n1_7_relative_action_processor_assets(
             "GR00T N1.7 relative-action processor has max_action_horizon "
             f"{assets.max_action_horizon} below valid_action_horizon {assets.valid_action_horizon}."
         )
-    if not _raw_relative_stats_preserve_action_horizon(assets.raw_stats, groups, assets.max_action_horizon):
+    if not _raw_relative_stats_preserve_action_horizon(assets.raw_stats, groups, assets.valid_action_horizon):
         raise ValueError(
-            "GR00T N1.7 relative-action processor requires horizon-preserving action statistics."
+            "GR00T N1.7 relative-action processor requires valid-horizon-preserving action statistics."
         )
 
     group_keys = {group.key for group in groups}
@@ -1152,6 +1152,15 @@ def _raw_relative_stats_preserve_action_horizon(
             return torch.as_tensor(value).ndim >= 2 and torch.as_tensor(value).shape[0] >= action_horizon
         return False
     return True
+
+
+def _n1_7_valid_action_horizon(config: GrootConfig, max_action_horizon: int) -> int:
+    """Return the real action-delta horizon before N1.7 pads to its native capacity."""
+
+    configured_horizon = len(config.action_delta_indices)
+    if configured_horizon <= 0:
+        configured_horizon = int(config.chunk_size)
+    return min(configured_horizon, max_action_horizon)
 
 
 def make_groot_pre_post_processors(
@@ -1199,8 +1208,9 @@ def make_groot_pre_post_processors(
                 if checkpoint_assets is not None and checkpoint_assets.max_action_horizon is not None
                 else N1_7_NATIVE_ACTION_HORIZON
             )
+            valid_action_horizon = _n1_7_valid_action_horizon(config, native_action_horizon)
             relative_dataset_stats = _make_relative_action_training_stats_from_dataset_meta(
-                config, dataset_meta, action_horizon=native_action_horizon
+                config, dataset_meta, action_horizon=valid_action_horizon
             )
         relative_assets = _build_n1_7_relative_action_processor_assets(
             config,

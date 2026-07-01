@@ -24,8 +24,8 @@ import pytest
 import torch
 
 from lerobot.configs import FeatureType, PolicyFeature
-from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.groot.action_head.cross_attention_dit import AlternateVLDiT
+from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.groot.groot_n1_7 import GR00TN17
 from lerobot.policies.groot.processor_groot import (
     GrootN17ActionDecodeStep,
@@ -40,7 +40,7 @@ from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 OSS_REFERENCE_COMMIT = "ab88b50c718f6528e1df9dcbaf75865d1b604760"
 
 
-def _so101_stats(action_horizon: int = 40) -> tuple[dict, dict]:
+def _so101_stats(action_horizon: int = 16) -> tuple[dict, dict]:
     state_dim = 6
     action_dim = 6
     flat_state = {
@@ -92,7 +92,7 @@ def test_groot_n1_7_relative_processor_preserves_native_action_horizon_for_so101
         relative_exclude_joints=["gripper"],
         use_bf16=False,
     )
-    dataset_stats, meta_stats = _so101_stats(action_horizon=40)
+    dataset_stats, meta_stats = _so101_stats(action_horizon=16)
     dataset_meta = SimpleNamespace(
         features={
             OBS_STATE: {"names": [f"joint_{idx}.pos" for idx in range(5)] + ["gripper.pos"]},
@@ -112,9 +112,9 @@ def test_groot_n1_7_relative_processor_preserves_native_action_horizon_for_so101
     pack_step = next(step for step in preprocessor.steps if isinstance(step, GrootN17PackInputsStep))
     assert pack_step.action_horizon == 40
     assert pack_step.valid_action_horizon == 16
-    assert pack_step.modality_config["action"]["delta_indices"] == list(range(40))
+    assert pack_step.modality_config["action"]["delta_indices"] == list(range(16))
     assert pack_step.modality_config["action"]["modality_keys"] == ["single_arm", "gripper"]
-    assert torch.as_tensor(pack_step.raw_stats["relative_action"]["single_arm"]["min"]).shape == (40, 5)
+    assert torch.as_tensor(pack_step.raw_stats["relative_action"]["single_arm"]["min"]).shape == (16, 5)
 
 
 def _fixture_path(filename: str) -> Path:
