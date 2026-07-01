@@ -93,16 +93,13 @@ class _PreprocessingCollate:
         return self.preprocessor(collated)
 
 
-def should_log_model_input_images(step: int) -> bool:
-    log_freq = os.environ.get("WANDB_MODEL_INPUT_IMAGES_LOG_FREQ")
-    if log_freq is None:
-        return True
+def max_model_input_image_logs() -> int:
+    raw_limit = os.environ.get("WANDB_MODEL_INPUT_IMAGES_MAX_LOGS", "5")
     try:
-        image_logging_steps = int(log_freq)
+        return max(0, int(raw_limit))
     except ValueError:
-        logging.warning("Invalid WANDB_MODEL_INPUT_IMAGES_LOG_FREQ=%r; logging images this step", log_freq)
-        return True
-    return image_logging_steps > 0 and step % image_logging_steps == 0
+        logging.warning("Invalid WANDB_MODEL_INPUT_IMAGES_MAX_LOGS=%r; using 5", raw_limit)
+        return 5
 
 
 def _convert_camera_uint8_to_float(batch: dict[str, Any], camera_keys: list[str]) -> None:
@@ -725,6 +722,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
         )
 
+    model_input_image_log_count = 0
+    model_input_image_log_limit = max_model_input_image_logs()
+
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
         batch = next(dl_iter)
@@ -779,13 +779,17 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                         weighter_stats = sample_weighter.get_stats()
                         wandb_log_dict.update({f"sample_weighting/{k}": v for k, v in weighter_stats.items()})
                     wandb_logger.log_dict(wandb_log_dict, step)
-                    if should_log_model_input_images(step):
+                    if (
+                        model_input_images
+                        and model_input_image_log_count < model_input_image_log_limit
+                    ):
                         wandb_logger.log_images(
                             model_input_images,
                             step=step,
                             mode="train",
                             key="model_input_images",
                         )
+                        model_input_image_log_count += 1
             train_tracker.reset_averages()
 
         if is_eval_step:

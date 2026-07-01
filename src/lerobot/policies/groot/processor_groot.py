@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import logging
+import math
 import os
 from copy import copy, deepcopy
 from dataclasses import dataclass, field, fields, is_dataclass
@@ -111,6 +112,24 @@ def _wandb_model_input_image_limit() -> int:
     except ValueError:
         logging.warning("Invalid WANDB_MODEL_INPUT_IMAGES_MAX=%r; using 8", raw_limit)
         return 8
+
+
+def _wandb_model_input_image_log_freq() -> int:
+    raw_freq = os.environ.get("WANDB_MODEL_INPUT_IMAGES_LOG_FREQ", "100")
+    try:
+        return max(1, int(raw_freq))
+    except ValueError:
+        logging.warning("Invalid WANDB_MODEL_INPUT_IMAGES_LOG_FREQ=%r; using 100", raw_freq)
+        return 100
+
+
+def _wandb_model_input_image_max_logs() -> int:
+    raw_limit = os.environ.get("WANDB_MODEL_INPUT_IMAGES_MAX_LOGS", "5")
+    try:
+        return max(0, int(raw_limit))
+    except ValueError:
+        logging.warning("Invalid WANDB_MODEL_INPUT_IMAGES_MAX_LOGS=%r; using 5", raw_limit)
+        return 5
 
 
 N1_7_EMBODIMENT_MAPPING = {
@@ -2010,6 +2029,31 @@ class GrootN17VLMEncodeStep(ProcessorStep):
             # the CPU path, which is bit-identical, instead of crashing.
             return None
 
+    def _should_collect_wandb_model_input_images(self, image_limit: int) -> bool:
+        max_image_logs = _wandb_model_input_image_max_logs()
+        if image_limit <= 0 or max_image_logs <= 0:
+            return False
+
+        payloads_collected = getattr(self, "_wandb_payloads_collected", 0)
+        if payloads_collected >= max_image_logs:
+            return False
+
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is None:
+            worker_id = 0
+            num_workers = 1
+        else:
+            worker_id = worker_info.id
+            num_workers = max(1, worker_info.num_workers)
+
+        collate_calls = getattr(self, "_wandb_preprocess_calls", 0)
+        local_log_interval = max(1, math.ceil(_wandb_model_input_image_log_freq() / num_workers))
+        should_collect = worker_id == 0 and collate_calls % local_log_interval == 0
+        self._wandb_preprocess_calls = collate_calls + 1
+        if should_collect:
+            self._wandb_payloads_collected = payloads_collected + 1
+        return should_collect
+
     def _build_sample_images(
         self, video: Any, batch_size: int, target_device: torch.device | None
     ) -> list[list[Any]]:
@@ -2084,7 +2128,7 @@ class GrootN17VLMEncodeStep(ProcessorStep):
         target_device = self._target_device()
         sample_images = self._build_sample_images(video, batch_size, target_device)
         wandb_image_limit = _wandb_model_input_image_limit()
-        if wandb_image_limit > 0 and sample_images:
+        if self._should_collect_wandb_model_input_images(wandb_image_limit) and sample_images:
             wandb_images = []
             batch_index = 0
             for sample_input_index, image in enumerate(sample_images[batch_index]):
