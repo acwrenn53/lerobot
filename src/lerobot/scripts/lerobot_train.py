@@ -351,7 +351,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             **processor_kwargs,
         )
 
-    if is_main_process and getattr(policy_config, "type", None) == "groot":
+    if is_main_process and getattr(cfg.policy, "type", None) == "groot":
         pack_step = next(
             (
                 step
