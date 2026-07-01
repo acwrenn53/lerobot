@@ -55,6 +55,7 @@ from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_proces
 from lerobot.rewards import make_reward_pre_post_processors
 from lerobot.utils.collate import lerobot_collate_fn
 from lerobot.utils.import_utils import register_third_party_plugins
+from lerobot.utils.constants import ACTION
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.utils import (
@@ -308,8 +309,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     if (processor_pretrained_path and not cfg.resume) or not processor_pretrained_path:
         processor_kwargs["dataset_stats"] = dataset.meta.stats
 
-    if cfg.is_reward_model_training:
-        processor_kwargs["dataset_meta"] = dataset.meta
+    processor_kwargs["dataset_meta"] = dataset.meta
 
     if not cfg.is_reward_model_training and processor_pretrained_path is not None:
         preprocessor_overrides = {
@@ -350,6 +350,38 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             pretrained_revision=getattr(cfg.policy, "pretrained_revision", None),
             **processor_kwargs,
         )
+
+    if is_main_process and getattr(cfg.policy, "type", None) == "groot":
+        pack_step = next(
+            (
+                step
+                for step in getattr(preprocessor, "steps", ())
+                if hasattr(step, "action_horizon") and hasattr(step, "valid_action_horizon")
+            ),
+            None,
+        )
+        if pack_step is not None:
+            relative_stats = (getattr(pack_step, "raw_stats", None) or {}).get("relative_action", {})
+            horizon_stats = False
+            if isinstance(relative_stats, dict):
+                for group_stats in relative_stats.values():
+                    if not isinstance(group_stats, dict):
+                        continue
+                    for stat_name in ("min", "max", "mean", "std", "q01", "q99"):
+                        value = group_stats.get(stat_name)
+                        if value is not None:
+                            horizon_stats = torch.as_tensor(value).ndim >= 2
+                            break
+                    if horizon_stats:
+                        break
+            logging.info(
+                "GR00T processor: action_horizon=%s valid_action_horizon=%s video_horizon=%s "
+                "horizon_preserving_action_stats=%s",
+                getattr(pack_step, "action_horizon", None),
+                getattr(pack_step, "valid_action_horizon", None),
+                getattr(pack_step, "video_horizon", None),
+                horizon_stats,
+            )
 
     if is_main_process:
         logging.info("Creating optimizer and scheduler")
