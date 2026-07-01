@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 import torch
 from termcolor import colored
 from torch.optim import Optimizer
+from torch.utils.data._utils.collate import default_collate
 from tqdm import tqdm
 
 from lerobot.common.train_utils import (
@@ -53,6 +54,7 @@ from lerobot.datasets.factory import make_train_eval_datasets
 from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
+from lerobot.processor import DeviceProcessorStep, PolicyProcessorPipeline
 from lerobot.rewards import make_reward_pre_post_processors
 from lerobot.utils.collate import lerobot_collate_fn
 from lerobot.utils.import_utils import register_third_party_plugins
@@ -71,6 +73,24 @@ from .lerobot_eval import eval_policy_all
 WANDB_MODEL_INPUT_IMAGES_KEY = "_wandb_model_input_images"
 
 
+class _PreprocessingCollate:
+    """Collate a batch and run CPU-safe preprocessing inside DataLoader workers."""
+
+    def __init__(self, base_collate_fn, camera_keys: list[str], preprocessor):
+        self.base_collate_fn = base_collate_fn
+        self.camera_keys = camera_keys
+        self.preprocessor = preprocessor
+
+    def __call__(self, batch: list[dict[str, Any] | None]) -> dict[str, Any] | None:
+        collated = (
+            self.base_collate_fn(batch) if self.base_collate_fn is not None else default_collate(batch)
+        )
+        if collated is None:
+            return None
+        _convert_camera_uint8_to_float(collated, self.camera_keys)
+        return self.preprocessor(collated)
+
+
 def should_log_model_input_images(step: int) -> bool:
     log_freq = os.environ.get("WANDB_MODEL_INPUT_IMAGES_LOG_FREQ")
     if log_freq is None:
@@ -81,6 +101,59 @@ def should_log_model_input_images(step: int) -> bool:
         logging.warning("Invalid WANDB_MODEL_INPUT_IMAGES_LOG_FREQ=%r; logging images this step", log_freq)
         return True
     return image_logging_steps > 0 and step % image_logging_steps == 0
+
+
+def _convert_camera_uint8_to_float(batch: dict[str, Any], camera_keys: list[str]) -> None:
+    for cam_key in camera_keys:
+        value = batch.get(cam_key)
+        if isinstance(value, torch.Tensor) and value.dtype == torch.uint8:
+            batch[cam_key] = value.to(dtype=torch.float32) / 255.0
+
+
+def _env_flag_enabled(name: str, default: bool = True) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _split_groot_preprocessor_for_dataloader(
+    preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
+    *,
+    enabled: bool,
+) -> tuple[
+    PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None,
+    PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
+]:
+    if not enabled:
+        return None, preprocessor
+
+    steps = list(getattr(preprocessor, "steps", ()))
+    device_step_index = next(
+        (idx for idx, step in enumerate(steps) if isinstance(step, DeviceProcessorStep)),
+        None,
+    )
+    if device_step_index is None or device_step_index == 0:
+        return None, preprocessor
+
+    worker_steps = steps[:device_step_index]
+    main_steps = steps[device_step_index:]
+    if not any(step.__class__.__name__.startswith("Groot") for step in worker_steps):
+        return None, preprocessor
+
+    worker_preprocessor = PolicyProcessorPipeline[dict[str, Any], dict[str, Any]](
+        steps=worker_steps,
+        name=f"{preprocessor.name}_dataloader",
+        to_transition=preprocessor.to_transition,
+        to_output=preprocessor.to_output,
+    )
+    main_preprocessor = PolicyProcessorPipeline[dict[str, Any], dict[str, Any]](
+        steps=main_steps,
+        name=f"{preprocessor.name}_main",
+        to_transition=preprocessor.to_transition,
+        to_output=preprocessor.to_output,
+    )
+    return worker_preprocessor, main_preprocessor
 
 
 def update_policy(
@@ -398,6 +471,21 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 horizon_stats,
             )
 
+    dataloader_preprocessor, training_preprocessor = _split_groot_preprocessor_for_dataloader(
+        preprocessor,
+        enabled=(
+            not cfg.is_reward_model_training
+            and getattr(active_cfg, "type", None) == "groot"
+            and _env_flag_enabled("LEROBOT_GROOT_DATALOADER_PREPROCESSING", default=True)
+        ),
+    )
+    if is_main_process and dataloader_preprocessor is not None:
+        logging.info(
+            "GR00T DataLoader preprocessing enabled: %s steps in collate, %s steps in train loop",
+            len(dataloader_preprocessor.steps),
+            len(training_preprocessor.steps),
+        )
+
     if is_main_process:
         logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
@@ -497,7 +585,14 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     # Only swap in the language-aware collate when the dataset actually
     # declares language columns; otherwise stay on PyTorch's default
     # collate so non-language training runs are unaffected.
-    collate_fn = lerobot_collate_fn if dataset.meta.has_language_columns else None
+    base_collate_fn = lerobot_collate_fn if dataset.meta.has_language_columns else None
+    collate_fn = base_collate_fn
+    if dataloader_preprocessor is not None:
+        collate_fn = _PreprocessingCollate(
+            base_collate_fn,
+            list(dataset.meta.camera_keys),
+            dataloader_preprocessor,
+        )
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=cfg.num_workers,
@@ -525,7 +620,14 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 selected.extend(frames.tolist())
             eval_ds = torch.utils.data.Subset(eval_dataset, selected)
 
-        eval_collate_fn = lerobot_collate_fn if dataset.meta.has_language_columns else None
+        eval_base_collate_fn = lerobot_collate_fn if dataset.meta.has_language_columns else None
+        eval_collate_fn = eval_base_collate_fn
+        if dataloader_preprocessor is not None:
+            eval_collate_fn = _PreprocessingCollate(
+                eval_base_collate_fn,
+                list(dataset.meta.camera_keys),
+                dataloader_preprocessor,
+            )
         eval_dataloader = torch.utils.data.DataLoader(
             eval_ds,
             batch_size=cfg.batch_size,
@@ -603,10 +705,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
         batch = next(dl_iter)
-        for cam_key in dataset.meta.camera_keys:
-            if cam_key in batch and batch[cam_key].dtype == torch.uint8:
-                batch[cam_key] = batch[cam_key].to(dtype=torch.float32) / 255.0
-        batch = preprocessor(batch)
+        if dataloader_preprocessor is None:
+            _convert_camera_uint8_to_float(batch, list(dataset.meta.camera_keys))
+        batch = training_preprocessor(batch)
         model_input_images = batch.pop(WANDB_MODEL_INPUT_IMAGES_KEY, None)
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
@@ -670,10 +771,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             n_eval_batches = 0
             with torch.no_grad(), accelerator.autocast():
                 for eval_batch in eval_dataloader:
-                    for cam_key in dataset.meta.camera_keys:
-                        if cam_key in eval_batch and eval_batch[cam_key].dtype == torch.uint8:
-                            eval_batch[cam_key] = eval_batch[cam_key].to(dtype=torch.float32) / 255.0
-                    eval_batch = preprocessor(eval_batch)
+                    if dataloader_preprocessor is None:
+                        _convert_camera_uint8_to_float(eval_batch, list(dataset.meta.camera_keys))
+                    eval_batch = training_preprocessor(eval_batch)
                     loss, _ = policy.forward(eval_batch)
                     eval_loss_sum += loss.item()
                     n_eval_batches += 1
