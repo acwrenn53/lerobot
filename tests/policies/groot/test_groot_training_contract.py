@@ -14,33 +14,50 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import subprocess
 import sys
+from dataclasses import fields
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
-from lerobot.configs import parser
-from lerobot.configs.default import DatasetConfig
 from lerobot.configs.train import TrainPipelineConfig
+from lerobot.optim import AdamWConfig
 from lerobot.optim.schedulers import DiffuserSchedulerConfig
 from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.groot.groot_n1_7 import _tie_unused_qwen_lm_head
 from lerobot.policies.groot.modeling_groot import GrootPolicy
 from lerobot.policies.groot.processor_groot import (
     GrootN17PackInputsStep,
-    GrootN17VLMEncodeStep,
     _resolve_visual_modality_keys_from_dataset_meta,
-)
-from lerobot.scripts.lerobot_train import (
-    _enable_groot_training_processor_steps,
-    _groot_processor_mode,
-    _policy_processor_mode,
 )
 from lerobot.types import TransitionKey
 from lerobot.utils.constants import OBS_STATE
+
+
+def test_shared_trainer_has_no_groot_specific_control_flow():
+    from lerobot.scripts import lerobot_train
+
+    source = inspect.getsource(lerobot_train)
+    for forbidden in (
+        "from lerobot.policies.groot.configuration_groot import GrootConfig",
+        "_enable_groot_training_processor_steps",
+        "_groot_processor_mode",
+        "_split_groot_preprocessor_for_dataloader",
+        "isinstance(active_cfg, GrootConfig)",
+    ):
+        assert forbidden not in source
+
+
+def test_shared_adamw_config_does_not_expose_groot_specific_fused_flag():
+    assert "fused" not in {config_field.name for config_field in fields(AdamWConfig)}
+
+
+def test_shared_train_config_does_not_call_policy_specific_step_hooks():
+    assert "configure_training_steps" not in inspect.getsource(TrainPipelineConfig.validate)
 
 
 def test_groot_n1_7_optimizer_matches_isaac_training_contract():
@@ -51,7 +68,6 @@ def test_groot_n1_7_optimizer_matches_isaac_training_contract():
     assert optimizer.eps == pytest.approx(1e-8)
     assert optimizer.weight_decay == pytest.approx(1e-5)
     assert optimizer.grad_clip_norm == pytest.approx(1.0)
-    assert optimizer.fused is True
 
 
 def test_groot_n1_7_sampler_excludes_incomplete_action_tails():
@@ -93,100 +109,6 @@ def test_groot_n1_7_scheduler_rounds_fractional_warmup_up_like_transformers():
     assert scheduler_config.num_warmup_steps == 39
 
 
-def test_groot_n1_7_training_enables_stochastic_processor_steps_for_fresh_base_model():
-    pack_step = GrootN17PackInputsStep(training=False)
-    vlm_step = GrootN17VLMEncodeStep(training=False)
-    unrelated_step = SimpleNamespace(training=False)
-    preprocessor = SimpleNamespace(steps=[pack_step, vlm_step, unrelated_step])
-
-    _enable_groot_training_processor_steps(preprocessor)
-
-    assert pack_step.training is True
-    assert vlm_step.training is True
-    assert unrelated_step.training is False
-
-
-def test_groot_n1_7_eval_temporarily_disables_stochastic_processors_and_restores_them():
-    pack_step = GrootN17PackInputsStep(training=True)
-    vlm_step = GrootN17VLMEncodeStep(training=True)
-    unrelated_step = SimpleNamespace(training=True)
-    preprocessor = SimpleNamespace(steps=[pack_step, vlm_step, unrelated_step])
-
-    with _groot_processor_mode(preprocessor, training=False):
-        assert pack_step.training is False
-        assert vlm_step.training is False
-        assert unrelated_step.training is True
-
-    assert pack_step.training is True
-    assert vlm_step.training is True
-    assert unrelated_step.training is True
-
-
-def test_non_groot_eval_processor_mode_is_a_noop_without_touching_optional_steps():
-    class NonGrootPreprocessor:
-        @property
-        def steps(self):
-            raise AssertionError("Non-GR00T evaluation must not inspect GR00T processor steps")
-
-    with _policy_processor_mode(NonGrootPreprocessor(), SimpleNamespace(), training=False):
-        pass
-
-
-def test_groot_training_preprocessor_splits_cpu_steps_before_device_transfer():
-    from lerobot.processor import DeviceProcessorStep, PolicyProcessorPipeline
-    from lerobot.scripts import lerobot_train
-
-    pack_step = GrootN17PackInputsStep(training=True)
-    vlm_step = GrootN17VLMEncodeStep(training=True, use_albumentations=True)
-    device_step = DeviceProcessorStep(device="cpu")
-    preprocessor = PolicyProcessorPipeline(steps=[pack_step, vlm_step, device_step], name="groot")
-
-    worker, main = lerobot_train._split_groot_preprocessor_for_dataloader(preprocessor, enabled=True)
-
-    assert worker is not None
-    assert worker.steps == [pack_step, vlm_step]
-    assert main.steps == [device_step]
-    assert pack_step.training is True
-    assert vlm_step.training is True
-
-
-def test_groot_training_preprocessor_split_can_be_disabled():
-    from lerobot.processor import DeviceProcessorStep, PolicyProcessorPipeline
-    from lerobot.scripts import lerobot_train
-
-    preprocessor = PolicyProcessorPipeline(
-        steps=[GrootN17PackInputsStep(training=True), DeviceProcessorStep(device="cpu")],
-        name="groot",
-    )
-
-    worker, main = lerobot_train._split_groot_preprocessor_for_dataloader(preprocessor, enabled=False)
-
-    assert worker is None
-    assert main is preprocessor
-
-
-def test_preprocessed_batch_transition_preserves_vlm_fields():
-    from lerobot.scripts import lerobot_train
-    from lerobot.utils.constants import ACTION
-
-    batch = {
-        OBS_STATE: torch.ones(2, 6),
-        ACTION: torch.zeros(2, 16, 6),
-        "input_ids": torch.ones(2, 8, dtype=torch.long),
-        "pixel_values": torch.ones(4, 1176),
-        "image_grid_thw": torch.ones(4, 3, dtype=torch.long),
-    }
-
-    transition = lerobot_train._preprocessed_batch_to_transition(batch)
-
-    assert transition[TransitionKey.OBSERVATION][OBS_STATE] is batch[OBS_STATE]
-    assert transition[TransitionKey.ACTION] is batch[ACTION]
-    complementary = transition[TransitionKey.COMPLEMENTARY_DATA]
-    assert complementary["input_ids"] is batch["input_ids"]
-    assert complementary["pixel_values"] is batch["pixel_values"]
-    assert complementary["image_grid_thw"] is batch["image_grid_thw"]
-
-
 def test_lerobot_train_import_does_not_require_albumentations():
     code = """
 import builtins
@@ -225,43 +147,6 @@ def test_n1_7_training_augmentation_replays_geometry_across_views():
     np.testing.assert_array_equal(outputs[0], outputs[1])
 
 
-def test_groot_n1_7_policy_preset_uses_pipeline_steps_for_warmup(tmp_path, monkeypatch):
-    monkeypatch.setattr(parser, "get_path_arg", lambda _: None)
-    policy = GrootConfig(max_steps=20_000, push_to_hub=False)
-    config = TrainPipelineConfig(
-        dataset=DatasetConfig(repo_id="dummy/dataset"),
-        policy=policy,
-        output_dir=tmp_path / "run",
-        steps=1_200,
-        env_eval_freq=0,
-    )
-
-    config.validate()
-
-    assert policy.max_steps == 1_200
-    assert isinstance(config.scheduler, DiffuserSchedulerConfig)
-    assert config.scheduler.num_warmup_steps == 60
-
-
-def test_groot_n1_7_pipeline_steps_sync_with_explicit_optimizer_config(tmp_path, monkeypatch):
-    monkeypatch.setattr(parser, "get_path_arg", lambda _: None)
-    policy = GrootConfig(max_steps=20_000, push_to_hub=False)
-    config = TrainPipelineConfig(
-        dataset=DatasetConfig(repo_id="dummy/dataset"),
-        policy=policy,
-        output_dir=tmp_path / "run",
-        steps=777,
-        env_eval_freq=0,
-        use_policy_training_preset=False,
-        optimizer=policy.get_optimizer_preset(),
-        scheduler=policy.get_scheduler_preset(),
-    )
-
-    config.validate()
-
-    assert policy.max_steps == 777
-
-
 def test_groot_n1_7_training_applies_raw_state_dropout_before_encoder():
     step = GrootN17PackInputsStep(
         max_state_dim=4,
@@ -278,6 +163,26 @@ def test_groot_n1_7_training_applies_raw_state_dropout_before_encoder():
     output = step(transition)
 
     expected = torch.zeros(2, 1, 4)
+    torch.testing.assert_close(output[TransitionKey.OBSERVATION]["state"], expected)
+
+
+def test_groot_n1_7_training_state_dropout_is_disabled_under_no_grad():
+    step = GrootN17PackInputsStep(
+        max_state_dim=4,
+        max_action_dim=4,
+        normalize_min_max=False,
+        training=True,
+        state_dropout_prob=1.0,
+    )
+    transition = {
+        TransitionKey.OBSERVATION: {OBS_STATE: torch.tensor([[1.0, 2.0], [3.0, 4.0]])},
+        TransitionKey.COMPLEMENTARY_DATA: {"task": ["Move", "Move"]},
+    }
+
+    with torch.no_grad():
+        output = step(transition)
+
+    expected = torch.tensor([[[1.0, 2.0, 0.0, 0.0]], [[3.0, 4.0, 0.0, 0.0]]])
     torch.testing.assert_close(output[TransitionKey.OBSERVATION]["state"], expected)
 
 

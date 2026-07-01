@@ -52,17 +52,6 @@ def test_optimizer_build(config_cls, expected_class, model_params):
         assert optimizer.defaults["lr"] == config.lr
 
 
-def test_adamw_fused_config_builds_and_steps(model_params):
-    config = AdamWConfig(fused=True)
-    optimizer = config.build(model_params)
-    loss = torch.stack([parameter.square().sum() for parameter in model_params]).sum()
-
-    loss.backward()
-    optimizer.step()
-
-    assert optimizer.defaults["fused"] is True
-
-
 def test_save_optimizer_state(optimizer, tmp_path):
     save_optimizer_state(optimizer, tmp_path)
     assert (tmp_path / OPTIMIZER_STATE).is_file()

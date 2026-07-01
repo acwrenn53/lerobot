@@ -210,7 +210,10 @@ def _load_n1_7_checkpoint_processor_assets(config: GrootConfig) -> _GrootN17Chec
         modality_config=modality_config,
         use_relative_action=use_relative_action,
     )
-    embodiment_mapping = _load_n1_7_embodiment_mapping(checkpoint_path) or dict(N1_7_EMBODIMENT_MAPPING)
+    embodiment_mapping = {
+        **N1_7_EMBODIMENT_MAPPING,
+        **(_load_n1_7_embodiment_mapping(checkpoint_path) or {}),
+    }
     formalize_language = processor_kwargs.get("formalize_language", True)
     if not isinstance(formalize_language, bool):
         formalize_language = True
@@ -476,6 +479,17 @@ def _apply_groot_step_overrides(
                 post_init()
 
 
+def _set_groot_preprocessor_training(
+    preprocessor: PolicyProcessorPipeline,
+    *,
+    training: bool,
+) -> None:
+    """Set the runtime-only mode of GR00T stochastic processor steps."""
+    for step in preprocessor.steps:
+        if isinstance(step, (GrootN17PackInputsStep, GrootN17VLMEncodeStep)):
+            step.training = training
+
+
 def make_groot_pre_post_processors_from_pretrained(
     config: GrootConfig,
     pretrained_path: str,
@@ -524,6 +538,7 @@ def make_groot_pre_post_processors_from_pretrained(
     _reconnect_groot_relative_absolute_steps(preprocessor, postprocessor)
     _reconnect_groot_n1_7_pack_decode_steps(preprocessor, postprocessor)
     _apply_groot_action_decode_transform(postprocessor, config.action_decode_transform)
+    _set_groot_preprocessor_training(preprocessor, training=dataset_meta is not None)
     return preprocessor, postprocessor
 
 
@@ -1223,6 +1238,7 @@ def make_groot_pre_post_processors(
         embodiment_tag=config.embodiment_tag,
         embodiment_mapping=embodiment_mapping,
         normalize_min_max=True,
+        training=dataset_meta is not None,
         state_dropout_prob=(checkpoint_assets.state_dropout_prob if checkpoint_assets is not None else 0.0),
         stats=padded_stats,
         clip_outliers=clip_outliers,
@@ -1263,6 +1279,7 @@ def make_groot_pre_post_processors(
             crop_fraction=crop_fraction,
             use_albumentations=use_albumentations,
             letter_box_transform=letter_box_transform,
+            training=dataset_meta is not None,
             random_rotation_angle=(
                 checkpoint_assets.random_rotation_angle if checkpoint_assets is not None else 0.0
             ),
@@ -1875,7 +1892,7 @@ class GrootN17PackInputsStep(ProcessorStep):
             if dim < self.max_state_dim:
                 pad = torch.zeros(bsz, 1, self.max_state_dim - dim, dtype=state.dtype, device=state.device)
                 state = torch.cat([state, pad], dim=2)
-            if self.training and self.state_dropout_prob > 0:
+            if self.training and torch.is_grad_enabled() and self.state_dropout_prob > 0:
                 drop_state = torch.tensor(
                     [random.random() < self.state_dropout_prob for _ in range(bsz)],
                     dtype=torch.bool,
@@ -2088,7 +2105,7 @@ class GrootN17VLMEncodeStep(ProcessorStep):
         """
         if self.use_albumentations:
             video_np = np.asarray(video)
-            if self.training:
+            if self.training and torch.is_grad_enabled():
                 require_package("albumentations", extra="groot")
                 from .image_augmentations import (
                     apply_n1_7_training_transform,

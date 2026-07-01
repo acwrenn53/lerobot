@@ -670,7 +670,6 @@ def test_raw_n1_7_hub_checkpoint_processors_resolve_pinned_sidecars(tmp_path, mo
 
 def test_raw_n1_7_hub_fresh_embodiment_uses_oss_training_defaults(tmp_path, monkeypatch, request):
     import lerobot.policies.groot.configuration_groot as configuration_groot
-    from lerobot.scripts import lerobot_train
 
     snapshot_path = tmp_path / "snapshot"
     _write_raw_n1_7_libero_checkpoint(snapshot_path)
@@ -736,10 +735,11 @@ def test_raw_n1_7_hub_fresh_embodiment_uses_oss_training_defaults(tmp_path, monk
         next(step for step in preprocessor.steps if isinstance(step, GrootN17VLMEncodeStep)),
     )
 
-    assert pack_inputs.training is False
-    assert vlm_encode.training is False
+    assert pack_inputs.training is True
+    assert vlm_encode.training is True
     assert pack_inputs.action_horizon == 40
     assert pack_inputs.valid_action_horizon == 16
+    assert pack_inputs.embodiment_mapping.get("new_embodiment") == 10
     assert pack_inputs.state_dropout_prob == pytest.approx(0.2)
     assert vlm_encode.use_albumentations is True
     assert vlm_encode.shortest_image_edge == 256
@@ -750,15 +750,6 @@ def test_raw_n1_7_hub_fresh_embodiment_uses_oss_training_defaults(tmp_path, monk
         "saturation": 0.5,
         "hue": 0.08,
     }
-
-    lerobot_train._enable_groot_training_processor_steps(preprocessor)
-    assert pack_inputs.training is True
-    assert vlm_encode.training is True
-    with lerobot_train._groot_processor_mode(preprocessor, training=False):
-        assert pack_inputs.training is False
-        assert vlm_encode.training is False
-    assert pack_inputs.training is True
-    assert vlm_encode.training is True
 
 
 def test_raw_n1_7_pretrained_processor_detection_uses_pinned_revision(tmp_path, monkeypatch):
@@ -851,17 +842,25 @@ def test_groot_n1_7_saved_processors_round_trip_checkpoint_specific_fields(tmp_p
         save_dir,
         config_filename="policy_postprocessor.json",
     )
-    pack_inputs = next(step for step in loaded_preprocessor.steps if isinstance(step, GrootN17PackInputsStep))
-    vlm_encode = next(step for step in loaded_preprocessor.steps if isinstance(step, GrootN17VLMEncodeStep))
+    pack_inputs = cast(
+        GrootN17PackInputsStep,
+        next(step for step in loaded_preprocessor.steps if isinstance(step, GrootN17PackInputsStep)),
+    )
+    vlm_encode = cast(
+        GrootN17VLMEncodeStep,
+        next(step for step in loaded_preprocessor.steps if isinstance(step, GrootN17VLMEncodeStep)),
+    )
     decode_actions = next(
         step for step in loaded_postprocessor.steps if isinstance(step, GrootN17ActionDecodeStep)
     )
 
     assert pack_inputs.valid_action_horizon == 16
     assert pack_inputs.action_horizon == 40
+    assert pack_inputs.training is False
     assert pack_inputs.video_modality_keys == ["image", "wrist_image"]
     assert pack_inputs.clip_outliers is True
     assert vlm_encode.letter_box_transform is False
+    assert vlm_encode.training is False
     torch.testing.assert_close(
         pack_inputs.stats[OBS_STATE]["min"],
         torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
@@ -869,6 +868,33 @@ def test_groot_n1_7_saved_processors_round_trip_checkpoint_specific_fields(tmp_p
     assert decode_actions.env_action_dim == 7
     assert decode_actions.action_decode_transform == GROOT_ACTION_DECODE_TRANSFORM_LIBERO
     assert decode_actions.raw_stats["action"]["gripper"]["q99"] == [115.0]
+
+
+def test_groot_n1_7_saved_processors_reenable_training_when_dataset_meta_is_supplied(tmp_path):
+    model_path = tmp_path / "libero_spatial"
+    _write_raw_n1_7_libero_checkpoint(model_path)
+    config = _raw_n1_7_libero_config(model_path)
+    preprocessor, postprocessor = make_pre_post_processors(config, pretrained_path=str(model_path))
+    save_dir = tmp_path / "saved_processors"
+    preprocessor.save_pretrained(save_dir)
+    postprocessor.save_pretrained(save_dir)
+
+    resumed_preprocessor, _ = make_groot_pre_post_processors_from_pretrained(
+        config,
+        str(save_dir),
+        dataset_meta=SimpleNamespace(),
+    )
+    pack_inputs = cast(
+        GrootN17PackInputsStep,
+        next(step for step in resumed_preprocessor.steps if isinstance(step, GrootN17PackInputsStep)),
+    )
+    vlm_encode = cast(
+        GrootN17VLMEncodeStep,
+        next(step for step in resumed_preprocessor.steps if isinstance(step, GrootN17VLMEncodeStep)),
+    )
+
+    assert pack_inputs.training is True
+    assert vlm_encode.training is True
 
 
 def test_converted_raw_n1_7_processors_load_without_legacy_action_unpack_override(tmp_path):
@@ -2180,6 +2206,32 @@ def test_groot_n1_7_vlm_train_augmentation_replays_across_views_and_differs_from
     # Evaluation remains deterministic center-crop and must not apply the train augmentation.
     np.testing.assert_array_equal(np.asarray(eval_frames[0]), np.asarray(eval_frames[1]))
     assert not np.array_equal(np.asarray(train_frames[0]), np.asarray(eval_frames[0]))
+
+
+def test_groot_n1_7_vlm_training_augmentation_is_disabled_under_no_grad():
+    image = (np.arange(480 * 640 * 3, dtype=np.uint32) % 251).astype(np.uint8).reshape(480, 640, 3)
+    video = image[None, None, None]
+    kwargs = {
+        "image_target_size": [256, 256],
+        "shortest_image_edge": 256,
+        "crop_fraction": 0.95,
+        "use_albumentations": True,
+        "random_rotation_angle": 0,
+        "color_jitter_params": {
+            "brightness": 0.3,
+            "contrast": 0.4,
+            "saturation": 0.5,
+            "hue": 0.08,
+        },
+    }
+    train_step = GrootN17VLMEncodeStep(training=True, **kwargs)
+    eval_step = GrootN17VLMEncodeStep(training=False, **kwargs)
+
+    with torch.no_grad():
+        no_grad_frame = train_step._build_sample_images(video, batch_size=1, target_device=None)[0][0]
+    eval_frame = eval_step._build_sample_images(video, batch_size=1, target_device=None)[0][0]
+
+    np.testing.assert_array_equal(np.asarray(no_grad_frame), np.asarray(eval_frame))
 
 
 def test_groot_n1_7_vlm_train_augmentation_respects_global_seed():

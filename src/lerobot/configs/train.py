@@ -207,10 +207,6 @@ class TrainPipelineConfig(HubMixin):
         if isinstance(self.dataset.repo_id, list):
             raise NotImplementedError("LeRobotMultiDataset is not currently implemented.")
 
-        configure_training_steps = getattr(active_cfg, "configure_training_steps", None)
-        if callable(configure_training_steps):
-            configure_training_steps(self.steps)
-
         if not self.use_policy_training_preset and (self.optimizer is None or self.scheduler is None):
             raise ValueError("Optimizer and Scheduler must be set when the policy presets are not used.")
         elif self.use_policy_training_preset and not self.resume:

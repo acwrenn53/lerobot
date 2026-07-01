@@ -21,7 +21,7 @@ Requires: pip install 'lerobot[training]'  (includes dataset + accelerate + wand
 import dataclasses
 import logging
 import time
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from pprint import pformat
 from typing import TYPE_CHECKING, Any
 
@@ -31,7 +31,6 @@ if TYPE_CHECKING:
 import torch
 from termcolor import colored
 from torch.optim import Optimizer
-from torch.utils.data import default_collate
 from tqdm import tqdm
 
 from lerobot.common.train_utils import (
@@ -53,11 +52,8 @@ from lerobot.datasets.factory import make_train_eval_datasets
 from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
-from lerobot.policies.groot.configuration_groot import GrootConfig
-from lerobot.processor import DeviceProcessorStep, PolicyProcessorPipeline, create_transition
 from lerobot.rewards import make_reward_pre_post_processors
 from lerobot.utils.collate import lerobot_collate_fn
-from lerobot.utils.constants import ACTION, DONE, INFO, OBS_PREFIX, REWARD, TRUNCATED
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
@@ -70,130 +66,6 @@ from lerobot.utils.utils import (
 )
 
 from .lerobot_eval import eval_policy_all
-
-_TRANSITION_BATCH_KEYS = {ACTION, REWARD, DONE, TRUNCATED, INFO}
-
-
-class _PreprocessingCollate:
-    """Collate a batch and run CPU-safe preprocessing inside DataLoader workers."""
-
-    def __init__(self, base_collate_fn, camera_keys: list[str], preprocessor):
-        self.base_collate_fn = base_collate_fn
-        self.camera_keys = camera_keys
-        self.preprocessor = preprocessor
-
-    def __call__(self, batch: list[dict[str, Any] | None]) -> dict[str, Any] | None:
-        collated = self.base_collate_fn(batch) if self.base_collate_fn is not None else default_collate(batch)
-        if collated is None:
-            return None
-        _convert_camera_uint8_to_float(collated, self.camera_keys)
-        return self.preprocessor(collated)
-
-
-def _preprocessed_batch_to_transition(batch: dict[str, Any]):
-    """Rebuild a transition without dropping Qwen/VLM complementary fields."""
-    if not isinstance(batch, dict):
-        raise ValueError(f"EnvTransition must be a dictionary. Got {type(batch).__name__}")
-
-    observation = {key: value for key, value in batch.items() if key.startswith(OBS_PREFIX)}
-    complementary_data = {
-        key: value
-        for key, value in batch.items()
-        if key not in _TRANSITION_BATCH_KEYS and not key.startswith(OBS_PREFIX)
-    }
-    return create_transition(
-        observation=observation if observation else None,
-        action=batch.get(ACTION),
-        reward=batch.get(REWARD, 0.0),
-        done=batch.get(DONE, False),
-        truncated=batch.get(TRUNCATED, False),
-        info=batch.get(INFO, {}),
-        complementary_data=complementary_data if complementary_data else None,
-    )
-
-
-def _split_groot_preprocessor_for_dataloader(
-    preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
-    *,
-    enabled: bool,
-) -> tuple[
-    PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None,
-    PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
-]:
-    """Split CPU GR00T steps into workers while keeping device transfer in the train loop."""
-    if not enabled:
-        return None, preprocessor
-
-    steps = list(getattr(preprocessor, "steps", ()))
-    device_step_index = next(
-        (index for index, step in enumerate(steps) if isinstance(step, DeviceProcessorStep)),
-        None,
-    )
-    if device_step_index is None or device_step_index == 0:
-        return None, preprocessor
-
-    worker_steps = steps[:device_step_index]
-    main_steps = steps[device_step_index:]
-    if not any(step.__class__.__name__.startswith("Groot") for step in worker_steps):
-        return None, preprocessor
-
-    worker_preprocessor = PolicyProcessorPipeline[dict[str, Any], dict[str, Any]](
-        steps=worker_steps,
-        name=f"{preprocessor.name}_dataloader",
-        to_transition=preprocessor.to_transition,
-        to_output=preprocessor.to_output,
-    )
-    main_preprocessor = PolicyProcessorPipeline[dict[str, Any], dict[str, Any]](
-        steps=main_steps,
-        name=f"{preprocessor.name}_main",
-        to_transition=_preprocessed_batch_to_transition,
-        to_output=preprocessor.to_output,
-    )
-    return worker_preprocessor, main_preprocessor
-
-
-def _convert_camera_uint8_to_float(batch: dict[str, Any], camera_keys: list[str]) -> None:
-    for camera_key in camera_keys:
-        value = batch.get(camera_key)
-        if isinstance(value, torch.Tensor) and value.dtype == torch.uint8:
-            batch[camera_key] = value.to(dtype=torch.float32) / 255.0
-
-
-def _groot_training_processor_steps(preprocessor: Any) -> list[Any]:
-    from lerobot.policies.groot.processor_groot import GrootN17PackInputsStep, GrootN17VLMEncodeStep
-
-    return [
-        step
-        for step in preprocessor.steps
-        if isinstance(step, (GrootN17PackInputsStep, GrootN17VLMEncodeStep))
-    ]
-
-
-def _enable_groot_training_processor_steps(preprocessor: Any) -> None:
-    """Enable the stochastic N1.7 processor path without persisting training mode."""
-    for step in _groot_training_processor_steps(preprocessor):
-        step.training = True
-
-
-@contextmanager
-def _groot_processor_mode(preprocessor: Any, *, training: bool):
-    """Temporarily switch stochastic N1.7 processor steps and restore their prior mode."""
-    steps = _groot_training_processor_steps(preprocessor)
-    previous_modes = [step.training for step in steps]
-    try:
-        for step in steps:
-            step.training = training
-        yield
-    finally:
-        for step, previous_mode in zip(steps, previous_modes, strict=True):
-            step.training = previous_mode
-
-
-def _policy_processor_mode(preprocessor: Any, active_cfg: Any, *, training: bool):
-    """Return the GR00T mode context without importing GR00T's optional stack for other policies."""
-    if isinstance(active_cfg, GrootConfig):
-        return _groot_processor_mode(preprocessor, training=training)
-    return nullcontext()
 
 
 def update_policy(
@@ -436,8 +308,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     if (processor_pretrained_path and not cfg.resume) or not processor_pretrained_path:
         processor_kwargs["dataset_stats"] = dataset.meta.stats
 
-    if cfg.is_reward_model_training or isinstance(active_cfg, GrootConfig):
-        processor_kwargs["dataset_meta"] = dataset.meta
+    processor_kwargs["dataset_meta"] = dataset.meta
 
     if not cfg.is_reward_model_training and processor_pretrained_path is not None:
         preprocessor_overrides = {
@@ -478,13 +349,6 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             pretrained_revision=getattr(cfg.policy, "pretrained_revision", None),
             **processor_kwargs,
         )
-        if isinstance(active_cfg, GrootConfig):
-            _enable_groot_training_processor_steps(preprocessor)
-
-    dataloader_preprocessor, training_preprocessor = _split_groot_preprocessor_for_dataloader(
-        preprocessor,
-        enabled=isinstance(active_cfg, GrootConfig),
-    )
 
     if is_main_process:
         logging.info("Creating optimizer and scheduler")
@@ -586,12 +450,6 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     # declares language columns; otherwise stay on PyTorch's default
     # collate so non-language training runs are unaffected.
     collate_fn = lerobot_collate_fn if dataset.meta.has_language_columns else None
-    if dataloader_preprocessor is not None:
-        collate_fn = _PreprocessingCollate(
-            collate_fn,
-            list(dataset.meta.camera_keys),
-            dataloader_preprocessor,
-        )
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=cfg.num_workers,
@@ -697,9 +555,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
         batch = next(dl_iter)
-        if dataloader_preprocessor is None:
-            _convert_camera_uint8_to_float(batch, list(dataset.meta.camera_keys))
-        batch = training_preprocessor(batch)
+        for cam_key in dataset.meta.camera_keys:
+            if cam_key in batch and batch[cam_key].dtype == torch.uint8:
+                batch[cam_key] = batch[cam_key].to(dtype=torch.float32) / 255.0
+        batch = preprocessor(batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
         train_tracker, output_dict = update_policy(
@@ -746,23 +605,22 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             train_tracker.reset_averages()
 
         if is_eval_step:
-            with _policy_processor_mode(preprocessor, active_cfg, training=False):
-                policy.eval()
-                try:
-                    eval_loss_sum = 0.0
-                    n_eval_batches = 0
-                    with torch.no_grad(), accelerator.autocast():
-                        for eval_batch in eval_dataloader:
-                            _convert_camera_uint8_to_float(eval_batch, list(dataset.meta.camera_keys))
-                            eval_batch = preprocessor(eval_batch)
-                            loss, _ = policy.forward(eval_batch)
-                            eval_loss_sum += loss.item()
-                            n_eval_batches += 1
-                    eval_loss = eval_loss_sum / max(n_eval_batches, 1)
-                    eval_loss = torch.tensor(eval_loss, device=device)
-                    eval_loss = accelerator.reduce(eval_loss, reduction="mean").item()
-                finally:
-                    policy.train()
+            policy.eval()
+            eval_loss_sum = 0.0
+            n_eval_batches = 0
+            with torch.no_grad(), accelerator.autocast():
+                for eval_batch in eval_dataloader:
+                    for cam_key in dataset.meta.camera_keys:
+                        if cam_key in eval_batch and eval_batch[cam_key].dtype == torch.uint8:
+                            eval_batch[cam_key] = eval_batch[cam_key].to(dtype=torch.float32) / 255.0
+                    eval_batch = preprocessor(eval_batch)
+                    loss, _ = policy.forward(eval_batch)
+                    eval_loss_sum += loss.item()
+                    n_eval_batches += 1
+            eval_loss = eval_loss_sum / max(n_eval_batches, 1)
+            eval_loss = torch.tensor(eval_loss, device=device)
+            eval_loss = accelerator.reduce(eval_loss, reduction="mean").item()
+            policy.train()
 
             if is_main_process:
                 logging.info(f"step {step}: eval_loss={eval_loss:.4f}")
@@ -805,11 +663,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             if is_main_process:
                 step_id = get_step_identifier(step, cfg.steps)
                 logging.info(f"Eval policy at step {step}")
-                with (
-                    _policy_processor_mode(preprocessor, active_cfg, training=False),
-                    torch.no_grad(),
-                    accelerator.autocast(),
-                ):
+                with torch.no_grad(), accelerator.autocast():
                     eval_info = eval_policy_all(
                         envs=eval_env,  # dict[suite][task_id] -> vec_env
                         policy=accelerator.unwrap_model(policy),

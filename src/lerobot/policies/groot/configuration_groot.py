@@ -527,7 +527,6 @@ class GrootConfig(PreTrainedConfig):
             eps=self.optimizer_eps,
             weight_decay=self.optimizer_weight_decay,
             grad_clip_norm=1.0,
-            fused=True,
         )
 
     def get_scheduler_preset(self) -> DiffuserSchedulerConfig:
@@ -536,12 +535,6 @@ class GrootConfig(PreTrainedConfig):
             name="cosine",
             num_warmup_steps=math.ceil(self.max_steps * self.warmup_ratio),
         )
-
-    def configure_training_steps(self, total_steps: int) -> None:
-        """Use the trainer update count as the scheduler preset's source of truth."""
-        if total_steps <= 0:
-            raise ValueError(f"Training steps must be positive, got {total_steps}.")
-        self.max_steps = total_steps
 
     @property
     def observation_delta_indices(self) -> None:
