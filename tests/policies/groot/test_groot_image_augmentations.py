@@ -19,9 +19,7 @@
 Isaac-GR00T applies a stochastic fractional random crop (+ optional rotation and
 color jitter) during training and replays the exact sampled transform across all
 camera views of a sample, while evaluation stays on the deterministic
-center-crop path. These tests pin that contract for the LeRobot integration,
-implemented on the torchvision.transforms.v2 stack (the same stack behind
-LeRobot's built-in dataset image transforms).
+center-crop path. These tests pin that contract for the LeRobot integration.
 """
 
 import random
@@ -34,9 +32,10 @@ import torch
 
 from lerobot.policies.groot.processor_groot import GrootN17VLMEncodeStep
 
+pytest.importorskip("albumentations")
+
 
 def test_lerobot_train_import_does_not_require_albumentations():
-    """The groot training augmentation must not add any dependency beyond torchvision."""
     code = """
 import builtins
 real_import = builtins.__import__
@@ -57,7 +56,7 @@ def test_n1_7_training_augmentation_replays_geometry_across_views():
         build_n1_7_training_transform,
     )
 
-    torch.manual_seed(7)
+    np.random.seed(7)
     image = np.arange(480 * 640 * 3, dtype=np.uint32).reshape(480, 640, 3).astype(np.uint8)
     transform = build_n1_7_training_transform(
         image_crop_size=[224, 224],
@@ -70,11 +69,7 @@ def test_n1_7_training_augmentation_replays_geometry_across_views():
 
     outputs = apply_n1_7_training_transform(transform, [image, image.copy()])
 
-    # resize(shortest=256) -> fractional crop(0.875) -> resize(shortest=256); the
-    # long edge lands at ~341 px (rounding may differ by 1 px across backends).
-    assert outputs[0].shape[0] == 256
-    assert abs(outputs[0].shape[1] - 341) <= 1
-    assert outputs[0].shape[2] == 3
+    assert outputs[0].shape == (256, 341, 3)
     np.testing.assert_array_equal(outputs[0], outputs[1])
 
 
@@ -146,7 +141,6 @@ def test_groot_n1_7_vlm_train_augmentation_respects_global_seed():
     def augment_once():
         random.seed(42)
         np.random.seed(42)
-        torch.manual_seed(42)
         step = GrootN17VLMEncodeStep(
             image_target_size=[256, 256],
             shortest_image_edge=256,
