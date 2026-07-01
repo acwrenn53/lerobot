@@ -68,27 +68,14 @@ class FractionalRandomCrop(v2.Transform):
 
 
 class ResizeShortestEdge(v2.Transform):
-    """Resize so the shortest image edge equals ``size``, preserving aspect ratio.
-
-    Output dims are computed with albumentations'/Isaac's rounding
-    (``round(dim * scale)`` on both edges) so the sampling geometry matches the
-    reference pipeline; torchvision's native shortest-edge resize rounds the
-    long edge differently and can shift the grid by 1 px.
-    """
+    """Resize so the shortest image edge equals ``size``, preserving aspect ratio."""
 
     def __init__(self, size: int):
         super().__init__()
         self.size = int(size)
 
-    def make_params(self, flat_inputs: list[Any]) -> dict[str, Any]:
-        height, width = v2.query_size(flat_inputs)
-        scale = self.size / min(height, width)
-        return {"height": round(height * scale), "width": round(width * scale)}
-
     def transform(self, inpt: Any, params: dict[str, Any]) -> Any:
-        return self._call_kernel(
-            F.resize, inpt, size=[params["height"], params["width"]], antialias=True
-        )
+        return self._call_kernel(F.resize, inpt, size=[self.size], antialias=True)
 
 
 def build_n1_7_training_transform(
