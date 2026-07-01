@@ -114,6 +114,9 @@ N1_7_EMBODIMENT_MAPPING = {
     "libero_sim": 2,
     "new_embodiment": 10,
 }
+# Native N1.7 action-head tensor horizon: checkpoints decode 40-step chunks even when
+# the dataset/execution horizon is shorter.
+N1_7_NATIVE_ACTION_HORIZON = 40
 
 
 @dataclass
@@ -144,6 +147,8 @@ class _GrootN17CheckpointProcessorAssets:
     crop_fraction: float | None
     use_albumentations: bool
     letter_box_transform: bool
+    random_rotation_angle: float
+    color_jitter_params: dict[str, float] | None
 
 
 @dataclass(frozen=True)
@@ -203,6 +208,14 @@ def _load_n1_7_checkpoint_processor_assets(config: GrootConfig) -> _GrootN17Chec
     letter_box_transform = processor_kwargs.get("letter_box_transform", False)
     if not isinstance(letter_box_transform, bool):
         letter_box_transform = False
+    random_rotation_angle = as_optional_float(processor_kwargs.get("random_rotation_angle")) or 0.0
+    raw_color_jitter = processor_kwargs.get("color_jitter_params")
+    color_jitter_params = None
+    if isinstance(raw_color_jitter, dict):
+        color_jitter_params = {
+            key: float(raw_color_jitter.get(key, 0.0))
+            for key in ("brightness", "contrast", "saturation", "hue")
+        }
 
     valid_action_horizon = _load_n1_7_checkpoint_action_horizon(processor_kwargs, config.embodiment_tag)
     video_horizon = _load_n1_7_checkpoint_video_horizon(processor_kwargs, config.embodiment_tag)
@@ -230,6 +243,8 @@ def _load_n1_7_checkpoint_processor_assets(config: GrootConfig) -> _GrootN17Chec
         crop_fraction=as_optional_float(processor_kwargs.get("crop_fraction")),
         use_albumentations=use_albumentations,
         letter_box_transform=letter_box_transform,
+        random_rotation_angle=random_rotation_angle,
+        color_jitter_params=color_jitter_params,
     )
 
 
@@ -445,6 +460,22 @@ def _apply_groot_step_overrides(
                 post_init()
 
 
+def _set_groot_preprocessor_training(
+    preprocessor: PolicyProcessorPipeline,
+    *,
+    training: bool,
+) -> None:
+    """Set the runtime-only mode of GR00T stochastic processor steps.
+
+    Any dataclass step exposing a ``training`` field participates, so processor
+    steps can opt into train-time-only behavior (augmentation, dropout) without
+    this helper enumerating them.
+    """
+    for step in preprocessor.steps:
+        if is_dataclass(step) and any(f.name == "training" for f in fields(step)):
+            setattr(step, "training", training)
+
+
 def make_groot_pre_post_processors_from_pretrained(
     config: GrootConfig,
     pretrained_path: str,
@@ -493,6 +524,7 @@ def make_groot_pre_post_processors_from_pretrained(
     _reconnect_groot_relative_absolute_steps(preprocessor, postprocessor)
     _reconnect_groot_n1_7_pack_decode_steps(preprocessor, postprocessor)
     _apply_groot_action_decode_transform(postprocessor, config.action_decode_transform)
+    _set_groot_preprocessor_training(preprocessor, training=dataset_meta is not None)
     return preprocessor, postprocessor
 
 
@@ -1064,6 +1096,8 @@ def _build_n1_7_relative_action_processor_assets(
         crop_fraction=base_assets.crop_fraction if base_assets is not None else None,
         use_albumentations=base_assets.use_albumentations if base_assets is not None else False,
         letter_box_transform=base_assets.letter_box_transform if base_assets is not None else False,
+        random_rotation_angle=base_assets.random_rotation_angle if base_assets is not None else 0.0,
+        color_jitter_params=base_assets.color_jitter_params if base_assets is not None else None,
     )
 
 
@@ -1199,6 +1233,13 @@ def make_groot_pre_post_processors(
             crop_fraction=crop_fraction,
             use_albumentations=use_albumentations,
             letter_box_transform=letter_box_transform,
+            training=dataset_meta is not None,
+            random_rotation_angle=(
+                checkpoint_assets.random_rotation_angle if checkpoint_assets is not None else 0.0
+            ),
+            color_jitter_params=(
+                checkpoint_assets.color_jitter_params if checkpoint_assets is not None else None
+            ),
             device=config.device,
         ),
         DeviceProcessorStep(device=config.device),
@@ -1971,8 +2012,12 @@ class GrootN17VLMEncodeStep(ProcessorStep):
     crop_fraction: float | None = None
     use_albumentations: bool = False
     letter_box_transform: bool = False
+    training: bool = False
+    random_rotation_angle: float = 0.0
+    color_jitter_params: dict[str, float] | None = None
     device: str | None = None
     _proc: ProcessorMixin | None = field(default=None, init=False, repr=False)
+    _train_transform: Any | None = field(default=None, init=False, repr=False)
 
     @property
     def proc(self) -> ProcessorMixin:
@@ -2004,6 +2049,33 @@ class GrootN17VLMEncodeStep(ProcessorStep):
         """
         if self.use_albumentations:
             video_np = np.asarray(video)
+            if self.training and torch.is_grad_enabled():
+                require_package("albumentations", extra="groot")
+                from .image_augmentations import (
+                    apply_n1_7_training_transform,
+                    build_n1_7_training_transform,
+                )
+
+                if self._train_transform is None:
+                    self._train_transform = build_n1_7_training_transform(
+                        image_crop_size=self.image_crop_size,
+                        image_target_size=self.image_target_size,
+                        shortest_image_edge=self.shortest_image_edge,
+                        crop_fraction=self.crop_fraction,
+                        random_rotation_angle=self.random_rotation_angle,
+                        color_jitter_params=self.color_jitter_params,
+                    )
+                train_frames_per_sample: list[list[np.ndarray]] = []
+                for batch_idx in range(batch_size):
+                    ordered_frames = [
+                        video_np[batch_idx, timestep, view_idx]
+                        for timestep in range(video_np.shape[1])
+                        for view_idx in range(video_np.shape[2])
+                    ]
+                    train_frames_per_sample.append(
+                        apply_n1_7_training_transform(self._train_transform, ordered_frames)
+                    )
+                return train_frames_per_sample
             return [
                 [
                     _transform_n1_7_image_for_vlm_albumentations(
@@ -2112,6 +2184,8 @@ class GrootN17VLMEncodeStep(ProcessorStep):
             "crop_fraction": self.crop_fraction,
             "use_albumentations": self.use_albumentations,
             "letter_box_transform": self.letter_box_transform,
+            "random_rotation_angle": self.random_rotation_angle,
+            "color_jitter_params": self.color_jitter_params,
             "device": self.device,
         }
 
