@@ -16,6 +16,7 @@
 
 import inspect
 import json
+import random
 import sys
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -39,15 +40,16 @@ from lerobot.policies.groot.configuration_groot import (
 )
 from lerobot.policies.groot.modeling_groot import GrootPolicy
 from lerobot.policies.groot.processor_groot import (
+    N1_7_NATIVE_ACTION_HORIZON,
     GrootActionUnpackUnnormalizeStep,
     GrootN17ActionDecodeStep,
     GrootN17PackInputsStep,
     GrootN17VLMEncodeStep,
-    N1_7_NATIVE_ACTION_HORIZON,
     _make_relative_action_training_stats,
     _transform_n1_7_image_for_vlm_albumentations,
     _transform_n1_7_image_for_vlm_torch,
     make_groot_pre_post_processors,
+    make_groot_pre_post_processors_from_pretrained,
 )
 from lerobot.processor import (
     AbsoluteActionsProcessorStep,
@@ -252,6 +254,7 @@ def _write_raw_n1_7_libero_checkpoint(path):
                     "max_action_dim": 132,
                     "use_percentiles": True,
                     "use_relative_action": True,
+                    "state_dropout_prob": 0.2,
                     "modality_configs": {
                         "libero_sim": {
                             "video": {
@@ -593,6 +596,7 @@ def test_raw_n1_7_libero_checkpoint_processors_use_checkpoint_assets(tmp_path):
     assert pack_inputs.max_state_dim == 132
     assert pack_inputs.max_action_dim == 132
     assert pack_inputs.clip_outliers is True
+    assert pack_inputs.state_dropout_prob == pytest.approx(0.2)
     assert pack_inputs.video_modality_keys == ["image", "wrist_image"]
     assert pack_inputs.stats[OBS_STATE]["min"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
     assert pack_inputs.stats[OBS_STATE]["max"] == [
@@ -617,6 +621,67 @@ def test_raw_n1_7_libero_checkpoint_processors_use_checkpoint_assets(tmp_path):
     assert decode_actions.use_percentiles is True
     assert decode_actions.use_relative_action is True
     assert decode_actions.action_decode_transform == GROOT_ACTION_DECODE_TRANSFORM_LIBERO
+
+
+def test_raw_n1_7_hub_checkpoint_processors_resolve_pinned_sidecars(tmp_path, monkeypatch):
+    import lerobot.policies.groot.configuration_groot as configuration_groot
+
+    snapshot_path = tmp_path / "snapshot"
+    _write_raw_n1_7_libero_checkpoint(snapshot_path)
+    calls = []
+
+    def fake_snapshot_download(repo_id, **kwargs):
+        calls.append((repo_id, kwargs))
+        return str(snapshot_path)
+
+    monkeypatch.setattr(configuration_groot, "snapshot_download", fake_snapshot_download, raising=False)
+    config = GrootConfig(
+        base_model_path="example/GR00T-N1.7-test",
+        pretrained_revision="0123456789abcdef",
+        embodiment_tag="libero_sim",
+        input_features=_groot_features(state_dim=8, action_dim=7)[0],
+        output_features=_groot_features(state_dim=8, action_dim=7)[1],
+        chunk_size=40,
+        n_action_steps=16,
+        device="cpu",
+    )
+
+    preprocessor, _ = make_pre_post_processors(config)
+
+    pack_inputs = next(step for step in preprocessor.steps if isinstance(step, GrootN17PackInputsStep))
+    vlm_encode = next(step for step in preprocessor.steps if isinstance(step, GrootN17VLMEncodeStep))
+    assert pack_inputs.valid_action_horizon == 16
+    assert pack_inputs.action_horizon == 40
+    assert pack_inputs.state_dropout_prob == pytest.approx(0.2)
+    assert vlm_encode.use_albumentations is True
+    assert calls
+    assert all(repo_id == "example/GR00T-N1.7-test" for repo_id, _ in calls)
+    assert all(kwargs["revision"] == "0123456789abcdef" for _, kwargs in calls)
+
+
+def test_raw_n1_7_pretrained_processor_detection_uses_pinned_revision(tmp_path, monkeypatch):
+    import lerobot.policies.groot.configuration_groot as configuration_groot
+
+    snapshot_path = tmp_path / "snapshot"
+    _write_raw_n1_7_libero_checkpoint(snapshot_path)
+    calls = []
+
+    def fake_snapshot_download(repo_id, **kwargs):
+        calls.append((repo_id, kwargs))
+        return str(snapshot_path)
+
+    monkeypatch.setattr(configuration_groot, "snapshot_download", fake_snapshot_download, raising=False)
+    config = _raw_n1_7_libero_config("example/GR00T-N1.7-pretrained-test")
+    config.pretrained_revision = "fedcba9876543210"
+
+    preprocessor, _ = make_groot_pre_post_processors_from_pretrained(
+        config,
+        "example/GR00T-N1.7-pretrained-test",
+    )
+
+    assert any(isinstance(step, GrootN17PackInputsStep) for step in preprocessor.steps)
+    assert calls
+    assert all(kwargs["revision"] == "fedcba9876543210" for _, kwargs in calls)
 
 
 def test_raw_n1_7_checkpoint_requires_percentile_stats_when_config_uses_percentiles(tmp_path):
@@ -1660,8 +1725,12 @@ def test_groot_from_pretrained_rejects_caller_config_mismatch_from_local_config(
 def test_groot_n1_7_processors_are_registered_lazily_without_external_gr00t():
     sys.modules.pop("gr00t", None)
     config = _groot_config()
+    dataset_stats = {
+        OBS_STATE: {"min": torch.zeros(8), "max": torch.ones(8)},
+        ACTION: {"min": torch.zeros(7), "max": torch.ones(7)},
+    }
 
-    preprocessor, _ = make_groot_pre_post_processors(config)
+    preprocessor, _ = make_groot_pre_post_processors(config, dataset_stats=dataset_stats)
     step_types = {type(step) for step in preprocessor.steps}
 
     assert GrootN17PackInputsStep in step_types
@@ -1977,6 +2046,62 @@ def test_groot_n1_7_vlm_encode_transforms_non_square_two_camera_sample_like_core
     )
 
 
+def test_groot_n1_7_vlm_train_augmentation_replays_across_views_and_differs_from_eval():
+    image = (np.arange(480 * 640 * 3, dtype=np.uint32) % 251).astype(np.uint8).reshape(480, 640, 3)
+    video = np.stack([image, image], axis=0).reshape(1, 1, 2, 480, 640, 3)
+    color_jitter = {"brightness": 0.3, "contrast": 0.4, "saturation": 0.5, "hue": 0.08}
+
+    train_step = GrootN17VLMEncodeStep(
+        image_target_size=[256, 256],
+        shortest_image_edge=256,
+        crop_fraction=0.95,
+        use_albumentations=True,
+        training=True,
+        random_rotation_angle=0,
+        color_jitter_params=color_jitter,
+    )
+    train_frames = train_step._build_sample_images(video, batch_size=1, target_device=None)[0]
+
+    eval_step = GrootN17VLMEncodeStep(
+        image_target_size=[256, 256],
+        shortest_image_edge=256,
+        crop_fraction=0.95,
+        use_albumentations=True,
+        training=False,
+        random_rotation_angle=0,
+        color_jitter_params=color_jitter,
+    )
+    eval_frames = eval_step._build_sample_images(video, batch_size=1, target_device=None)[0]
+
+    # Native GR00T replays one sampled crop/jitter across camera views.
+    np.testing.assert_array_equal(np.asarray(train_frames[0]), np.asarray(train_frames[1]))
+    # Evaluation remains deterministic center-crop and must not apply the train augmentation.
+    np.testing.assert_array_equal(np.asarray(eval_frames[0]), np.asarray(eval_frames[1]))
+    assert not np.array_equal(np.asarray(train_frames[0]), np.asarray(eval_frames[0]))
+
+
+def test_groot_n1_7_vlm_train_augmentation_respects_global_seed():
+    image = (np.arange(480 * 640 * 3, dtype=np.uint32) % 251).astype(np.uint8).reshape(480, 640, 3)
+    video = image[None, None, None]
+    color_jitter = {"brightness": 0.3, "contrast": 0.4, "saturation": 0.5, "hue": 0.08}
+
+    def augment_once():
+        random.seed(42)
+        np.random.seed(42)
+        step = GrootN17VLMEncodeStep(
+            image_target_size=[256, 256],
+            shortest_image_edge=256,
+            crop_fraction=0.95,
+            use_albumentations=True,
+            training=True,
+            random_rotation_angle=0,
+            color_jitter_params=color_jitter,
+        )
+        return np.asarray(step._build_sample_images(video, batch_size=1, target_device=None)[0][0])
+
+    np.testing.assert_array_equal(augment_once(), augment_once())
+
+
 def test_groot_n1_7_vlm_encode_config_round_trips_model_name():
     step = GrootN17VLMEncodeStep(
         model_name="local-cosmos",
@@ -1986,10 +2111,16 @@ def test_groot_n1_7_vlm_encode_config_round_trips_model_name():
         crop_fraction=0.95,
         use_albumentations=True,
         letter_box_transform=True,
+        training=True,
+        random_rotation_angle=5.0,
+        color_jitter_params={"brightness": 0.3, "contrast": 0.4, "saturation": 0.5, "hue": 0.08},
     )
 
-    restored = GrootN17VLMEncodeStep(**step.get_config())
+    serialized = step.get_config()
+    restored = GrootN17VLMEncodeStep(**serialized)
 
+    assert "training" not in serialized
+    assert restored.training is False
     assert restored.model_name == "local-cosmos"
     assert restored.image_crop_size == [230, 230]
     assert restored.image_target_size == [256, 256]
@@ -1997,6 +2128,13 @@ def test_groot_n1_7_vlm_encode_config_round_trips_model_name():
     assert restored.crop_fraction == 0.95
     assert restored.use_albumentations is True
     assert restored.letter_box_transform is True
+    assert restored.random_rotation_angle == 5.0
+    assert restored.color_jitter_params == {
+        "brightness": 0.3,
+        "contrast": 0.4,
+        "saturation": 0.5,
+        "hue": 0.08,
+    }
 
 
 def test_groot_n1_7_processor_uses_qwen_component_assets(monkeypatch):
@@ -2332,16 +2470,14 @@ def test_groot_n1_7_relative_action_processors_compute_stats_from_runtime_datase
             return len(samples)
 
         def __getitem__(self, idx):
-            return samples[idx]
+            return {**samples[idx], ACTION: samples[idx][ACTION][:2]}
 
     def _fake_lerobot_dataset(repo_id, **kwargs):
         assert repo_id == runtime_meta.repo_id
         assert kwargs["root"] == runtime_meta.root
         assert kwargs["revision"] == runtime_meta.revision
         assert kwargs["download_videos"] is False
-        assert kwargs["delta_timestamps"][ACTION] == [
-            index / runtime_meta.fps for index in range(N1_7_NATIVE_ACTION_HORIZON)
-        ]
+        assert kwargs["delta_timestamps"][ACTION] == [index / runtime_meta.fps for index in range(2)]
         return _RelativeStatsDataset()
 
     monkeypatch.setattr("lerobot.policies.groot.processor_groot.LeRobotDataset", _fake_lerobot_dataset)
@@ -2354,13 +2490,14 @@ def test_groot_n1_7_relative_action_processors_compute_stats_from_runtime_datase
     pack_step = next(step for step in preprocessor.steps if isinstance(step, GrootN17PackInputsStep))
     assert pack_step.action_horizon == N1_7_NATIVE_ACTION_HORIZON
     assert pack_step.valid_action_horizon == 2
+    assert pack_step.modality_config["action"]["delta_indices"] == [0, 1]
     pack_relative_min = pack_step.raw_stats["relative_action"]["single_arm"]["min"]
     assert pack_relative_min[:2] == [
         [-2.0, -3.0, -4.0, -5.0, -6.0],
         [1.0, 2.0, 3.0, 4.0, 5.0],
     ]
-    assert len(pack_relative_min) == N1_7_NATIVE_ACTION_HORIZON
-    assert pack_step.raw_stats["relative_action"]["single_arm"]["count"] == [2] * N1_7_NATIVE_ACTION_HORIZON
+    assert len(pack_relative_min) == 2
+    assert pack_step.raw_stats["relative_action"]["single_arm"]["count"] == [2] * 2
     assert pack_step.raw_stats["action"]["gripper"]["max"] == [100.0]
 
 
@@ -2534,7 +2671,7 @@ def test_groot_n1_7_generated_relative_stats_match_oss_gr00t_reference_numbers()
     torch.testing.assert_close(packed[TransitionKey.ACTION][0, :3, :6], expected_normalized)
 
     decoded = decode_step({TransitionKey.ACTION: packed[TransitionKey.ACTION]})
-    assert decoded[TransitionKey.ACTION].shape == (1, N1_7_NATIVE_ACTION_HORIZON, 6)
+    assert decoded[TransitionKey.ACTION].shape == (1, 3, 6)
     torch.testing.assert_close(
         decoded[TransitionKey.ACTION][:, :3],
         action_a.unsqueeze(0)[:, :3],

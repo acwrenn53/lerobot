@@ -46,6 +46,19 @@ def _fixture_path(filename: str) -> Path:
     return path
 
 
+def _synthetic_so101_camera_image(height: int, width: int, camera_index: int) -> np.ndarray:
+    yy, xx = np.mgrid[0:height, 0:width]
+    base = (xx * (camera_index + 3) + yy * (camera_index + 5)) % 256
+    return np.stack(
+        [
+            base,
+            (base + 37 + camera_index * 29) % 256,
+            (xx // 2 + yy // 3 + camera_index * 53) % 256,
+        ],
+        axis=-1,
+    ).astype(np.uint8)
+
+
 def test_groot_n1_7_eval_image_transform_matches_oss_reference():
     """Match the native N1.7 eval transform for a non-square SO-101 frame."""
 
@@ -104,6 +117,48 @@ def test_groot_n1_7_vlm_chat_content_order_matches_oss_reference():
     step(transition)
 
     assert processor.content_types == ["image", "image", "text"]
+
+
+def test_groot_n1_7_albumentations_qwen_preprocessing_matches_oss_model_input():
+    video = np.stack(
+        [
+            _synthetic_so101_camera_image(480, 640, camera_index=0),
+            _synthetic_so101_camera_image(480, 640, camera_index=1),
+        ],
+        axis=0,
+    )[None, None]
+    transition = {
+        TransitionKey.OBSERVATION: {"video": video},
+        TransitionKey.COMPLEMENTARY_DATA: {
+            "language": ["Pick up the vial and place it in the rack"],
+        },
+    }
+    step = GrootN17VLMEncodeStep(
+        image_crop_size=[230, 230],
+        image_target_size=[256, 256],
+        shortest_image_edge=256,
+        crop_fraction=0.95,
+        use_albumentations=True,
+        device="cuda",
+    )
+
+    encoded = step(transition)[TransitionKey.COMPLEMENTARY_DATA]
+
+    expected_hashes = {
+        "input_ids": "808512fbf99a86b602a211342aacc766e0fb96b40bc4ebd0a26a3a24a5cd75a2",
+        "attention_mask": "fb17ce2f7bdcf782890c18ff78b3ddd679e5c795cf1ba3c947cccb96184a9069",
+        "image_grid_thw": "034e7ae9a4cdee11a99019d7042a658ebf32ca63149f6f8e9d0e0851a2b7e7a1",
+    }
+    for key, expected_hash in expected_hashes.items():
+        actual = encoded[key].detach().cpu().contiguous().numpy()
+        assert hashlib.sha256(actual.tobytes()).hexdigest() == expected_hash, key
+
+    pixel_values = encoded["pixel_values"].to(torch.bfloat16).float().detach().cpu().contiguous().numpy()
+    assert pixel_values.min() >= -1.0
+    assert pixel_values.max() <= 1.0
+    assert hashlib.sha256(pixel_values.tobytes()).hexdigest() == (
+        "d5ee54547b68f399b09c384fbad3995f29299e48503350bf69867db9f9967a22"
+    )
 
 
 def test_groot_n1_7_alternate_vl_dit_matches_oss_reference():

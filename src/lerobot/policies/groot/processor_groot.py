@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import logging
+import random
 from copy import copy, deepcopy
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
@@ -83,7 +84,9 @@ from .configuration_groot import (
     N1_7_DEFAULT_IMAGE_CROP_SIZE,
     N1_7_DEFAULT_IMAGE_TARGET_SIZE,
     GrootConfig,
+    infer_groot_model_version,
     is_raw_groot_n1_7_checkpoint,
+    resolve_groot_n1_7_checkpoint_dir,
 )
 from .utils import (
     as_int_pair,
@@ -114,6 +117,7 @@ N1_7_EMBODIMENT_MAPPING = {
     "libero_sim": 2,
     "new_embodiment": 10,
 }
+N1_7_NATIVE_ACTION_HORIZON = 40
 
 
 @dataclass
@@ -136,6 +140,7 @@ class _GrootN17CheckpointProcessorAssets:
     video_horizon: int | None
     use_percentiles: bool
     use_relative_action: bool
+    state_dropout_prob: float
     clip_outliers: bool
     video_modality_keys: list[str] | None
     image_crop_size: list[int] | None
@@ -144,6 +149,8 @@ class _GrootN17CheckpointProcessorAssets:
     crop_fraction: float | None
     use_albumentations: bool
     letter_box_transform: bool
+    random_rotation_angle: float
+    color_jitter_params: dict[str, float] | None
 
 
 @dataclass(frozen=True)
@@ -160,10 +167,20 @@ def _load_n1_7_checkpoint_processor_assets(config: GrootConfig) -> _GrootN17Chec
     can keep using caller-provided dataset stats and config values.
     """
 
-    if not is_raw_groot_n1_7_checkpoint(config.base_model_path):
+    checkpoint_path = resolve_groot_n1_7_checkpoint_dir(
+        config.base_model_path,
+        config.pretrained_revision,
+    )
+    if checkpoint_path is None:
+        if infer_groot_model_version(config.base_model_path) == "n1.7":
+            raise FileNotFoundError(
+                "Could not resolve GR00T N1.7 processor sidecars from "
+                f"'{config.base_model_path}' at revision '{config.pretrained_revision or 'main'}'."
+            )
+        return None
+    if not is_raw_groot_n1_7_checkpoint(config.base_model_path, config.pretrained_revision):
         return None
 
-    checkpoint_path = Path(config.base_model_path).expanduser()
     processor_config = read_json(checkpoint_path / "processor_config.json")
     processor_kwargs = processor_config.get("processor_kwargs", {})
     if not isinstance(processor_kwargs, dict):
@@ -182,6 +199,9 @@ def _load_n1_7_checkpoint_processor_assets(config: GrootConfig) -> _GrootN17Chec
         modality_config = {}
 
     use_relative_action = bool(processor_kwargs.get("use_relative_action", False))
+    state_dropout_prob = as_optional_float(processor_kwargs.get("state_dropout_prob"))
+    if state_dropout_prob is None:
+        state_dropout_prob = 0.0
     stats = _load_n1_7_checkpoint_stats(
         checkpoint_path,
         processor_kwargs,
@@ -203,6 +223,14 @@ def _load_n1_7_checkpoint_processor_assets(config: GrootConfig) -> _GrootN17Chec
     letter_box_transform = processor_kwargs.get("letter_box_transform", False)
     if not isinstance(letter_box_transform, bool):
         letter_box_transform = False
+    random_rotation_angle = as_optional_float(processor_kwargs.get("random_rotation_angle")) or 0.0
+    raw_color_jitter = processor_kwargs.get("color_jitter_params")
+    color_jitter_params = None
+    if isinstance(raw_color_jitter, dict):
+        color_jitter_params = {
+            key: float(raw_color_jitter.get(key, 0.0))
+            for key in ("brightness", "contrast", "saturation", "hue")
+        }
 
     valid_action_horizon = _load_n1_7_checkpoint_action_horizon(processor_kwargs, config.embodiment_tag)
     video_horizon = _load_n1_7_checkpoint_video_horizon(processor_kwargs, config.embodiment_tag)
@@ -222,6 +250,7 @@ def _load_n1_7_checkpoint_processor_assets(config: GrootConfig) -> _GrootN17Chec
         video_horizon=video_horizon,
         use_percentiles=bool(processor_kwargs.get("use_percentiles", False)),
         use_relative_action=use_relative_action,
+        state_dropout_prob=state_dropout_prob,
         clip_outliers=clip_outliers,
         video_modality_keys=video_modality_keys,
         image_crop_size=as_int_pair(processor_kwargs.get("image_crop_size")),
@@ -230,6 +259,8 @@ def _load_n1_7_checkpoint_processor_assets(config: GrootConfig) -> _GrootN17Chec
         crop_fraction=as_optional_float(processor_kwargs.get("crop_fraction")),
         use_albumentations=use_albumentations,
         letter_box_transform=letter_box_transform,
+        random_rotation_angle=random_rotation_angle,
+        color_jitter_params=color_jitter_params,
     )
 
 
@@ -467,7 +498,7 @@ def make_groot_pre_post_processors_from_pretrained(
     preprocessor_overrides = _drop_groot_absent_standard_overrides(preprocessor_overrides)
     postprocessor_overrides = _drop_groot_absent_standard_overrides(postprocessor_overrides)
 
-    if is_raw_groot_n1_7_checkpoint(pretrained_path):
+    if is_raw_groot_n1_7_checkpoint(pretrained_path, config.pretrained_revision):
         processor_cfg = copy(config)
         processor_cfg.base_model_path = str(pretrained_path)
         preprocessor, postprocessor = make_groot_pre_post_processors(
@@ -604,7 +635,17 @@ def _resolve_visual_modality_keys_from_dataset_meta(dataset_meta: Any | None) ->
         if not is_visual or not isinstance(key, str) or not key.startswith(f"{OBS_IMAGES}."):
             continue
         keys.append(key.removeprefix(f"{OBS_IMAGES}."))
-    return keys or None
+    if not keys:
+        return None
+
+    semantic_priority = {"front": 0, "wrist": 1}
+    return [
+        key
+        for _, key in sorted(
+            enumerate(keys),
+            key=lambda item: (semantic_priority.get(item[1].lower(), 2), item[0]),
+        )
+    ]
 
 
 def _as_int(value: Any) -> int:
@@ -813,7 +854,10 @@ def _stats_preserve_action_horizon(stats: dict[str, dict[str, Any]] | None) -> b
 
 
 def _make_relative_action_training_stats_from_dataset_meta(
-    config: GrootConfig, dataset_meta: Any | None
+    config: GrootConfig,
+    dataset_meta: Any | None,
+    *,
+    action_horizon: int = N1_7_NATIVE_ACTION_HORIZON,
 ) -> dict[str, dict[str, Any]] | None:
     repo_id = getattr(dataset_meta, "repo_id", None)
     root = getattr(dataset_meta, "root", None)
@@ -823,7 +867,7 @@ def _make_relative_action_training_stats_from_dataset_meta(
 
     require_package("datasets", extra="groot")
 
-    delta_timestamps = {ACTION: [index / fps for index in config.action_delta_indices]}
+    delta_timestamps = {ACTION: [index / fps for index in range(action_horizon)]}
     dataset = LeRobotDataset(
         repo_id,
         root=root,
@@ -1007,13 +1051,18 @@ def _build_n1_7_relative_action_processor_assets(
         }
         for group in groups
     ]
-    action_horizon = min(config.chunk_size, 40)
+    native_action_horizon = (
+        base_assets.max_action_horizon
+        if base_assets is not None and base_assets.max_action_horizon is not None
+        else N1_7_NATIVE_ACTION_HORIZON
+    )
+    valid_action_horizon = min(config.chunk_size, native_action_horizon)
     modality_config: dict[str, Any] = {
         "state": {"modality_keys": [group.key for group in groups]},
         "action": {
             "modality_keys": [group.key for group in groups],
             "action_configs": action_configs,
-            "delta_indices": list(range(action_horizon)),
+            "delta_indices": list(range(valid_action_horizon)),
         },
     }
     video_modality_keys = (
@@ -1051,11 +1100,12 @@ def _build_n1_7_relative_action_processor_assets(
         if base_assets is not None
         else dict(N1_7_EMBODIMENT_MAPPING),
         formalize_language=base_assets.formalize_language if base_assets is not None else True,
-        valid_action_horizon=action_horizon,
-        max_action_horizon=action_horizon,
+        valid_action_horizon=valid_action_horizon,
+        max_action_horizon=native_action_horizon,
         video_horizon=base_assets.video_horizon if base_assets is not None else None,
         use_percentiles=use_percentiles,
         use_relative_action=True,
+        state_dropout_prob=base_assets.state_dropout_prob if base_assets is not None else 0.0,
         clip_outliers=base_assets.clip_outliers if base_assets is not None else True,
         video_modality_keys=video_modality_keys,
         image_crop_size=base_assets.image_crop_size if base_assets is not None else None,
@@ -1064,6 +1114,8 @@ def _build_n1_7_relative_action_processor_assets(
         crop_fraction=base_assets.crop_fraction if base_assets is not None else None,
         use_albumentations=base_assets.use_albumentations if base_assets is not None else False,
         letter_box_transform=base_assets.letter_box_transform if base_assets is not None else False,
+        random_rotation_angle=base_assets.random_rotation_angle if base_assets is not None else 0.0,
+        color_jitter_params=base_assets.color_jitter_params if base_assets is not None else None,
     )
 
 
@@ -1107,8 +1159,14 @@ def make_groot_pre_post_processors(
     if config.use_relative_actions and not checkpoint_has_stats:
         relative_dataset_stats = dataset_stats
         if not _stats_preserve_action_horizon(relative_dataset_stats):
+            native_action_horizon = (
+                checkpoint_assets.max_action_horizon
+                if checkpoint_assets is not None and checkpoint_assets.max_action_horizon is not None
+                else N1_7_NATIVE_ACTION_HORIZON
+            )
+            valid_action_horizon = min(config.chunk_size, native_action_horizon)
             relative_dataset_stats = _make_relative_action_training_stats_from_dataset_meta(
-                config, dataset_meta
+                config, dataset_meta, action_horizon=valid_action_horizon
             )
         relative_assets = _build_n1_7_relative_action_processor_assets(
             config,
@@ -1160,6 +1218,7 @@ def make_groot_pre_post_processors(
         embodiment_tag=config.embodiment_tag,
         embodiment_mapping=embodiment_mapping,
         normalize_min_max=True,
+        state_dropout_prob=(checkpoint_assets.state_dropout_prob if checkpoint_assets is not None else 0.0),
         stats=padded_stats,
         clip_outliers=clip_outliers,
         video_modality_keys=video_modality_keys,
@@ -1199,6 +1258,12 @@ def make_groot_pre_post_processors(
             crop_fraction=crop_fraction,
             use_albumentations=use_albumentations,
             letter_box_transform=letter_box_transform,
+            random_rotation_angle=(
+                checkpoint_assets.random_rotation_angle if checkpoint_assets is not None else 0.0
+            ),
+            color_jitter_params=(
+                checkpoint_assets.color_jitter_params if checkpoint_assets is not None else None
+            ),
             device=config.device,
         ),
         DeviceProcessorStep(device=config.device),
@@ -1472,6 +1537,8 @@ class GrootN17PackInputsStep(ProcessorStep):
     embodiment_tag: str = "new_embodiment"
     embodiment_mapping: dict[str, int] = field(default_factory=lambda: dict(N1_7_EMBODIMENT_MAPPING))
     normalize_min_max: bool = True
+    training: bool = False
+    state_dropout_prob: float = 0.0
     stats: dict[str, dict[str, Any]] | None = None
     clip_outliers: bool = True
     use_percentiles: bool = False
@@ -1803,6 +1870,13 @@ class GrootN17PackInputsStep(ProcessorStep):
             if dim < self.max_state_dim:
                 pad = torch.zeros(bsz, 1, self.max_state_dim - dim, dtype=state.dtype, device=state.device)
                 state = torch.cat([state, pad], dim=2)
+            if self.training and self.state_dropout_prob > 0:
+                drop_state = torch.tensor(
+                    [random.random() < self.state_dropout_prob for _ in range(bsz)],
+                    dtype=torch.bool,
+                    device=state.device,
+                ).view(bsz, 1, 1)
+                state = state.masked_fill(drop_state, 0)
             obs["state"] = state
 
         action = transition.get(TransitionKey.ACTION)
@@ -1914,6 +1988,7 @@ class GrootN17PackInputsStep(ProcessorStep):
             "embodiment_tag": self.embodiment_tag,
             "embodiment_mapping": self.embodiment_mapping,
             "normalize_min_max": self.normalize_min_max,
+            "state_dropout_prob": self.state_dropout_prob,
             "clip_outliers": self.clip_outliers,
             "use_percentiles": self.use_percentiles,
             "video_modality_keys": self.video_modality_keys,
@@ -1971,8 +2046,12 @@ class GrootN17VLMEncodeStep(ProcessorStep):
     crop_fraction: float | None = None
     use_albumentations: bool = False
     letter_box_transform: bool = False
+    training: bool = False
+    random_rotation_angle: float = 0.0
+    color_jitter_params: dict[str, float] | None = None
     device: str | None = None
     _proc: ProcessorMixin | None = field(default=None, init=False, repr=False)
+    _train_transform: Any | None = field(default=None, init=False, repr=False)
 
     @property
     def proc(self) -> ProcessorMixin:
@@ -2004,6 +2083,33 @@ class GrootN17VLMEncodeStep(ProcessorStep):
         """
         if self.use_albumentations:
             video_np = np.asarray(video)
+            if self.training:
+                require_package("albumentations", extra="groot")
+                from .image_augmentations import (
+                    apply_n1_7_training_transform,
+                    build_n1_7_training_transform,
+                )
+
+                if self._train_transform is None:
+                    self._train_transform = build_n1_7_training_transform(
+                        image_crop_size=self.image_crop_size,
+                        image_target_size=self.image_target_size,
+                        shortest_image_edge=self.shortest_image_edge,
+                        crop_fraction=self.crop_fraction,
+                        random_rotation_angle=self.random_rotation_angle,
+                        color_jitter_params=self.color_jitter_params,
+                    )
+                train_frames_per_sample: list[list[np.ndarray]] = []
+                for batch_idx in range(batch_size):
+                    ordered_frames = [
+                        video_np[batch_idx, timestep, view_idx]
+                        for timestep in range(video_np.shape[1])
+                        for view_idx in range(video_np.shape[2])
+                    ]
+                    train_frames_per_sample.append(
+                        apply_n1_7_training_transform(self._train_transform, ordered_frames)
+                    )
+                return train_frames_per_sample
             return [
                 [
                     _transform_n1_7_image_for_vlm_albumentations(
@@ -2112,6 +2218,8 @@ class GrootN17VLMEncodeStep(ProcessorStep):
             "crop_fraction": self.crop_fraction,
             "use_albumentations": self.use_albumentations,
             "letter_box_transform": self.letter_box_transform,
+            "random_rotation_angle": self.random_rotation_angle,
+            "color_jitter_params": self.color_jitter_params,
             "device": self.device,
         }
 

@@ -15,11 +15,16 @@
 # limitations under the License.
 
 import logging
+import math
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
+from huggingface_hub import snapshot_download
+from huggingface_hub.errors import HfHubHTTPError, HFValidationError, LocalEntryNotFoundError
+
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTrainedConfig
-from lerobot.optim import AdamWConfig, CosineDecayWithWarmupSchedulerConfig
+from lerobot.optim import AdamWConfig, DiffuserSchedulerConfig
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 from .utils import read_json
@@ -115,28 +120,63 @@ def infer_groot_model_version(model_path: str | None) -> str | None:
     return None
 
 
-def is_raw_groot_n1_7_checkpoint(model_path: str | Path | None) -> bool:
-    if model_path is None:
-        return False
-
-    path = Path(model_path).expanduser()
-    if path.is_dir():
-        config_path = path / "config.json"
-    elif path.name == "config.json":
-        config_path = path
-    else:
-        return False
-
-    config = read_json(config_path)
-    return "type" not in config and _infer_groot_model_version_from_config(config) == GROOT_N1_7
+_N1_7_PROCESSOR_SIDECARS = (
+    "config.json",
+    "processor_config.json",
+    "statistics.json",
+    "embodiment_id.json",
+)
 
 
-def infer_groot_n1_7_embodiment_tag(model_path: str | Path | None) -> str | None:
+@lru_cache(maxsize=32)
+def resolve_groot_n1_7_checkpoint_dir(
+    model_path: str | Path | None,
+    revision: str | None = None,
+) -> Path | None:
+    """Resolve a local checkpoint path or cache the N1.7 processor sidecars from the Hub."""
     if model_path is None:
         return None
 
-    processor_config_path = Path(model_path).expanduser() / "processor_config.json"
-    processor_config = read_json(processor_config_path)
+    path = Path(model_path).expanduser()
+    if path.is_dir():
+        return path
+    if path.is_file():
+        return path.parent
+
+    try:
+        return Path(
+            snapshot_download(
+                repo_id=str(model_path),
+                repo_type="model",
+                revision=revision,
+                allow_patterns=list(_N1_7_PROCESSOR_SIDECARS),
+            )
+        )
+    except (HFValidationError, HfHubHTTPError, LocalEntryNotFoundError):
+        return None
+
+
+def is_raw_groot_n1_7_checkpoint(
+    model_path: str | Path | None,
+    revision: str | None = None,
+) -> bool:
+    checkpoint_path = resolve_groot_n1_7_checkpoint_dir(model_path, revision)
+    if checkpoint_path is None:
+        return False
+
+    config = read_json(checkpoint_path / "config.json")
+    return "type" not in config and _infer_groot_model_version_from_config(config) == GROOT_N1_7
+
+
+def infer_groot_n1_7_embodiment_tag(
+    model_path: str | Path | None,
+    revision: str | None = None,
+) -> str | None:
+    checkpoint_path = resolve_groot_n1_7_checkpoint_dir(model_path, revision)
+    if checkpoint_path is None:
+        return None
+
+    processor_config = read_json(checkpoint_path / "processor_config.json")
 
     modality_configs = processor_config.get("processor_kwargs", {}).get("modality_configs", {})
     if not isinstance(modality_configs, dict):
@@ -149,13 +189,15 @@ def infer_groot_n1_7_embodiment_tag(model_path: str | Path | None) -> str | None
 
 
 def infer_groot_n1_7_action_horizon(
-    model_path: str | Path | None, embodiment_tag: str | None = None
+    model_path: str | Path | None,
+    embodiment_tag: str | None = None,
+    revision: str | None = None,
 ) -> int | None:
-    if model_path is None:
+    checkpoint_path = resolve_groot_n1_7_checkpoint_dir(model_path, revision)
+    if checkpoint_path is None:
         return None
 
-    processor_config_path = Path(model_path).expanduser() / "processor_config.json"
-    processor_config = read_json(processor_config_path)
+    processor_config = read_json(checkpoint_path / "processor_config.json")
 
     processor_kwargs = processor_config.get("processor_kwargs", {})
     if not isinstance(processor_kwargs, dict):
@@ -165,7 +207,7 @@ def infer_groot_n1_7_action_horizon(
         return None
 
     if embodiment_tag is None:
-        embodiment_tag = infer_groot_n1_7_embodiment_tag(model_path)
+        embodiment_tag = infer_groot_n1_7_embodiment_tag(model_path, revision)
     if embodiment_tag is None:
         return None
 
@@ -182,14 +224,16 @@ def infer_groot_n1_7_action_horizon(
 
 
 def infer_groot_n1_7_action_execution_horizon(
-    model_path: str | Path | None, embodiment_tag: str | None = None
+    model_path: str | Path | None,
+    embodiment_tag: str | None = None,
+    revision: str | None = None,
 ) -> int | None:
-    action_horizon = infer_groot_n1_7_action_horizon(model_path, embodiment_tag)
+    action_horizon = infer_groot_n1_7_action_horizon(model_path, embodiment_tag, revision)
     if action_horizon is None:
         return None
 
     if embodiment_tag is None:
-        embodiment_tag = infer_groot_n1_7_embodiment_tag(model_path)
+        embodiment_tag = infer_groot_n1_7_embodiment_tag(model_path, revision)
     if embodiment_tag == "libero_sim":
         # NVIDIA's N1.7 LIBERO rollout wrapper replans after 8 of the 16 decoded
         # actions. Keeping that execution cadence avoids stale open-loop chunks.
@@ -336,11 +380,13 @@ class GrootConfig(PreTrainedConfig):
 
     # Training parameters
     optimizer_lr: float = 1e-4
-    optimizer_betas: tuple[float, float] = (0.95, 0.999)
+    optimizer_betas: tuple[float, float] = (0.9, 0.999)
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 1e-5
     warmup_ratio: float = 0.05
     use_bf16: bool = True
+    # The native N1.7 fine-tuning recipe keeps model parameters in FP32 and computes under BF16 autocast.
+    model_params_fp32: bool = True
 
     # TODO(Steven): Remove these deprecated fields in a future release.
     # Deprecated Isaac-GR00T runner / GR00T N1.5 fields, plus the (never-wired) LoRA fields — all
@@ -361,7 +407,7 @@ class GrootConfig(PreTrainedConfig):
     dataset_paths: list[str] | None = None
     output_dir: str = "./tmp/gr00t"
     save_steps: int = 1000
-    max_steps: int = 10000
+    max_steps: int = 20000
     batch_size: int = 32
     dataloader_num_workers: int = 8
     report_to: str = "wandb"
@@ -480,16 +526,21 @@ class GrootConfig(PreTrainedConfig):
             betas=self.optimizer_betas,
             eps=self.optimizer_eps,
             weight_decay=self.optimizer_weight_decay,
+            grad_clip_norm=1.0,
         )
 
-    def get_scheduler_preset(self) -> CosineDecayWithWarmupSchedulerConfig:
+    def get_scheduler_preset(self) -> DiffuserSchedulerConfig:
         """Return scheduler configuration."""
-        return CosineDecayWithWarmupSchedulerConfig(
-            num_warmup_steps=int(10000 * self.warmup_ratio),  # 5% warmup by default
-            num_decay_steps=10000,  # Adjust based on training steps
-            peak_lr=self.optimizer_lr,
-            decay_lr=self.optimizer_lr * 0.1,
+        return DiffuserSchedulerConfig(
+            name="cosine",
+            num_warmup_steps=math.ceil(self.max_steps * self.warmup_ratio),
         )
+
+    def configure_training_steps(self, total_steps: int) -> None:
+        """Use the trainer update count as the scheduler preset's source of truth."""
+        if total_steps <= 0:
+            raise ValueError(f"Training steps must be positive, got {total_steps}.")
+        self.max_steps = total_steps
 
     @property
     def observation_delta_indices(self) -> None:
@@ -500,9 +551,19 @@ class GrootConfig(PreTrainedConfig):
     def action_delta_indices(self) -> list[int]:
         """Return indices for delta actions."""
         model_action_horizon = (
-            infer_groot_n1_7_action_horizon(self.base_model_path, self.embodiment_tag) or 40
+            infer_groot_n1_7_action_horizon(
+                self.base_model_path,
+                self.embodiment_tag,
+                self.pretrained_revision,
+            )
+            or 40
         )
         return list(range(min(self.chunk_size, model_action_horizon)))
+
+    @property
+    def drop_n_last_frames(self) -> int:
+        """Exclude episode tails that cannot supply a complete N1.7 action chunk."""
+        return max(0, len(self.action_delta_indices) - 1)
 
     @property
     def reward_delta_indices(self) -> None:

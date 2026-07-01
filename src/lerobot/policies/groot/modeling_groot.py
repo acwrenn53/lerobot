@@ -34,6 +34,7 @@ from huggingface_hub import hf_hub_download
 from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
 from huggingface_hub.errors import HfHubHTTPError
 from torch import Tensor
+from transformers.trainer_pt_utils import get_parameter_names
 
 from lerobot.configs import FeatureType, PolicyFeature
 from lerobot.utils.constants import ACTION, OBS_IMAGES
@@ -50,7 +51,7 @@ from .configuration_groot import (
     infer_groot_n1_7_action_execution_horizon,
     infer_groot_n1_7_action_horizon,
 )
-from .groot_n1_7 import GR00TN17
+from .groot_n1_7 import GR00TN17, _tie_unused_qwen_lm_head
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +89,7 @@ class GrootPolicy(PreTrainedPolicy):
             # Forwarded as a GR00TN17Config override; read back by set_trainable_parameters.
             "tune_top_llm_layers": self.config.tune_top_llm_layers,
             "use_flash_attention": self.config.use_flash_attention,
+            "revision": self.config.pretrained_revision,
         }
         # Surface the inference-time knobs onto the model config only when the user set them; None
         # leaves the value baked into the checkpoint untouched.
@@ -96,11 +98,52 @@ class GrootPolicy(PreTrainedPolicy):
         if self.config.rtc_ramp_rate is not None:
             model_kwargs["rtc_ramp_rate"] = self.config.rtc_ramp_rate
 
-        return GR00TN17.from_pretrained(
+        model = GR00TN17.from_pretrained(
             **model_kwargs,
             tune_vlln=self.config.tune_vlln,
             transformers_loading_kwargs={"trust_remote_code": True},
         )
+        backbone = getattr(model, "backbone", None)
+        qwen_model = getattr(backbone, "model", None)
+        if qwen_model is not None:
+            _tie_unused_qwen_lm_head(qwen_model)
+        if self.config.model_params_fp32:
+            self._cast_model_parameters_to_fp32(model)
+        return model
+
+    @staticmethod
+    def _cast_model_parameters_to_fp32(model: torch.nn.Module) -> None:
+        for parameter in model.parameters():
+            if parameter.is_floating_point():
+                parameter.data = parameter.data.to(torch.float32)
+
+    @staticmethod
+    def _build_weight_decay_parameter_groups(model: torch.nn.Module) -> list[dict[str, object]]:
+        forbidden_name_patterns = [
+            r"bias",
+            r"layernorm",
+            r"rmsnorm",
+            r"(?:^|\.)norm(?:$|\.)",
+            r"_norm(?:$|\.)",
+        ]
+        decay_names = set(get_parameter_names(model, [torch.nn.LayerNorm], forbidden_name_patterns))
+        decay_params = [
+            parameter
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad and name in decay_names
+        ]
+        no_decay_params = [
+            parameter
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad and name not in decay_names
+        ]
+        return [
+            {"params": decay_params},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ]
+
+    def get_optim_params(self):  # type: ignore[override]
+        return self._build_weight_decay_parameter_groups(self)
 
     def reset(self):
         """Reset policy state when environment resets."""
@@ -216,6 +259,8 @@ class GrootPolicy(PreTrainedPolicy):
         else:
             # Override the base_model_path with the provided path
             config.base_model_path = str(pretrained_name_or_path)
+        if revision is not None:
+            config.pretrained_revision = revision
 
         # Pass through any additional config overrides from kwargs
         for key, value in kwargs.items():
@@ -238,18 +283,17 @@ class GrootPolicy(PreTrainedPolicy):
         policy.eval()
         return policy
 
-    def get_optim_params(self) -> dict:
-        return self.parameters()
-
     def _resolve_action_queue_steps(self) -> int:
         n_action_steps = int(self.config.n_action_steps)
         checkpoint_action_horizon = infer_groot_n1_7_action_horizon(
             self.config.base_model_path,
             self.config.embodiment_tag,
+            self.config.pretrained_revision,
         )
         execution_horizon = infer_groot_n1_7_action_execution_horizon(
             self.config.base_model_path,
             self.config.embodiment_tag,
+            self.config.pretrained_revision,
         )
         horizons = [n_action_steps]
         if checkpoint_action_horizon is not None:
@@ -265,6 +309,7 @@ class GrootPolicy(PreTrainedPolicy):
         checkpoint_action_horizon = infer_groot_n1_7_action_horizon(
             self.config.base_model_path,
             self.config.embodiment_tag,
+            self.config.pretrained_revision,
         )
         if checkpoint_action_horizon is not None:
             horizons.append(checkpoint_action_horizon)

@@ -53,8 +53,8 @@ DEVICE = auto_select_torch_device()
 # GR00T N1.7 checkpoint (N1.5 is no longer supported). The N1.7-3B base model loads
 # via GrootPolicy.from_pretrained with root-level sharded safetensors.
 MODEL_PATH = "nvidia/GR00T-N1.7-3B"
-# Valid N1.7 embodiment tag carried by the checkpoint metadata.
-EMBODIMENT_TAG = "gr1_unified"
+# Fresh fine-tuning uses a dataset-defined embodiment and supplies its statistics.
+EMBODIMENT_TAG = "new_embodiment"
 
 
 def cleanup_memory():
@@ -116,9 +116,19 @@ def instantiate_lerobot_groot(
     policy.to(DEVICE)
     policy.config.device = DEVICE
 
+    dataset_stats = {
+        "observation.state": {
+            "min": torch.full((DUMMY_STATE_DIM,), -1.0),
+            "max": torch.full((DUMMY_STATE_DIM,), 1.0),
+        },
+        "action": {
+            "min": torch.full((DUMMY_ACTION_DIM,), -1.0),
+            "max": torch.full((DUMMY_ACTION_DIM,), 1.0),
+        },
+    }
     preprocessor, postprocessor = make_groot_pre_post_processors(
         config=policy.config,
-        dataset_stats=None,  # Pass None for dataset_stats to disable normalization (original GR00T doesn't normalize)
+        dataset_stats=dataset_stats,
     )
 
     return (policy, preprocessor, postprocessor)
