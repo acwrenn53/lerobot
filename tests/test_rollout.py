@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import dataclasses
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -249,6 +250,114 @@ def test_create_inference_engine_sync():
         device="cpu",
     )
     assert isinstance(engine, SyncInferenceEngine)
+
+
+def test_sync_inference_postprocesses_required_chunks_before_queueing_actions():
+    from lerobot.rollout import SyncInferenceEngine
+    from lerobot.utils.constants import ACTION
+
+    raw_chunk = torch.tensor([[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]])
+
+    class ChunkPolicy:
+        class Config:
+            use_amp = False
+            n_action_steps = 3
+
+        config = Config()
+
+        def __init__(self):
+            self.action_queue_steps = 2
+            self.predict_calls = 0
+            self.reset_calls = 0
+
+        def get_action_queue_steps(self):
+            return self.action_queue_steps
+
+        def predict_action_chunk(self, _observation):
+            self.predict_calls += 1
+            return raw_chunk
+
+        def select_action(self, _observation):
+            raise AssertionError("chunk-required inference must not call select_action")
+
+        def reset(self):
+            self.reset_calls += 1
+
+    class PassthroughProcessor:
+        requires_full_action_chunk = False
+
+        def __init__(self):
+            self.calls = 0
+            self.reset_calls = 0
+
+        def __call__(self, value):
+            self.calls += 1
+            return value
+
+        def reset(self):
+            self.reset_calls += 1
+
+    class ChunkPostprocessor(PassthroughProcessor):
+        requires_full_action_chunk = True
+
+        def __call__(self, value):
+            self.calls += 1
+            assert tuple(value.shape) == (1, 2, 2)
+            return value + 10.0
+
+    policy = ChunkPolicy()
+    preprocessor = PassthroughProcessor()
+    postprocessor = ChunkPostprocessor()
+    engine = SyncInferenceEngine(
+        policy=cast(Any, policy),
+        preprocessor=cast(Any, preprocessor),
+        postprocessor=cast(Any, postprocessor),
+        dataset_features={ACTION: {"names": ["joint_1", "joint_2"]}},
+        ordered_action_keys=["joint_1", "joint_2"],
+        task="test",
+        device="cpu",
+        robot_type="mock",
+    )
+
+    outputs = [engine.get_action({}) for _ in range(3)]
+
+    torch.testing.assert_close(outputs[0], torch.tensor([11.0, 12.0]))
+    torch.testing.assert_close(outputs[1], torch.tensor([13.0, 14.0]))
+    torch.testing.assert_close(outputs[2], torch.tensor([11.0, 12.0]))
+    assert policy.predict_calls == 2
+    assert preprocessor.calls == 2
+    assert postprocessor.calls == 2
+
+    engine.reset()
+    torch.testing.assert_close(engine.get_action({}), torch.tensor([11.0, 12.0]))
+    assert policy.predict_calls == 3
+
+
+def test_sync_inference_preserves_legacy_select_action_path():
+    from lerobot.rollout import SyncInferenceEngine
+    from lerobot.utils.constants import ACTION
+
+    policy = MagicMock()
+    policy.config.use_amp = False
+    policy.select_action.return_value = torch.tensor([[1.0, 2.0]])
+    preprocessor = MagicMock(side_effect=lambda value: value)
+    postprocessor = MagicMock(side_effect=lambda value: value + 10.0)
+    postprocessor.requires_full_action_chunk = False
+    engine = SyncInferenceEngine(
+        policy=policy,
+        preprocessor=preprocessor,
+        postprocessor=postprocessor,
+        dataset_features={ACTION: {"names": ["joint_1", "joint_2"]}},
+        ordered_action_keys=["joint_1", "joint_2"],
+        task="test",
+        device="cpu",
+        robot_type="mock",
+    )
+
+    torch.testing.assert_close(engine.get_action({}), torch.tensor([11.0, 12.0]))
+    policy.select_action.assert_called_once()
+    policy.predict_action_chunk.assert_not_called()
+    postprocessor.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

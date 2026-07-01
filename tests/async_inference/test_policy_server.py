@@ -217,3 +217,66 @@ def test_predict_action_chunk(monkeypatch, policy_server):
     for i, ta in enumerate(timed_actions):
         expected_ts = obs.get_timestamp() + i * policy_server.config.environment_dt
         assert abs(ta.get_timestamp() - expected_ts) < 1e-6
+
+
+def test_predict_action_chunk_postprocesses_required_chunks_atomically(monkeypatch, policy_server):
+    """Postprocessors that depend on chunk context must see the full predicted horizon once."""
+    from lerobot.async_inference.policy_server import PolicyServer
+
+    policy_server.policy_type = "act"
+    policy_server.preprocessor = lambda obs: obs
+    policy_server.actions_per_chunk = 3
+    raw_chunk = torch.arange(18, dtype=torch.float32).reshape(1, 3, 6)
+
+    class ChunkPostprocessor:
+        requires_full_action_chunk = True
+
+        def __init__(self):
+            self.input_shapes = []
+
+        def __call__(self, tensor):
+            self.input_shapes.append(tuple(tensor.shape))
+            assert tensor.ndim == 3
+            return tensor + 100.0
+
+    postprocessor = ChunkPostprocessor()
+    policy_server.postprocessor = postprocessor
+
+    def _fake_get_action_chunk(_self, _obs, _type="act"):
+        return raw_chunk
+
+    monkeypatch.setattr(PolicyServer, "_get_action_chunk", _fake_get_action_chunk, raising=True)
+
+    obs = _make_obs(torch.zeros(6), timestep=5)
+    timed_actions = policy_server._predict_action_chunk(obs)
+
+    assert postprocessor.input_shapes == [(1, 3, 6)]
+    assert len(timed_actions) == 3
+    torch.testing.assert_close(
+        torch.stack([timed_action.get_action() for timed_action in timed_actions]),
+        raw_chunk.squeeze(0) + 100.0,
+    )
+
+
+def test_predict_action_chunk_rejects_invalid_chunk_postprocessor_shape(monkeypatch, policy_server):
+    from lerobot.async_inference.policy_server import PolicyServer
+
+    policy_server.policy_type = "act"
+    policy_server.preprocessor = lambda obs: obs
+    policy_server.actions_per_chunk = 3
+
+    class InvalidChunkPostprocessor:
+        requires_full_action_chunk = True
+
+        def __call__(self, tensor):
+            return tensor[:, 0, :]
+
+    policy_server.postprocessor = InvalidChunkPostprocessor()
+
+    def _fake_get_action_chunk(_self, _obs, _type="act"):
+        return torch.zeros(1, 3, 6)
+
+    monkeypatch.setattr(PolicyServer, "_get_action_chunk", _fake_get_action_chunk, raising=True)
+
+    with pytest.raises(ValueError, match="expects shape"):
+        policy_server._predict_action_chunk(_make_obs(torch.zeros(6), timestep=5))

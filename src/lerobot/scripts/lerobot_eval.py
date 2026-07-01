@@ -54,7 +54,7 @@ import json
 import logging
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Callable
 from contextlib import nullcontext
 from copy import deepcopy
@@ -241,6 +241,7 @@ def rollout(
     all_rewards = []
     all_successes = []
     all_dones = []
+    postprocessed_action_queue: deque[torch.Tensor] = deque()
 
     step = 0
     # Keep track of which environments are done.
@@ -274,9 +275,27 @@ def rollout(
             observation = env_preprocessor(observation)
 
             observation = preprocessor(observation)
-            with torch.inference_mode():
-                action = policy.select_action(observation)
-            action = postprocessor(action)
+            if postprocessor.requires_full_action_chunk:
+                if not postprocessed_action_queue:
+                    with torch.inference_mode():
+                        action_chunk = policy.predict_action_chunk(observation)
+                        action_chunk = action_chunk[:, : policy.get_action_queue_steps()]
+                    action_chunk = postprocessor(action_chunk)
+                    if (
+                        action_chunk.ndim != 3
+                        or action_chunk.shape[0] != env.num_envs
+                        or action_chunk.shape[1] == 0
+                    ):
+                        raise ValueError(
+                            "Chunk postprocessing in lerobot-eval expects shape "
+                            f"(batch, non-empty horizon, action_dim), got {tuple(action_chunk.shape)}."
+                        )
+                    postprocessed_action_queue.extend(action_chunk.unbind(dim=1))
+                action = postprocessed_action_queue.popleft()
+            else:
+                with torch.inference_mode():
+                    action = policy.select_action(observation)
+                action = postprocessor(action)
 
             action_transition = {ACTION: action}
             action_transition = env_postprocessor(action_transition)

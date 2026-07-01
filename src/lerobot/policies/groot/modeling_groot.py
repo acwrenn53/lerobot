@@ -89,6 +89,7 @@ class GrootPolicy(PreTrainedPolicy):
             # Forwarded as a GR00TN17Config override; read back by set_trainable_parameters.
             "tune_top_llm_layers": self.config.tune_top_llm_layers,
             "use_flash_attention": self.config.use_flash_attention,
+            "revision": self.config.pretrained_revision,
         }
         # Surface the inference-time knobs onto the model config only when the user set them; None
         # leaves the value baked into the checkpoint untouched.
@@ -255,6 +256,8 @@ class GrootPolicy(PreTrainedPolicy):
         else:
             # Override the base_model_path with the provided path
             config.base_model_path = str(pretrained_name_or_path)
+        if revision is not None:
+            config.pretrained_revision = revision
 
         # Pass through any additional config overrides from kwargs
         for key, value in kwargs.items():
@@ -286,10 +289,12 @@ class GrootPolicy(PreTrainedPolicy):
         checkpoint_action_horizon = infer_groot_n1_7_action_horizon(
             self.config.base_model_path,
             self.config.embodiment_tag,
+            self.config.pretrained_revision,
         )
         execution_horizon = infer_groot_n1_7_action_execution_horizon(
             self.config.base_model_path,
             self.config.embodiment_tag,
+            self.config.pretrained_revision,
         )
         horizons = [n_action_steps]
         if checkpoint_action_horizon is not None:
@@ -298,6 +303,10 @@ class GrootPolicy(PreTrainedPolicy):
             horizons.append(execution_horizon)
         return min(horizons)
 
+    def get_action_queue_steps(self) -> int:
+        """Return the checkpoint-resolved number of actions executed per prediction."""
+        return self._action_queue_steps
+
     def _resolve_prediction_horizon(self, actions: Tensor) -> int:
         """Return the policy-facing action horizon for a native GR00T prediction."""
 
@@ -305,6 +314,7 @@ class GrootPolicy(PreTrainedPolicy):
         checkpoint_action_horizon = infer_groot_n1_7_action_horizon(
             self.config.base_model_path,
             self.config.embodiment_tag,
+            self.config.pretrained_revision,
         )
         if checkpoint_action_horizon is not None:
             horizons.append(checkpoint_action_horizon)

@@ -176,6 +176,11 @@ class AbsoluteActionsProcessorStep(ProcessorStep):
     enabled: bool = False
     relative_step: RelativeActionsProcessorStep | None = field(default=None, repr=False)
 
+    @property
+    def requires_full_action_chunk(self) -> bool:
+        """Relative actions must be anchored before the predicted horizon is split."""
+        return self.enabled
+
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         if not self.enabled:
             return transition

@@ -181,6 +181,11 @@ class ProcessorStep(ABC):
         """
         return transition
 
+    @property
+    def requires_full_action_chunk(self) -> bool:
+        """Whether this step must receive an action chunk before it is split into timesteps."""
+        return False
+
     def get_config(self) -> dict[str, Any]:
         """Returns the configuration of the step for serialization.
 
@@ -298,6 +303,11 @@ class DataProcessorPipeline[TInput, TOutput](HubMixin):
         transition = self.to_transition(data)
         transformed_transition = self._forward(transition)
         return self.to_output(transformed_transition)
+
+    @property
+    def requires_full_action_chunk(self) -> bool:
+        """Whether any step needs the complete action horizon in a single call."""
+        return any(step.requires_full_action_chunk for step in self.steps)
 
     def _forward(self, transition: EnvTransition) -> EnvTransition:
         """Executes all processing steps and hooks in sequence.

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+from collections import deque
 from contextlib import nullcontext
 from copy import copy
 
@@ -31,27 +32,14 @@ from .base import InferenceEngine
 logger = logging.getLogger(__name__)
 
 
-# TODO(Steven): support relative-action policies.  The per-tick flow refreshes
-# ``RelativeActionsProcessorStep._last_state`` every call, so cached chunk
-# actions popped on later ticks get reanchored to the *current* robot state and
-# absolute targets drift through the chunk.  Relative-action policies are
-# rejected at context-build time today; RTC postprocesses the whole chunk and
-# is unaffected.
-#
-# Candidate fix: drive the policy via ``predict_action_chunk`` and serve a
-# local FIFO of postprocessed actions.  Eliminates drift by construction and
-# saves per-tick pre/post work, but bypasses ``select_action`` — needs
-# fallbacks for SAC (raises), ACT temporal ensembling (ensembler lives in
-# ``select_action``), and Diffusion-family (obs-history queues populated as a
-# side effect of ``select_action``).
-
-
 class SyncInferenceEngine(InferenceEngine):
     """Inline synchronous inference: compute one action per call.
 
-    ``get_action`` runs the full policy pipeline (pre/post-processor +
-    ``select_action``) on the given observation frame and returns a
-    CPU action tensor reordered to match the dataset action keys.
+    ``get_action`` runs the policy pre/post-processing pipeline on the given
+    observation and returns one CPU action reordered to match the dataset keys.
+    Legacy pipelines use ``select_action`` per tick. Pipelines that require full
+    action chunks predict and postprocess the configured execution horizon
+    atomically, then serve the resulting absolute actions from a local FIFO.
     """
 
     def __init__(
@@ -73,6 +61,7 @@ class SyncInferenceEngine(InferenceEngine):
         self._task = task
         self._device = torch.device(device or "cpu")
         self._robot_type = robot_type
+        self._postprocessed_action_queue: deque[torch.Tensor] = deque()
         logger.info(
             "SyncInferenceEngine initialized (device=%s, action_keys=%d)",
             self._device,
@@ -93,6 +82,7 @@ class SyncInferenceEngine(InferenceEngine):
         self._policy.reset()
         self._preprocessor.reset()
         self._postprocessor.reset()
+        self._postprocessed_action_queue.clear()
 
     def get_action(self, obs_frame: dict | None) -> torch.Tensor | None:
         """Run the full inference pipeline on ``obs_frame`` and return an action tensor."""
@@ -108,12 +98,29 @@ class SyncInferenceEngine(InferenceEngine):
             else nullcontext()
         )
         with torch.inference_mode(), autocast_ctx:
-            observation = prepare_observation_for_inference(
-                observation, self._device, self._task, self._robot_type
-            )
-            observation = self._preprocessor(observation)
-            action = self._policy.select_action(observation)
-            action = self._postprocessor(action)
+            if self._postprocessor.requires_full_action_chunk:
+                if not self._postprocessed_action_queue:
+                    observation = prepare_observation_for_inference(
+                        observation, self._device, self._task, self._robot_type
+                    )
+                    observation = self._preprocessor(observation)
+                    action_chunk = self._policy.predict_action_chunk(observation)
+                    action_chunk = action_chunk[:, : self._policy.get_action_queue_steps()]
+                    action_chunk = self._postprocessor(action_chunk)
+                    if action_chunk.ndim != 3 or action_chunk.shape[0] != 1 or action_chunk.shape[1] == 0:
+                        raise ValueError(
+                            "Chunk postprocessing in SyncInferenceEngine expects shape "
+                            f"(1, non-empty horizon, action_dim), got {tuple(action_chunk.shape)}."
+                        )
+                    self._postprocessed_action_queue.extend(action_chunk.unbind(dim=1))
+                action = self._postprocessed_action_queue.popleft()
+            else:
+                observation = prepare_observation_for_inference(
+                    observation, self._device, self._task, self._robot_type
+                )
+                observation = self._preprocessor(observation)
+                action = self._policy.select_action(observation)
+                action = self._postprocessor(action)
         action_tensor = action.squeeze(0).cpu()
 
         # Reorder to match dataset action ordering so the caller can treat

@@ -308,8 +308,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     if (processor_pretrained_path and not cfg.resume) or not processor_pretrained_path:
         processor_kwargs["dataset_stats"] = dataset.meta.stats
 
-    if cfg.is_reward_model_training:
-        processor_kwargs["dataset_meta"] = dataset.meta
+    processor_kwargs["dataset_meta"] = dataset.meta
 
     if not cfg.is_reward_model_training and processor_pretrained_path is not None:
         preprocessor_overrides = {
