@@ -207,3 +207,82 @@ class WandBLogger:
 
         wandb_video = self._wandb.Video(video_path, fps=self.env_fps, format="mp4")
         self._wandb.log({f"{mode}/video": wandb_video}, step=step)
+
+    @staticmethod
+    def _as_wandb_image_data(image):
+        import torch
+
+        if torch.is_tensor(image):
+            tensor = image.detach().cpu()
+            if tensor.dtype == torch.bfloat16:
+                tensor = tensor.float()
+            if tensor.ndim == 3 and tensor.shape[0] in (1, 3, 4):
+                tensor = tensor.permute(1, 2, 0)
+            return tensor.numpy()
+        return image
+
+    @staticmethod
+    def _image_payload_and_caption(payload, step: int, fallback_index: int):
+        if isinstance(payload, dict):
+            image = payload.get("image")
+            metadata = {key: value for key, value in payload.items() if key != "image"}
+        else:
+            image = payload
+            metadata = {}
+
+        caption_parts = [f"step={step}"]
+        for key in (
+            "model_input_index",
+            "batch_index",
+            "sample_input_index",
+            "time_index",
+            "view_index",
+            "view",
+        ):
+            value = metadata.get(key)
+            if value is not None:
+                caption_parts.append(f"{key}={value}")
+        if len(caption_parts) == 1:
+            caption_parts.append(f"model_input_index={fallback_index}")
+        return image, " ".join(caption_parts)
+
+    @staticmethod
+    def _image_log_key(payload, fallback_index: int, mode: str, key: str) -> str:
+        view = payload.get("view") if isinstance(payload, dict) else None
+        if view is not None:
+            sanitized = "".join(ch if ch.isalnum() else "_" for ch in str(view).lower()).strip("_")
+            if sanitized:
+                if key == "model_input_images":
+                    return f"{mode}/model_input_image_{sanitized}"
+                return f"{mode}/{key}_{sanitized}"
+
+        slot = payload.get("sample_input_index", fallback_index) if isinstance(payload, dict) else fallback_index
+        try:
+            slot_index = int(slot)
+        except (TypeError, ValueError):
+            slot_index = fallback_index
+        if key == "model_input_images":
+            return f"{mode}/model_input_image_{slot_index:02d}"
+        return f"{mode}/{key}_{slot_index:02d}"
+
+    def log_images(self, images: list, step: int, mode: str = "train", key: str = "images"):
+        if mode not in {"train", "eval"}:
+            raise ValueError(mode)
+        if not images:
+            return
+
+        wandb_payload = {}
+        for fallback_index, payload in enumerate(images):
+            image, caption = self._image_payload_and_caption(
+                payload,
+                step=step,
+                fallback_index=fallback_index,
+            )
+            if image is None:
+                continue
+            wandb_payload[self._image_log_key(payload, fallback_index, mode, key)] = self._wandb.Image(
+                self._as_wandb_image_data(image), caption=caption
+            )
+        if not wandb_payload:
+            return
+        self._wandb.log(wandb_payload, step=step)

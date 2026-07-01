@@ -20,6 +20,7 @@ Requires: pip install 'lerobot[training]'  (includes dataset + accelerate + wand
 
 import dataclasses
 import logging
+import os
 import time
 from contextlib import nullcontext
 from pprint import pformat
@@ -66,6 +67,20 @@ from lerobot.utils.utils import (
 )
 
 from .lerobot_eval import eval_policy_all
+
+WANDB_MODEL_INPUT_IMAGES_KEY = "_wandb_model_input_images"
+
+
+def should_log_model_input_images(step: int) -> bool:
+    log_freq = os.environ.get("WANDB_MODEL_INPUT_IMAGES_LOG_FREQ")
+    if log_freq is None:
+        return True
+    try:
+        image_logging_steps = int(log_freq)
+    except ValueError:
+        logging.warning("Invalid WANDB_MODEL_INPUT_IMAGES_LOG_FREQ=%r; logging images this step", log_freq)
+        return True
+    return image_logging_steps > 0 and step % image_logging_steps == 0
 
 
 def update_policy(
@@ -351,6 +366,38 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             **processor_kwargs,
         )
 
+    if is_main_process and not cfg.is_reward_model_training and getattr(active_cfg, "type", None) == "groot":
+        pack_step = next(
+            (
+                step
+                for step in getattr(preprocessor, "steps", ())
+                if hasattr(step, "action_horizon") and hasattr(step, "valid_action_horizon")
+            ),
+            None,
+        )
+        if pack_step is not None:
+            relative_stats = (getattr(pack_step, "raw_stats", None) or {}).get("relative_action", {})
+            horizon_stats = False
+            if isinstance(relative_stats, dict):
+                for group_stats in relative_stats.values():
+                    if not isinstance(group_stats, dict):
+                        continue
+                    for stat_name in ("min", "max", "mean", "std", "q01", "q99"):
+                        value = group_stats.get(stat_name)
+                        if value is not None:
+                            horizon_stats = torch.as_tensor(value).ndim >= 2
+                            break
+                    if horizon_stats:
+                        break
+            logging.info(
+                "GR00T processor: action_horizon=%s valid_action_horizon=%s video_horizon=%s "
+                "horizon_preserving_action_stats=%s",
+                getattr(pack_step, "action_horizon", None),
+                getattr(pack_step, "valid_action_horizon", None),
+                getattr(pack_step, "video_horizon", None),
+                horizon_stats,
+            )
+
     if is_main_process:
         logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
@@ -560,6 +607,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             if cam_key in batch and batch[cam_key].dtype == torch.uint8:
                 batch[cam_key] = batch[cam_key].to(dtype=torch.float32) / 255.0
         batch = preprocessor(batch)
+        model_input_images = batch.pop(WANDB_MODEL_INPUT_IMAGES_KEY, None)
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
         train_tracker, output_dict = update_policy(
@@ -598,11 +646,22 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     wandb_log_dict = train_tracker.to_dict()
                     if output_dict:
                         wandb_log_dict.update(output_dict)
+                    if "lr" in wandb_log_dict and "learning_rate" not in wandb_log_dict:
+                        wandb_log_dict["learning_rate"] = wandb_log_dict["lr"]
+                    elif "learning_rate" in wandb_log_dict and "lr" not in wandb_log_dict:
+                        wandb_log_dict["lr"] = wandb_log_dict["learning_rate"]
                     # Log sample weighting statistics if enabled
                     if sample_weighter is not None:
                         weighter_stats = sample_weighter.get_stats()
                         wandb_log_dict.update({f"sample_weighting/{k}": v for k, v in weighter_stats.items()})
                     wandb_logger.log_dict(wandb_log_dict, step)
+                    if should_log_model_input_images(step):
+                        wandb_logger.log_images(
+                            model_input_images,
+                            step=step,
+                            mode="train",
+                            key="model_input_images",
+                        )
             train_tracker.reset_averages()
 
         if is_eval_step:

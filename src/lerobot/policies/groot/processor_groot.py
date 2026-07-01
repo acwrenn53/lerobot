@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import logging
+import os
 from copy import copy, deepcopy
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
@@ -98,6 +99,19 @@ from .utils import (
     relative_eef_to_absolute,
     stat_dim_from_entry,
 )
+
+WANDB_MODEL_INPUT_IMAGES_KEY = "_wandb_model_input_images"
+WANDB_MODEL_INPUT_IMAGE_KEYS_KEY = "_wandb_model_input_image_keys"
+
+
+def _wandb_model_input_image_limit() -> int:
+    raw_limit = os.environ.get("WANDB_MODEL_INPUT_IMAGES_MAX", "8")
+    try:
+        return max(0, int(raw_limit))
+    except ValueError:
+        logging.warning("Invalid WANDB_MODEL_INPUT_IMAGES_MAX=%r; using 8", raw_limit)
+        return 8
+
 
 N1_7_EMBODIMENT_MAPPING = {
     "oxe_droid_relative_eef_relative_joint": 24,
@@ -1062,7 +1076,7 @@ def _build_n1_7_relative_action_processor_assets(
         image_target_size=base_assets.image_target_size if base_assets is not None else None,
         shortest_image_edge=base_assets.shortest_image_edge if base_assets is not None else None,
         crop_fraction=base_assets.crop_fraction if base_assets is not None else None,
-        use_albumentations=base_assets.use_albumentations if base_assets is not None else False,
+        use_albumentations=base_assets.use_albumentations if base_assets is not None else True,
         letter_box_transform=base_assets.letter_box_transform if base_assets is not None else False,
     )
 
@@ -1184,7 +1198,7 @@ def make_groot_pre_post_processors(
         image_crop_size = list(N1_7_DEFAULT_IMAGE_CROP_SIZE)
         shortest_image_edge = None
         crop_fraction = None
-    use_albumentations = checkpoint_assets.use_albumentations if checkpoint_assets is not None else False
+    use_albumentations = checkpoint_assets.use_albumentations if checkpoint_assets is not None else True
     letter_box_transform = checkpoint_assets.letter_box_transform if checkpoint_assets is not None else False
 
     input_steps: list[ProcessorStep] = [
@@ -1337,7 +1351,7 @@ def _transform_n1_7_image_for_vlm_albumentations(
     if image_target_size is None:
         return image
 
-    target_h, target_w = image_target_size
+    target_h, _target_w = image_target_size
 
     image_np = np.asarray(image)
     if image_np.ndim == 2:
@@ -1402,7 +1416,7 @@ def _transform_n1_7_image_for_vlm_torch(
 ) -> torch.Tensor:
     """Default (non-albumentations) N1.7 image transform.
 
-    Optionally pads to square, then resizes to ``shortest_image_edge``, center-crops
+    Optionally pads to square, then resizes to ``image_target_size``, center-crops
     by ``crop_fraction``, and resizes to ``image_target_size``.
 
     Operates on a ``(C, H, W)`` uint8 tensor and keeps the result on the input
@@ -1775,6 +1789,9 @@ class GrootN17PackInputsStep(ProcessorStep):
             cams = [_align_video_horizon(_to_uint8_np_bthwc(obs[k]), self.video_horizon) for k in img_keys]
             video = np.stack(cams, axis=2)  # (B, T, V, H, W, C)
             obs["video"] = video
+            comp[WANDB_MODEL_INPUT_IMAGE_KEYS_KEY] = [
+                key.removeprefix(f"{OBS_IMAGES}.") for key in img_keys
+            ]
             image_keys_to_remove = [key for key in obs if key.startswith(OBS_IMAGES)]
             if OBS_IMAGE in obs:
                 image_keys_to_remove.append(OBS_IMAGE)
@@ -2053,6 +2070,11 @@ class GrootN17VLMEncodeStep(ProcessorStep):
             return transition
 
         batch_size = int(video.shape[0])
+        num_timesteps = int(video.shape[1])
+        num_views = int(video.shape[2])
+        view_names = comp.pop(WANDB_MODEL_INPUT_IMAGE_KEYS_KEY, None)
+        if not isinstance(view_names, list) or len(view_names) != num_views:
+            view_names = [str(view_index) for view_index in range(num_views)]
         languages = prepare_n1_7_language_batch(
             comp.get("language"),
             batch_size,
@@ -2061,6 +2083,27 @@ class GrootN17VLMEncodeStep(ProcessorStep):
 
         target_device = self._target_device()
         sample_images = self._build_sample_images(video, batch_size, target_device)
+        wandb_image_limit = _wandb_model_input_image_limit()
+        if wandb_image_limit > 0 and sample_images:
+            wandb_images = []
+            batch_index = 0
+            for sample_input_index, image in enumerate(sample_images[batch_index]):
+                if len(wandb_images) >= wandb_image_limit:
+                    break
+                time_index = sample_input_index // num_views if num_views else 0
+                view_index = sample_input_index % num_views if num_views else 0
+                wandb_images.append(
+                    {
+                        "image": image,
+                        "batch_index": batch_index,
+                        "sample_input_index": sample_input_index,
+                        "model_input_index": batch_index * num_timesteps * num_views + sample_input_index,
+                        "time_index": time_index,
+                        "view_index": view_index,
+                        "view": view_names[view_index] if view_index < len(view_names) else str(view_index),
+                    }
+                )
+            comp[WANDB_MODEL_INPUT_IMAGES_KEY] = wandb_images
 
         texts: list[str] = []
         images: list[Any] = []
