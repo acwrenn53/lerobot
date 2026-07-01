@@ -2050,7 +2050,6 @@ class GrootN17VLMEncodeStep(ProcessorStep):
         if self.use_albumentations:
             video_np = np.asarray(video)
             if self.training and torch.is_grad_enabled():
-                require_package("albumentations", extra="groot")
                 from .image_augmentations import (
                     apply_n1_7_training_transform,
                     build_n1_7_training_transform,
