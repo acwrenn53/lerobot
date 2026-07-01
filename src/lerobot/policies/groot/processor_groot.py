@@ -114,6 +114,7 @@ N1_7_EMBODIMENT_MAPPING = {
     "libero_sim": 2,
     "new_embodiment": 10,
 }
+N1_7_NATIVE_ACTION_HORIZON = 40
 
 
 @dataclass
@@ -813,7 +814,7 @@ def _stats_preserve_action_horizon(stats: dict[str, dict[str, Any]] | None) -> b
 
 
 def _make_relative_action_training_stats_from_dataset_meta(
-    config: GrootConfig, dataset_meta: Any | None
+    config: GrootConfig, dataset_meta: Any | None, *, action_horizon: int | None = None
 ) -> dict[str, dict[str, Any]] | None:
     repo_id = getattr(dataset_meta, "repo_id", None)
     root = getattr(dataset_meta, "root", None)
@@ -823,7 +824,8 @@ def _make_relative_action_training_stats_from_dataset_meta(
 
     require_package("datasets", extra="groot")
 
-    delta_timestamps = {ACTION: [index / fps for index in config.action_delta_indices]}
+    horizon = action_horizon or len(config.action_delta_indices)
+    delta_timestamps = {ACTION: [index / fps for index in range(horizon)]}
     dataset = LeRobotDataset(
         repo_id,
         root=root,
@@ -1007,13 +1009,18 @@ def _build_n1_7_relative_action_processor_assets(
         }
         for group in groups
     ]
-    action_horizon = min(config.chunk_size, 40)
+    native_action_horizon = (
+        base_assets.max_action_horizon
+        if base_assets is not None and base_assets.max_action_horizon is not None
+        else N1_7_NATIVE_ACTION_HORIZON
+    )
+    valid_action_horizon = _n1_7_valid_action_horizon(config, native_action_horizon)
     modality_config: dict[str, Any] = {
         "state": {"modality_keys": [group.key for group in groups]},
         "action": {
             "modality_keys": [group.key for group in groups],
             "action_configs": action_configs,
-            "delta_indices": list(range(action_horizon)),
+            "delta_indices": list(range(valid_action_horizon)),
         },
     }
     video_modality_keys = (
@@ -1043,7 +1050,7 @@ def _build_n1_7_relative_action_processor_assets(
         ),
     }
 
-    return _GrootN17CheckpointProcessorAssets(
+    assets = _GrootN17CheckpointProcessorAssets(
         stats=flat_stats,
         raw_stats=raw_stats,
         modality_config=modality_config,
@@ -1051,8 +1058,8 @@ def _build_n1_7_relative_action_processor_assets(
         if base_assets is not None
         else dict(N1_7_EMBODIMENT_MAPPING),
         formalize_language=base_assets.formalize_language if base_assets is not None else True,
-        valid_action_horizon=action_horizon,
-        max_action_horizon=action_horizon,
+        valid_action_horizon=valid_action_horizon,
+        max_action_horizon=native_action_horizon,
         video_horizon=base_assets.video_horizon if base_assets is not None else None,
         use_percentiles=use_percentiles,
         use_relative_action=True,
@@ -1065,6 +1072,71 @@ def _build_n1_7_relative_action_processor_assets(
         use_albumentations=base_assets.use_albumentations if base_assets is not None else False,
         letter_box_transform=base_assets.letter_box_transform if base_assets is not None else False,
     )
+    _validate_n1_7_relative_action_processor_assets(config, assets, groups)
+    return assets
+
+
+def _validate_n1_7_relative_action_processor_assets(
+    config: GrootConfig,
+    assets: _GrootN17CheckpointProcessorAssets,
+    groups: list[_GrootN17ActionGroup],
+) -> None:
+    if not config.use_relative_actions:
+        return
+    if assets.max_action_horizon is None or assets.valid_action_horizon is None:
+        raise ValueError("GR00T N1.7 relative-action processors require explicit action horizons.")
+    if assets.max_action_horizon < assets.valid_action_horizon:
+        raise ValueError(
+            "GR00T N1.7 relative-action processor has max_action_horizon "
+            f"{assets.max_action_horizon} below valid_action_horizon {assets.valid_action_horizon}."
+        )
+    if not _raw_relative_stats_preserve_action_horizon(assets.raw_stats, groups, assets.valid_action_horizon):
+        raise ValueError(
+            "GR00T N1.7 relative-action processor requires valid-horizon-preserving action statistics."
+        )
+
+    group_keys = {group.key for group in groups}
+    looks_like_so101 = (
+        int(config.output_features[ACTION].shape[0]) == 6
+        and "single_arm" in group_keys
+        and any("gripper" in str(joint).lower() for joint in (config.relative_exclude_joints or []))
+    )
+    if looks_like_so101 and not {"single_arm", "gripper"}.issubset(group_keys):
+        raise ValueError(
+            "SO101-style GR00T relative-action processors must preserve single_arm and gripper groups."
+        )
+
+
+def _raw_relative_stats_preserve_action_horizon(
+    raw_stats: dict[str, Any],
+    groups: list[_GrootN17ActionGroup],
+    action_horizon: int,
+) -> bool:
+    relative_stats = raw_stats.get("relative_action", {}) if isinstance(raw_stats, dict) else {}
+    if not isinstance(relative_stats, dict):
+        return False
+    for group in groups:
+        if not group.relative:
+            continue
+        group_stats = relative_stats.get(group.key, {})
+        if not isinstance(group_stats, dict):
+            return False
+        for stat_name in ("min", "max", "mean", "std", "q01", "q99"):
+            value = group_stats.get(stat_name)
+            if value is None:
+                continue
+            return torch.as_tensor(value).ndim >= 2 and torch.as_tensor(value).shape[0] >= action_horizon
+        return False
+    return True
+
+
+def _n1_7_valid_action_horizon(config: GrootConfig, max_action_horizon: int) -> int:
+    """Return the real action-delta horizon before N1.7 pads to its native capacity."""
+
+    configured_horizon = len(config.action_delta_indices)
+    if configured_horizon <= 0:
+        configured_horizon = int(config.chunk_size)
+    return min(configured_horizon, max_action_horizon)
 
 
 def make_groot_pre_post_processors(
@@ -1107,8 +1179,14 @@ def make_groot_pre_post_processors(
     if config.use_relative_actions and not checkpoint_has_stats:
         relative_dataset_stats = dataset_stats
         if not _stats_preserve_action_horizon(relative_dataset_stats):
+            native_action_horizon = (
+                checkpoint_assets.max_action_horizon
+                if checkpoint_assets is not None and checkpoint_assets.max_action_horizon is not None
+                else N1_7_NATIVE_ACTION_HORIZON
+            )
+            valid_action_horizon = _n1_7_valid_action_horizon(config, native_action_horizon)
             relative_dataset_stats = _make_relative_action_training_stats_from_dataset_meta(
-                config, dataset_meta
+                config, dataset_meta, action_horizon=valid_action_horizon
             )
         relative_assets = _build_n1_7_relative_action_processor_assets(
             config,
