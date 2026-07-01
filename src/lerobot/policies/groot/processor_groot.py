@@ -495,10 +495,15 @@ def _set_groot_preprocessor_training(
     *,
     training: bool,
 ) -> None:
-    """Set the runtime-only mode of GR00T stochastic processor steps."""
+    """Set the runtime-only mode of GR00T stochastic processor steps.
+
+    Any dataclass step exposing a ``training`` field participates, so processor
+    steps can opt into train-time-only behavior (dropout, augmentation) without
+    this helper enumerating them.
+    """
     for step in preprocessor.steps:
-        if isinstance(step, (GrootN17PackInputsStep, GrootN17VLMEncodeStep)):
-            step.training = training
+        if is_dataclass(step) and any(f.name == "training" for f in fields(step)):
+            setattr(step, "training", training)
 
 
 def make_groot_pre_post_processors_from_pretrained(

@@ -142,9 +142,6 @@ class GrootPolicy(PreTrainedPolicy):
             {"params": no_decay_params, "weight_decay": 0.0},
         ]
 
-    def get_optim_params(self):  # type: ignore[override]
-        return self._build_weight_decay_parameter_groups(self)
-
     def reset(self):
         """Reset policy state when environment resets."""
         self._action_queue = deque([], maxlen=self._action_queue_steps)
@@ -282,6 +279,10 @@ class GrootPolicy(PreTrainedPolicy):
 
         policy.eval()
         return policy
+
+    def get_optim_params(self):  # type: ignore[override]
+        """Isaac-GR00T excludes biases and normalization parameters from weight decay."""
+        return self._build_weight_decay_parameter_groups(self)
 
     def _resolve_action_queue_steps(self) -> int:
         n_action_steps = int(self.config.n_action_steps)

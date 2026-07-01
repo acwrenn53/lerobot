@@ -388,6 +388,7 @@ class GrootConfig(PreTrainedConfig):
 
     # Training parameters
     optimizer_lr: float = 1e-4
+    # Isaac-GR00T N1.7 fine-tunes with AdamW betas (0.9, 0.999).
     optimizer_betas: tuple[float, float] = (0.9, 0.999)
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 1e-5
@@ -538,7 +539,13 @@ class GrootConfig(PreTrainedConfig):
         )
 
     def get_scheduler_preset(self) -> DiffuserSchedulerConfig:
-        """Return scheduler configuration."""
+        """Return scheduler configuration.
+
+        Isaac-GR00T uses the HF Trainer cosine schedule with ~5% warmup over the
+        actual training update count; DiffuserSchedulerConfig wraps the same
+        diffusers/transformers `get_scheduler("cosine")` implementation and
+        derives num_training_steps from the outer --steps value at runtime.
+        """
         return DiffuserSchedulerConfig(
             name="cosine",
             num_warmup_steps=math.ceil(self.max_steps * self.warmup_ratio),
