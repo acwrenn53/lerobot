@@ -19,6 +19,7 @@ import json
 import random
 import sys
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import patch
 
 import numpy as np
@@ -248,6 +249,12 @@ def _write_raw_n1_7_libero_checkpoint(path):
                     "shortest_image_edge": 256,
                     "crop_fraction": 0.95,
                     "use_albumentations": True,
+                    "color_jitter_params": {
+                        "brightness": 0.3,
+                        "contrast": 0.4,
+                        "saturation": 0.5,
+                        "hue": 0.08,
+                    },
                     "letter_box_transform": False,
                     "max_action_horizon": 40,
                     "max_state_dim": 132,
@@ -623,12 +630,14 @@ def test_raw_n1_7_libero_checkpoint_processors_use_checkpoint_assets(tmp_path):
     assert decode_actions.action_decode_transform == GROOT_ACTION_DECODE_TRANSFORM_LIBERO
 
 
-def test_raw_n1_7_hub_checkpoint_processors_resolve_pinned_sidecars(tmp_path, monkeypatch):
+def test_raw_n1_7_hub_checkpoint_processors_resolve_pinned_sidecars(tmp_path, monkeypatch, request):
     import lerobot.policies.groot.configuration_groot as configuration_groot
 
     snapshot_path = tmp_path / "snapshot"
     _write_raw_n1_7_libero_checkpoint(snapshot_path)
     calls = []
+    configuration_groot.resolve_groot_n1_7_checkpoint_dir.cache_clear()
+    request.addfinalizer(configuration_groot.resolve_groot_n1_7_checkpoint_dir.cache_clear)
 
     def fake_snapshot_download(repo_id, **kwargs):
         calls.append((repo_id, kwargs))
@@ -636,7 +645,7 @@ def test_raw_n1_7_hub_checkpoint_processors_resolve_pinned_sidecars(tmp_path, mo
 
     monkeypatch.setattr(configuration_groot, "snapshot_download", fake_snapshot_download, raising=False)
     config = GrootConfig(
-        base_model_path="example/GR00T-N1.7-test",
+        base_model_path=GROOT_N1_7_BASE_MODEL,
         pretrained_revision="0123456789abcdef",
         embodiment_tag="libero_sim",
         input_features=_groot_features(state_dim=8, action_dim=7)[0],
@@ -655,8 +664,101 @@ def test_raw_n1_7_hub_checkpoint_processors_resolve_pinned_sidecars(tmp_path, mo
     assert pack_inputs.state_dropout_prob == pytest.approx(0.2)
     assert vlm_encode.use_albumentations is True
     assert calls
-    assert all(repo_id == "example/GR00T-N1.7-test" for repo_id, _ in calls)
+    assert all(repo_id == GROOT_N1_7_BASE_MODEL for repo_id, _ in calls)
     assert all(kwargs["revision"] == "0123456789abcdef" for _, kwargs in calls)
+
+
+def test_raw_n1_7_hub_fresh_embodiment_uses_oss_training_defaults(tmp_path, monkeypatch, request):
+    import lerobot.policies.groot.configuration_groot as configuration_groot
+    from lerobot.scripts import lerobot_train
+
+    snapshot_path = tmp_path / "snapshot"
+    _write_raw_n1_7_libero_checkpoint(snapshot_path)
+    configuration_groot.resolve_groot_n1_7_checkpoint_dir.cache_clear()
+    request.addfinalizer(configuration_groot.resolve_groot_n1_7_checkpoint_dir.cache_clear)
+    monkeypatch.setattr(
+        configuration_groot,
+        "snapshot_download",
+        lambda **_kwargs: str(snapshot_path),
+        raising=False,
+    )
+
+    input_features, output_features = _groot_features(state_dim=6, action_dim=6)
+    config = GrootConfig(
+        base_model_path=GROOT_N1_7_BASE_MODEL,
+        pretrained_revision="0123456789abcdef",
+        embodiment_tag="new_embodiment",
+        input_features=input_features,
+        output_features=output_features,
+        chunk_size=16,
+        n_action_steps=16,
+        use_relative_actions=True,
+        relative_exclude_joints=["gripper"],
+        device="cpu",
+    )
+    state_stats = {
+        "min": -torch.ones(6),
+        "max": torch.ones(6),
+        "mean": torch.zeros(6),
+        "std": torch.ones(6),
+        "q01": -0.9 * torch.ones(6),
+        "q99": 0.9 * torch.ones(6),
+    }
+    absolute_action_stats = {name: value.clone() for name, value in state_stats.items()}
+    action_stats = {name: value.unsqueeze(0).repeat(16, 1) for name, value in absolute_action_stats.items()}
+    dataset_meta = SimpleNamespace(
+        features={
+            ACTION: {
+                "names": [
+                    "shoulder_pan.pos",
+                    "shoulder_lift.pos",
+                    "elbow_flex.pos",
+                    "wrist_flex.pos",
+                    "wrist_roll.pos",
+                    "gripper.pos",
+                ]
+            }
+        },
+        stats={OBS_STATE: state_stats, ACTION: absolute_action_stats},
+    )
+
+    preprocessor, _ = make_groot_pre_post_processors(
+        config,
+        dataset_stats={OBS_STATE: state_stats, ACTION: action_stats},
+        dataset_meta=dataset_meta,
+    )
+    pack_inputs = cast(
+        GrootN17PackInputsStep,
+        next(step for step in preprocessor.steps if isinstance(step, GrootN17PackInputsStep)),
+    )
+    vlm_encode = cast(
+        GrootN17VLMEncodeStep,
+        next(step for step in preprocessor.steps if isinstance(step, GrootN17VLMEncodeStep)),
+    )
+
+    assert pack_inputs.training is False
+    assert vlm_encode.training is False
+    assert pack_inputs.action_horizon == 40
+    assert pack_inputs.valid_action_horizon == 16
+    assert pack_inputs.state_dropout_prob == pytest.approx(0.2)
+    assert vlm_encode.use_albumentations is True
+    assert vlm_encode.shortest_image_edge == 256
+    assert vlm_encode.crop_fraction == pytest.approx(0.95)
+    assert vlm_encode.color_jitter_params == {
+        "brightness": 0.3,
+        "contrast": 0.4,
+        "saturation": 0.5,
+        "hue": 0.08,
+    }
+
+    lerobot_train._enable_groot_training_processor_steps(preprocessor)
+    assert pack_inputs.training is True
+    assert vlm_encode.training is True
+    with lerobot_train._groot_processor_mode(preprocessor, training=False):
+        assert pack_inputs.training is False
+        assert vlm_encode.training is False
+    assert pack_inputs.training is True
+    assert vlm_encode.training is True
 
 
 def test_raw_n1_7_pretrained_processor_detection_uses_pinned_revision(tmp_path, monkeypatch):

@@ -51,6 +51,7 @@ def test_groot_n1_7_optimizer_matches_isaac_training_contract():
     assert optimizer.eps == pytest.approx(1e-8)
     assert optimizer.weight_decay == pytest.approx(1e-5)
     assert optimizer.grad_clip_norm == pytest.approx(1.0)
+    assert optimizer.fused is True
 
 
 def test_groot_n1_7_sampler_excludes_incomplete_action_tails():
@@ -336,3 +337,14 @@ def test_groot_n1_7_so101_visual_modalities_follow_isaac_front_then_wrist_order(
     )
 
     assert _resolve_visual_modality_keys_from_dataset_meta(dataset_meta) == ["front", "wrist"]
+
+
+def test_groot_n1_7_workshop_camera_aliases_follow_front_then_wrist_order():
+    dataset_meta = SimpleNamespace(
+        features={
+            "observation.images.ego": {"dtype": "video"},
+            "observation.images.external_D455": {"dtype": "video"},
+        }
+    )
+
+    assert _resolve_visual_modality_keys_from_dataset_meta(dataset_meta) == ["external_D455", "ego"]

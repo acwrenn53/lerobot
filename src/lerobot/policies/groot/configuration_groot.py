@@ -527,6 +527,7 @@ class GrootConfig(PreTrainedConfig):
             eps=self.optimizer_eps,
             weight_decay=self.optimizer_weight_decay,
             grad_clip_norm=1.0,
+            fused=True,
         )
 
     def get_scheduler_preset(self) -> DiffuserSchedulerConfig:

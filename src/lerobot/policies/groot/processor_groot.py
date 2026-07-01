@@ -638,7 +638,12 @@ def _resolve_visual_modality_keys_from_dataset_meta(dataset_meta: Any | None) ->
     if not keys:
         return None
 
-    semantic_priority = {"front": 0, "wrist": 1}
+    semantic_priority = {
+        "front": 0,
+        "external_d455": 0,
+        "wrist": 1,
+        "ego": 1,
+    }
     return [
         key
         for _, key in sorted(
