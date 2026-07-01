@@ -51,6 +51,13 @@ GROOT_N1_7_BACKBONE_MODEL = "nvidia/Cosmos-Reason2-2B"
 # full-res patchification by forcing a resize. Mirrored by GR00T_N1_7_DEFAULTS in groot_n1_7.py.
 N1_7_DEFAULT_IMAGE_TARGET_SIZE = (256, 256)
 N1_7_DEFAULT_IMAGE_CROP_SIZE = (230, 230)
+# Per-embodiment replan cadence used when the checkpoint sidecars do not pin one.
+# NVIDIA's N1.7 LIBERO rollout wrapper replans after 8 of the 16 decoded actions;
+# keeping that execution cadence avoids stale open-loop chunks. Embodiments absent
+# from this mapping execute the full decoded action horizon.
+N1_7_EMBODIMENT_EXECUTION_HORIZONS: dict[str, int] = {
+    "libero_sim": 8,
+}
 GROOT_ACTION_DECODE_TRANSFORM_LIBERO = "libero"
 # Sentinel meaning "the user did not pick an action decode transform": __post_init__ resolves it
 # to the embodiment default ('libero' for 'libero_sim', otherwise None). It is distinct from an
@@ -234,10 +241,11 @@ def infer_groot_n1_7_action_execution_horizon(
 
     if embodiment_tag is None:
         embodiment_tag = infer_groot_n1_7_embodiment_tag(model_path, revision)
-    if embodiment_tag == "libero_sim":
-        # NVIDIA's N1.7 LIBERO rollout wrapper replans after 8 of the 16 decoded
-        # actions. Keeping that execution cadence avoids stale open-loop chunks.
-        return min(action_horizon, 8)
+    if embodiment_tag is None:
+        return action_horizon
+    embodiment_execution_horizon = N1_7_EMBODIMENT_EXECUTION_HORIZONS.get(embodiment_tag)
+    if embodiment_execution_horizon is not None:
+        return min(action_horizon, embodiment_execution_horizon)
     return action_horizon
 
 

@@ -118,6 +118,17 @@ N1_7_EMBODIMENT_MAPPING = {
     "new_embodiment": 10,
 }
 N1_7_NATIVE_ACTION_HORIZON = 40
+# Semantic camera-role priority used to order dataset image streams into the N1.7 video
+# stack when the checkpoint sidecars do not declare `video_modality_keys`. Isaac-GR00T
+# expects the scene/front camera first and the wrist/ego camera second; dataset dict
+# order does not guarantee that. Keys are matched case-insensitively against the camera
+# name; unknown names keep their dataset order after the known roles.
+N1_7_CAMERA_ROLE_PRIORITY: dict[str, int] = {
+    "front": 0,
+    "external_d455": 0,
+    "wrist": 1,
+    "ego": 1,
+}
 
 
 @dataclass
@@ -653,17 +664,13 @@ def _resolve_visual_modality_keys_from_dataset_meta(dataset_meta: Any | None) ->
     if not keys:
         return None
 
-    semantic_priority = {
-        "front": 0,
-        "external_d455": 0,
-        "wrist": 1,
-        "ego": 1,
-    }
+    semantic_priority = N1_7_CAMERA_ROLE_PRIORITY
+    default_priority = max(semantic_priority.values(), default=0) + 1
     return [
         key
         for _, key in sorted(
             enumerate(keys),
-            key=lambda item: (semantic_priority.get(item[1].lower(), 2), item[0]),
+            key=lambda item: (semantic_priority.get(item[1].lower(), default_priority), item[0]),
         )
     ]
 
